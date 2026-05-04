@@ -1049,6 +1049,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "LEAKY_RELU",
     "TRI",
     "FILL",
+    "SNAKE",
 
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_BACK",
@@ -1080,7 +1081,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1159,6 +1160,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "leaky_relu(x)",
     "tri(x)",
     "fill(x, c)",
+    "snake(x, a, b)",
 
     "flash_attn_ext(x)",
     "flash_attn_back(x)",
@@ -1190,7 +1192,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4002,6 +4004,48 @@ struct ggml_tensor * ggml_diag_mask_zero_inplace(
         struct ggml_tensor  * a,
         int                   n_past) {
     return ggml_diag_mask_zero_impl(ctx, a, n_past, true);
+}
+
+// ggml_snake
+
+static struct ggml_tensor * ggml_snake_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * alpha,
+        struct ggml_tensor  * beta,
+        bool                  inplace) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(alpha->type == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32);
+
+    // alpha and beta are per-channel (typically a->ne[1])
+    GGML_ASSERT(ggml_is_vector(alpha) && alpha->ne[0] == a->ne[1]);
+    GGML_ASSERT(ggml_is_vector(beta) && beta->ne[0] == a->ne[1]);
+
+    struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
+
+    result->op = GGML_OP_SNAKE;
+    result->src[0] = a;
+    result->src[1] = alpha;
+    result->src[2] = beta;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_snake(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * alpha,
+        struct ggml_tensor  * beta) {
+    return ggml_snake_impl(ctx, a, alpha, beta, false);
+}
+
+struct ggml_tensor * ggml_snake_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * alpha,
+        struct ggml_tensor  * beta) {
+    return ggml_snake_impl(ctx, a, alpha, beta, true);
 }
 
 // ggml_soft_max
