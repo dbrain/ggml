@@ -553,6 +553,7 @@ extern "C" {
         GGML_OP_LEAKY_RELU,
         GGML_OP_TRI,
         GGML_OP_FILL,
+        GGML_OP_SNAKE,
 
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
@@ -1712,6 +1713,20 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   n_past);
+
+    // Snake activation: x + (1/beta) * sin^2(alpha * x)
+    GGML_API struct ggml_tensor * ggml_snake(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * alpha,
+            struct ggml_tensor  * beta);
+
+    // in-place, returns view(a)
+    GGML_API struct ggml_tensor * ggml_snake_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * alpha,
+            struct ggml_tensor  * beta);
 
     GGML_API struct ggml_tensor * ggml_soft_max(
             struct ggml_context * ctx,

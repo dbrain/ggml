@@ -63,6 +63,7 @@
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/snake.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -3103,6 +3104,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
+            break;
+        case GGML_OP_SNAKE:
+            ggml_cuda_op_snake(ctx, dst);
             break;
         default:
             return false;

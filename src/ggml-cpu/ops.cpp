@@ -2239,6 +2239,48 @@ void ggml_compute_forward_fill(const ggml_compute_params * params, ggml_tensor *
     ggml_compute_forward_fill_f32(params, dst);
 }
 
+// ggml_compute_snake
+
+static void ggml_compute_forward_snake_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1]; // alpha
+    const ggml_tensor * src2 = dst->src[2]; // beta
+
+    GGML_ASSERT(ggml_is_contiguous(src0));
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    const float * alpha_d = (const float *) src1->data;
+    const float * beta_d  = (const float *) src2->data;
+
+    const auto [ir0, ir1] = get_thread_range(params, src0);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i03 = ir/(ne02*ne01);
+        const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+        const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
+
+        const float * src_ptr = (const float *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
+              float * dst_ptr = (      float *) ((      char *) dst->data  + i03*nb3  + i02*nb2  + i01*nb1);
+
+        const float a = alpha_d[i01];
+        const float b = beta_d[i01];
+        
+        float ea = expf(a);
+        float eb = expf(b);
+
+        for (int i0 = 0; i0 < ne0; ++i0) {
+            const float val = src_ptr[i0];
+            const float sin_ax = sinf(ea * val);
+            dst_ptr[i0] = val + (1.0f / eb) * (sin_ax * sin_ax);
+        }
+    }
+}
+
+void ggml_compute_forward_snake(const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_compute_forward_snake_f32(params, dst);
+}
+
 // ggml_compute_tri
 
 static void ggml_compute_forward_tri_f32(const ggml_compute_params * params, ggml_tensor * dst) {
