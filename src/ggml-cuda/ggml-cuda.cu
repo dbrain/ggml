@@ -62,6 +62,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/snake.cuh"
+#include "ggml-cuda/conv-1d-direct.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2956,6 +2957,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SNAKE:
             ggml_cuda_op_snake(ctx, dst);
             break;
+        case GGML_OP_CONV_1D_DIRECT:
+            ggml_cuda_op_conv_1d_direct(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -5216,6 +5220,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_TRI:
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
+        case GGML_OP_SNAKE:
+        case GGML_OP_CONV_1D_DIRECT:
             return true;
 
         default:

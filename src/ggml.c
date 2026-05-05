@@ -1050,6 +1050,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "TRI",
     "FILL",
     "SNAKE",
+    "CONV_1D_DIRECT",
 
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_BACK",
@@ -1081,7 +1082,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1161,6 +1162,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "tri(x)",
     "fill(x, c)",
     "snake(x, a, b)",
+    "conv_1d_direct(w, x)",
 
     "flash_attn_ext(x)",
     "flash_attn_back(x)",
@@ -1192,7 +1194,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4046,6 +4048,44 @@ struct ggml_tensor * ggml_snake_inplace(
         struct ggml_tensor  * alpha,
         struct ggml_tensor  * beta) {
     return ggml_snake_impl(ctx, a, alpha, beta, true);
+}
+
+// ggml_conv_1d_direct
+//
+// Result shape mirrors what ggml_conv_1d returns: [OL, OC, batch] F32.
+// op_params encodes (s0, p0, d0) — same convention as IM2COL.
+struct ggml_tensor * ggml_conv_1d_direct(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        int                   s0,
+        int                   p0,
+        int                   d0) {
+    GGML_ASSERT(a->ne[1] == b->ne[1]); // in_ch matches
+    GGML_ASSERT(a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+
+    const int64_t kernel  = a->ne[0];
+    const int64_t in_ch   = a->ne[1];
+    const int64_t out_ch  = a->ne[2];
+    const int64_t in_seq  = b->ne[0];
+    const int64_t batch   = b->ne[2];
+
+    const int64_t out_seq = (in_seq + 2 * (int64_t)p0 - (int64_t)d0 * (kernel - 1) - 1) / (int64_t)s0 + 1;
+    GGML_ASSERT(out_seq > 0);
+
+    GGML_UNUSED(in_ch);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, out_seq, out_ch, batch);
+
+    int32_t params[3] = { s0, p0, d0 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_CONV_1D_DIRECT;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
 }
 
 // ggml_soft_max

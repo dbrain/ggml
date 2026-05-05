@@ -1984,6 +1984,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_snake(params, tensor);
             } break;
+        case GGML_OP_CONV_1D_DIRECT:
+            {
+                ggml_compute_forward_conv_1d_direct(params, tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
@@ -2209,6 +2213,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_TRI:
         case GGML_OP_FILL:
         case GGML_OP_SNAKE:
+        case GGML_OP_CONV_1D_DIRECT:
             {
                 n_tasks = n_threads;
             } break;

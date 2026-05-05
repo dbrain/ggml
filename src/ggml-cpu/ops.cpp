@@ -2281,6 +2281,62 @@ void ggml_compute_forward_snake(const ggml_compute_params * params, ggml_tensor 
     ggml_compute_forward_snake_f32(params, dst);
 }
 
+// ggml_compute_forward_conv_1d_direct
+//
+// CPU fallback. Slow reference path — never used on the CUDA build for the
+// vocoder, but needed so the op type isn't a build error and so the reserve
+// pass can measure shapes when scheduler probes ops on the CPU backend.
+// Layout: weight a [kernel, in_ch, out_ch], input b [in_seq, in_ch, batch] F32,
+// output dst [out_seq, out_ch, batch] F32. p0 is causal padding the caller
+// has already prepended into b — we just compute valid positions.
+
+static void ggml_compute_forward_conv_1d_direct_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0]; // weights
+    const ggml_tensor * b = dst->src[1]; // input
+
+    const int32_t * p = (const int32_t *) dst->op_params;
+    const int s0 = p[0];
+    const int p0 = p[1];
+    const int d0 = p[2];
+
+    const int64_t kernel = a->ne[0];
+    const int64_t in_ch  = a->ne[1];
+    const int64_t out_ch = a->ne[2];
+    const int64_t in_seq = b->ne[0];
+    const int64_t batch  = b->ne[2];
+    const int64_t out_seq = dst->ne[0];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // weight type may be F16 or F32; do the conversion on the fly.
+    const bool w_is_f16 = (a->type == GGML_TYPE_F16);
+
+    for (int64_t bi = 0; bi < batch; ++bi) {
+        for (int64_t oc = 0; oc < out_ch; ++oc) {
+            for (int64_t t = ith; t < out_seq; t += nth) {
+                float sum = 0.0f;
+                for (int64_t ic = 0; ic < in_ch; ++ic) {
+                    for (int64_t k = 0; k < kernel; ++k) {
+                        const int64_t in_t = t * s0 + k * d0 - p0;
+                        if (in_t < 0 || in_t >= in_seq) continue;
+                        const float xv = ((const float *)((const char *)b->data + bi*b->nb[2] + ic*b->nb[1]))[in_t];
+                        const float wv = w_is_f16
+                            ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *)((const char *)a->data + oc*a->nb[2] + ic*a->nb[1]))[k])
+                            : ((const float *)       ((const char *)a->data + oc*a->nb[2] + ic*a->nb[1]))[k];
+                        sum += xv * wv;
+                    }
+                }
+                ((float *)((char *)dst->data + bi*dst->nb[2] + oc*dst->nb[1]))[t] = sum;
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_conv_1d_direct(const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_compute_forward_conv_1d_direct_f32(params, dst);
+}
+
 // ggml_compute_tri
 
 static void ggml_compute_forward_tri_f32(const ggml_compute_params * params, ggml_tensor * dst) {
