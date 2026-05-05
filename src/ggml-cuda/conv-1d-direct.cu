@@ -1,44 +1,21 @@
-// Fused 1D convolution kernel using nvcuda::wmma (tensor cores).
+// Fused 1D convolution kernel for the qwen3-tts WavTokenizer vocoder.
 //
-// Bypasses ggml_conv_1d's im2col + cuBLAS gemm path. The im2col temp tensor
-// (740 MB at the deepest WavTokenizer decoder layer) is replaced by on-the-fly
-// index calculation inside the gemm's B-tile load. The cuBLAS gemm itself was
-// confirmed (via a CUBLAS_GEMM_ALGO sweep across 0..23) to be already optimally
-// tuned for our shapes — so the only remaining win is to do less total work,
-// which means tensor-core mma + skipped im2col temp.
-//
-// Designed for the qwen3-tts WavTokenizer vocoder shapes:
-//   - in_ch  ∈ {96, 192, 384, 768, 1024} (decoder block channels)
-//   - out_ch ∈ {96, 192, 384, 768, 1024}
-//   - kernel ∈ {1, 7}
-//   - dilation ∈ {1, 3, 9}
-//   - in_seq up to ~554k samples
+// Direct implementation (no im2col temp). Each thread computes one output
+// element via per-thread FMA accumulation. NOT yet using tensor cores —
+// correctness-first; can swap to a wmma kernel later once shapes/layouts
+// are validated end-to-end.
 //
 // Layout (matches ggml_conv_1d_direct in ggml.c):
 //     w   [kernel, in_ch, out_ch]  F16, contiguous (= [out_ch, in_ch * kernel] flat)
 //     x   [in_seq, in_ch, batch]   F32, contiguous
 //     dst [out_seq, out_ch, batch] F32
-//
-// Block tiling:
-//     grid  = (ceil(out_seq / BN), ceil(out_ch / BM), batch)
-//     block = WARPS_PER_BLOCK * 32 threads
-// Each block computes a [BM x BN] output tile. Each warp handles a
-// [WMMA_M x WMMA_N] sub-tile along N, all warps share the same M tile.
+// op_params: {s0, p_left, p_right, d0}.
 
 #include "conv-1d-direct.cuh"
-#include <mma.h>
 
-using namespace nvcuda;
+#define CONV1D_TILE_T 128
 
-#define WMMA_M 16
-#define WMMA_N 16
-#define WMMA_K 16
-#define BM 16
-#define BN 64
-#define BK 16
-#define WARPS_PER_BLOCK 4
-
-__global__ void conv1d_mma_kernel(
+__global__ void conv1d_direct_naive_kernel(
     const __half * __restrict__ w,        // [out_ch, in_ch * kernel]
     const float  * __restrict__ x,        // [batch, in_ch, in_seq]
     float        * __restrict__ y,        // [batch, out_ch, out_seq]
@@ -48,95 +25,50 @@ __global__ void conv1d_mma_kernel(
     int64_t x_stride_b, int64_t x_stride_c,
     int64_t y_stride_b, int64_t y_stride_c
 ) {
-    const int oc_tile = blockIdx.y;
-    const int t_tile  = blockIdx.x;
+    const int oc      = blockIdx.y;
     const int batch_i = blockIdx.z;
-    const int warp_id = threadIdx.x / 32;
-    const int oc_base = oc_tile * BM;
-    const int t_base  = t_tile  * BN;
-    const int K       = in_ch * kernel;
+    const int t       = blockIdx.x * CONV1D_TILE_T + threadIdx.x;
 
-    // Shared memory:
-    //   a_smem: [BM x BK] row-major (m * BK + k)
-    //   b_smem: [BN x BK] col-major-of-the-tile (n * BK + k); each row is
-    //           a contiguous BK chunk for one column n. wmma::matrix_b
-    //           col_major load with ldb=BK reads exactly that.
-    //   c_smem: [BM x BN] row-major (m * BN + n) — accumulator stage
-    __shared__ __half a_smem[BM * BK];
-    __shared__ __half b_smem[BN * BK];
-    __shared__ float  c_smem[BM * BN];
-
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-    wmma::fill_fragment(c_frag, 0.0f);
-
-    for (int k_outer = 0; k_outer < K; k_outer += BK) {
-        // load A tile [BM x BK] row-major into shared
-        for (int i = threadIdx.x; i < BM * BK; i += WARPS_PER_BLOCK * 32) {
-            const int m       = i / BK;
-            const int k_local = i % BK;
-            const int oc      = oc_base + m;
-            const int k_idx   = k_outer + k_local;
-            __half v = __float2half(0.0f);
-            if (oc < out_ch && k_idx < K) {
-                v = w[(int64_t)oc * K + k_idx];
-            }
-            a_smem[i] = v;
-        }
-
-        // load B tile (input via on-the-fly index), stored as
-        // b_smem[n * BK + k] so wmma's col_major load with ldb=BK works.
-        for (int i = threadIdx.x; i < BN * BK; i += WARPS_PER_BLOCK * 32) {
-            const int n_local = i / BK;
-            const int k_local = i % BK;
-            const int t       = t_base + n_local;
-            const int k_idx   = k_outer + k_local;
-            __half v = __float2half(0.0f);
-            if (t < out_seq && k_idx < K) {
-                const int ic   = k_idx / kernel;
-                const int k    = k_idx % kernel;
-                const int in_t = t * s0 + k * d0 - p_left;
-                if (in_t >= 0 && in_t < in_seq) {
-                    const float xv = x[batch_i * x_stride_b + ic * x_stride_c + in_t];
-                    v = __float2half(xv);
-                }
-            }
-            b_smem[i] = v;
-        }
-
-        __syncthreads();
-
-        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::col_major> b_frag;
-
-        wmma::load_matrix_sync(a_frag, a_smem, BK);
-        // warp_id-th 16-col chunk of B: starts at b_smem + (warp_id * WMMA_N) * BK
-        wmma::load_matrix_sync(b_frag, b_smem + warp_id * WMMA_N * BK, BK);
-        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-
-        __syncthreads();
+    // Cache the weight slice for this oc into shared memory once per block —
+    // all 128 threads in the block share the same oc, so the (in_ch * kernel)
+    // weights are reused 128 times. ALL threads must participate in the load
+    // and reach the syncthreads barrier; otherwise threads that need a value
+    // wait forever (or read uninitialized smem on newer arches).
+    extern __shared__ __half wsm[];   // sized at launch: in_ch * kernel halves
+    const int K = in_ch * kernel;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        wsm[i] = w[(int64_t)oc * K + i];
     }
-
-    // Each warp stores its [WMMA_M x WMMA_N] tile into c_smem (row-major
-    // within the BM x BN block, so subsequent global write is straightforward).
-    wmma::store_matrix_sync(c_smem + warp_id * WMMA_N, c_frag, BN, wmma::mem_row_major);
     __syncthreads();
 
-    for (int i = threadIdx.x; i < BM * BN; i += WARPS_PER_BLOCK * 32) {
-        const int m  = i / BN;
-        const int n  = i % BN;
-        const int oc = oc_base + m;
-        const int t  = t_base + n;
-        if (oc < out_ch && t < out_seq) {
-            y[batch_i * y_stride_b + (int64_t)oc * y_stride_c + t] = c_smem[m * BN + n];
+    if (oc >= out_ch || t >= out_seq) {
+        return;
+    }
+
+    float acc = 0.0f;
+    const float * xp_base = x + batch_i * x_stride_b;
+
+    for (int ic = 0; ic < in_ch; ++ic) {
+        const float * xp = xp_base + ic * x_stride_c;
+        const __half * wp = wsm + ic * kernel;
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            if (k >= kernel) break;
+            const int in_t = t * s0 + k * d0 - p_left;
+            if (in_t >= 0 && in_t < in_seq) {
+                acc += __half2float(wp[k]) * xp[in_t];
+            }
         }
     }
+
+    y[batch_i * y_stride_b + (int64_t)oc * y_stride_c + t] = acc;
 }
 
 void ggml_cuda_op_conv_1d_direct(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * a = dst->src[0]; // weights [kernel, in_ch, out_ch]
     const ggml_tensor * b = dst->src[1]; // input   [in_seq, in_ch, batch]
 
-    GGML_ASSERT(a->type == GGML_TYPE_F16);  // mma kernel currently F16-weights only
+    GGML_ASSERT(a->type == GGML_TYPE_F16);
     GGML_ASSERT(b->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(a));
@@ -146,9 +78,7 @@ void ggml_cuda_op_conv_1d_direct(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int32_t * p = (const int32_t *) dst->op_params;
     const int s0      = p[0];
     const int p_left  = p[1];
-    const int p_right = p[2];
     const int d0      = p[3];
-    GGML_UNUSED(p_right);
 
     const int kernel = a->ne[0];
     const int in_ch  = a->ne[1];
@@ -168,12 +98,13 @@ void ggml_cuda_op_conv_1d_direct(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     cudaStream_t stream = ctx.stream();
 
-    const int blocks_n = (out_seq + BN - 1) / BN;
-    const int blocks_m = (out_ch  + BM - 1) / BM;
-    dim3 grid(blocks_n, blocks_m, batch);
-    dim3 block(WARPS_PER_BLOCK * 32);
+    const int blocks_n = (out_seq + CONV1D_TILE_T - 1) / CONV1D_TILE_T;
+    dim3 grid(blocks_n, out_ch, batch);
+    dim3 block(CONV1D_TILE_T);
 
-    conv1d_mma_kernel<<<grid, block, 0, stream>>>(
+    const size_t shared_bytes = (size_t)in_ch * kernel * sizeof(__half);
+
+    conv1d_direct_naive_kernel<<<grid, block, shared_bytes, stream>>>(
         w_d, x_d, y_d, in_seq, out_seq, in_ch, out_ch, kernel,
         s0, p_left, d0, x_stride_b, x_stride_c, y_stride_b, y_stride_c);
 }

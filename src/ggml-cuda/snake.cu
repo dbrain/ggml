@@ -36,7 +36,10 @@ static __global__ void snake_f32(const float * x, const float * alpha, const flo
     float ea = expf(a);
     float eb = expf(b);
 
-    dst[i] = val + (1.0f / eb) * powf(sinf(ea * val), 2.0f);
+    // s² via plain multiply, not powf(s, 2) — CUDA's powf is exp(y*log(x))
+    // and returns NaN when s < 0 (it doesn't fast-path integer y).
+    const float s = sinf(ea * val);
+    dst[i] = val + (1.0f / eb) * (s * s);
 }
 
 void ggml_cuda_op_snake(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
