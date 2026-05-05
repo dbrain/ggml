@@ -1732,23 +1732,25 @@ extern "C" {
     // ggml_conv_1d_direct
     //
     // Fused 1D convolution that computes the conv directly without an im2col
-    // temp tensor. Designed for the long-seq small-channel shapes that
-    // qwen3-tts's vocoder hits ([seq=554k, ch=96] residual convs), where the
-    // im2col-then-cuBLAS-gemm path is bandwidth-bound on the temp tensor and
-    // ~100x slower than the compute floor on Ampere.
+    // temp tensor. Asymmetric (causal) padding via separate p_left / p_right
+    // — the kernel treats out-of-range input positions as zero, so the caller
+    // need not pre-pad the input. (Pre-padding via ggml_concat with an INPUT-
+    // flagged tail tensor was the wrong move — the scheduler routes any chain
+    // touching INPUT-flagged tensors to CPU.)
     //
     // a: weights [kernel, in_ch, out_ch]      F32 or F16
-    // b: input   [seq + 2*p0, in_ch, batch]   F32 (with explicit causal pad
-    //                                            already applied by caller)
+    // b: input   [in_seq, in_ch, batch]       F32
     // s0: stride
+    // p_left, p_right: padding on each side (use {(K-1)*d, 0} for causal)
     // d0: dilation
-    // returns: [out_seq = floor((b->ne[0] + 2*p0 - d0*(a->ne[0]-1) - 1)/s0) + 1, out_ch, batch] F32
+    // returns: [out_seq = floor((in_seq + p_left + p_right - d0*(K-1) - 1)/s0) + 1, out_ch, batch] F32
     GGML_API struct ggml_tensor * ggml_conv_1d_direct(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             int                   s0,
-            int                   p0,
+            int                   p_left,
+            int                   p_right,
             int                   d0);
 
     GGML_API struct ggml_tensor * ggml_soft_max(
