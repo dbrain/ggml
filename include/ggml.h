@@ -554,6 +554,7 @@ extern "C" {
         GGML_OP_TRI,
         GGML_OP_FILL,
         GGML_OP_SNAKE,
+        GGML_OP_CONV_1D_DIRECT,
 
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
@@ -1727,6 +1728,28 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * alpha,
             struct ggml_tensor  * beta);
+
+    // ggml_conv_1d_direct
+    //
+    // Fused 1D convolution that computes the conv directly without an im2col
+    // temp tensor. Designed for the long-seq small-channel shapes that
+    // qwen3-tts's vocoder hits ([seq=554k, ch=96] residual convs), where the
+    // im2col-then-cuBLAS-gemm path is bandwidth-bound on the temp tensor and
+    // ~100x slower than the compute floor on Ampere.
+    //
+    // a: weights [kernel, in_ch, out_ch]      F32 or F16
+    // b: input   [seq + 2*p0, in_ch, batch]   F32 (with explicit causal pad
+    //                                            already applied by caller)
+    // s0: stride
+    // d0: dilation
+    // returns: [out_seq = floor((b->ne[0] + 2*p0 - d0*(a->ne[0]-1) - 1)/s0) + 1, out_ch, batch] F32
+    GGML_API struct ggml_tensor * ggml_conv_1d_direct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            int                   s0,
+            int                   p0,
+            int                   d0);
 
     GGML_API struct ggml_tensor * ggml_soft_max(
             struct ggml_context * ctx,
