@@ -4052,14 +4052,16 @@ struct ggml_tensor * ggml_snake_inplace(
 
 // ggml_conv_1d_direct
 //
-// Result shape mirrors what ggml_conv_1d returns: [OL, OC, batch] F32.
-// op_params encodes (s0, p0, d0) — same convention as IM2COL.
+// Result shape: [out_seq, out_ch, batch] F32, where
+//   out_seq = (in_seq + p_left + p_right - d0*(K-1) - 1) / s0 + 1.
+// op_params encodes (s0, p_left, p_right, d0).
 struct ggml_tensor * ggml_conv_1d_direct(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
         struct ggml_tensor  * b,
         int                   s0,
-        int                   p0,
+        int                   p_left,
+        int                   p_right,
         int                   d0) {
     GGML_ASSERT(a->ne[1] == b->ne[1]); // in_ch matches
     GGML_ASSERT(a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_F32);
@@ -4071,14 +4073,15 @@ struct ggml_tensor * ggml_conv_1d_direct(
     const int64_t in_seq  = b->ne[0];
     const int64_t batch   = b->ne[2];
 
-    const int64_t out_seq = (in_seq + 2 * (int64_t)p0 - (int64_t)d0 * (kernel - 1) - 1) / (int64_t)s0 + 1;
+    const int64_t out_seq = (in_seq + (int64_t)p_left + (int64_t)p_right
+                             - (int64_t)d0 * (kernel - 1) - 1) / (int64_t)s0 + 1;
     GGML_ASSERT(out_seq > 0);
 
     GGML_UNUSED(in_ch);
 
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, out_seq, out_ch, batch);
 
-    int32_t params[3] = { s0, p0, d0 };
+    int32_t params[4] = { s0, p_left, p_right, d0 };
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_CONV_1D_DIRECT;

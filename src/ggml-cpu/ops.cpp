@@ -2295,9 +2295,9 @@ static void ggml_compute_forward_conv_1d_direct_f32(const ggml_compute_params * 
     const ggml_tensor * b = dst->src[1]; // input
 
     const int32_t * p = (const int32_t *) dst->op_params;
-    const int s0 = p[0];
-    const int p0 = p[1];
-    const int d0 = p[2];
+    const int s0      = p[0];
+    const int p_left  = p[1];
+    const int d0      = p[3];
 
     const int64_t kernel = a->ne[0];
     const int64_t in_ch  = a->ne[1];
@@ -2318,7 +2318,7 @@ static void ggml_compute_forward_conv_1d_direct_f32(const ggml_compute_params * 
                 float sum = 0.0f;
                 for (int64_t ic = 0; ic < in_ch; ++ic) {
                     for (int64_t k = 0; k < kernel; ++k) {
-                        const int64_t in_t = t * s0 + k * d0 - p0;
+                        const int64_t in_t = t * s0 + k * d0 - p_left;
                         if (in_t < 0 || in_t >= in_seq) continue;
                         const float xv = ((const float *)((const char *)b->data + bi*b->nb[2] + ic*b->nb[1]))[in_t];
                         const float wv = w_is_f16
@@ -2334,6 +2334,16 @@ static void ggml_compute_forward_conv_1d_direct_f32(const ggml_compute_params * 
 }
 
 void ggml_compute_forward_conv_1d_direct(const ggml_compute_params * params, ggml_tensor * dst) {
+    static FILE * cpu_dbg = nullptr;
+    static int n = 0;
+    if (params->ith == 0) {
+        if (!cpu_dbg) cpu_dbg = fopen("/tmp/conv_dbg.log", "a");
+        if (cpu_dbg && n < 50) {
+            fprintf(cpu_dbg, "compute(CPU) CONV_1D_DIRECT call#%d dst.ne=[%lld,%lld,%lld]\n",
+                    n++, (long long)dst->ne[0], (long long)dst->ne[1], (long long)dst->ne[2]);
+            fflush(cpu_dbg);
+        }
+    }
     ggml_compute_forward_conv_1d_direct_f32(params, dst);
 }
 
