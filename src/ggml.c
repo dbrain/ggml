@@ -2150,8 +2150,8 @@ static struct ggml_tensor * ggml_acc_impl(
         bool                  inplace) {
     GGML_ASSERT(ggml_nelements(b) <= ggml_nelements(a));
     GGML_ASSERT(ggml_is_contiguous(a));
-    GGML_ASSERT(a->type == GGML_TYPE_F32);
-    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
+    GGML_ASSERT(b->type == a->type);
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
@@ -4016,7 +4016,7 @@ static struct ggml_tensor * ggml_snake_impl(
         struct ggml_tensor  * alpha,
         struct ggml_tensor  * beta,
         bool                  inplace) {
-    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
     GGML_ASSERT(alpha->type == GGML_TYPE_F32);
     GGML_ASSERT(beta->type == GGML_TYPE_F32);
 
@@ -4055,17 +4055,19 @@ struct ggml_tensor * ggml_snake_inplace(
 // Result shape: [out_seq, out_ch, batch] F32, where
 //   out_seq = (in_seq + p_left + p_right - d0*(K-1) - 1) / s0 + 1.
 // op_params encodes (s0, p_left, p_right, d0).
-struct ggml_tensor * ggml_conv_1d_direct(
+struct ggml_tensor * ggml_conv_1d_direct_to(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
         struct ggml_tensor  * b,
         int                   s0,
         int                   p_left,
         int                   p_right,
-        int                   d0) {
+        int                   d0,
+        enum   ggml_type      dst_type) {
     GGML_ASSERT(a->ne[1] == b->ne[1]); // in_ch matches
     GGML_ASSERT(a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_F32);
-    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F16);
+    GGML_ASSERT(dst_type == GGML_TYPE_F32 || dst_type == GGML_TYPE_F16);
 
     const int64_t kernel  = a->ne[0];
     const int64_t in_ch   = a->ne[1];
@@ -4079,7 +4081,7 @@ struct ggml_tensor * ggml_conv_1d_direct(
 
     GGML_UNUSED(in_ch);
 
-    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, out_seq, out_ch, batch);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, dst_type, out_seq, out_ch, batch);
 
     int32_t params[4] = { s0, p_left, p_right, d0 };
     ggml_set_op_params(result, params, sizeof(params));
@@ -4089,6 +4091,17 @@ struct ggml_tensor * ggml_conv_1d_direct(
     result->src[1] = b;
 
     return result;
+}
+
+struct ggml_tensor * ggml_conv_1d_direct(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        int                   s0,
+        int                   p_left,
+        int                   p_right,
+        int                   d0) {
+    return ggml_conv_1d_direct_to(ctx, a, b, s0, p_left, p_right, d0, GGML_TYPE_F32);
 }
 
 // ggml_soft_max
@@ -4634,13 +4647,14 @@ static int64_t ggml_calc_conv_transpose_1d_output_size(int64_t ins, int64_t ks, 
     return (ins - 1) * s - 2 * p + d * (ks - 1) + 1;
 }
 
-GGML_API struct ggml_tensor * ggml_conv_transpose_1d(
+GGML_API struct ggml_tensor * ggml_conv_transpose_1d_to(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
         struct ggml_tensor  * b,
         int                   s0,
         int                   p0,
-        int                   d0) {
+        int                   d0,
+        enum   ggml_type      dst_type) {
     GGML_ASSERT(ggml_is_matrix(b));
     GGML_ASSERT(a->ne[2] == b->ne[1]);
     GGML_ASSERT(a->ne[3] == 1);
@@ -4648,11 +4662,13 @@ GGML_API struct ggml_tensor * ggml_conv_transpose_1d(
     GGML_ASSERT(p0 == 0);
     GGML_ASSERT(d0 == 1);
 
+    GGML_ASSERT(dst_type == GGML_TYPE_F32 || dst_type == GGML_TYPE_F16);
+
     const int64_t ne[4] = {
         ggml_calc_conv_transpose_1d_output_size(b->ne[0], a->ne[0], s0, 0 /*p0*/, 1 /*d0*/),
         a->ne[1], b->ne[2], 1,
     };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    struct ggml_tensor * result = ggml_new_tensor(ctx, dst_type, 4, ne);
 
     int32_t params[] = { s0, p0, d0 };
     ggml_set_op_params(result, params, sizeof(params));
@@ -4662,6 +4678,16 @@ GGML_API struct ggml_tensor * ggml_conv_transpose_1d(
     result->src[1] = b;
 
     return result;
+}
+
+GGML_API struct ggml_tensor * ggml_conv_transpose_1d(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        int                   s0,
+        int                   p0,
+        int                   d0) {
+    return ggml_conv_transpose_1d_to(ctx, a, b, s0, p0, d0, GGML_TYPE_F32);
 }
 
 // ggml_conv_2d

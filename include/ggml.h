@@ -1753,6 +1753,20 @@ extern "C" {
             int                   p_right,
             int                   d0);
 
+    // Same as ggml_conv_1d_direct but lets the caller pick the dst dtype
+    // (F32 or F16). The wmma kernel's accumulator stays F32 regardless;
+    // F16 dst halves every intermediate tensor in the cascade and saves
+    // ~50 % of the vocoder's sched_cu without measurable precision loss.
+    GGML_API struct ggml_tensor * ggml_conv_1d_direct_to(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            int                   s0,
+            int                   p_left,
+            int                   p_right,
+            int                   d0,
+            enum   ggml_type      dst_type);
+
     GGML_API struct ggml_tensor * ggml_soft_max(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
@@ -2088,6 +2102,17 @@ extern "C" {
             int                   s0,  // stride
             int                   p0,  // padding
             int                   d0); // dilation
+
+    // F16-dst variant of ggml_conv_transpose_1d. Only the F16-weight wmma
+    // path supports F16 dst; the legacy F32-weight kernel asserts F32.
+    GGML_API struct ggml_tensor * ggml_conv_transpose_1d_to(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            int                   s0,
+            int                   p0,
+            int                   d0,
+            enum   ggml_type      dst_type);
 
     GGML_API struct ggml_tensor * ggml_conv_2d(
             struct ggml_context * ctx,
