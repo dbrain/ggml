@@ -3,43 +3,60 @@
 
 #define CUDA_SNAKE_BLOCK_SIZE 256
 
-static __global__ void snake_f32(const float * x, const float * alpha, const float * beta, float * dst, const int64_t ne0, const int64_t ne1, const int64_t n) {
+// Snake activation: x + (1/exp(beta)) * sin(exp(alpha) * x)^2
+// Vocoder cascade keeps activations as F16 to halve scheduler intermediates;
+// math runs in F32 for numerical stability, only load/store endpoints vary.
+
+template <typename Tx>
+__device__ __forceinline__ float snake_load(const Tx * x, int64_t i);
+
+template <>
+__device__ __forceinline__ float snake_load<float>(const float * x, int64_t i) {
+    return x[i];
+}
+
+template <>
+__device__ __forceinline__ float snake_load<__half>(const __half * x, int64_t i) {
+    return __half2float(x[i]);
+}
+
+template <typename Ty>
+__device__ __forceinline__ void snake_store(Ty * y, int64_t i, float v);
+
+template <>
+__device__ __forceinline__ void snake_store<float>(float * y, int64_t i, float v) {
+    y[i] = v;
+}
+
+template <>
+__device__ __forceinline__ void snake_store<__half>(__half * y, int64_t i, float v) {
+    y[i] = __float2half(v);
+}
+
+template <typename Tx, typename Ty>
+static __global__ void snake_kernel(
+    const Tx * x, const float * alpha, const float * beta, Ty * dst,
+    const int64_t ne0, const int64_t ne1, const int64_t n
+) {
     const int64_t i = (int64_t)blockDim.x * blockIdx.x + threadIdx.x;
     if (i >= n) {
         return;
     }
 
-    // x shape: [ne0, ne1, ne2, ne3]
-    // alpha/beta shape: [ne1] (per-channel)
-    // We assume 2D or more, where ne1 is the channel dimension.
-    // For Snake in Vocos/Qwen3, it's typically [seq_len, channels, batch]
-    // But GGML's ne[0] is usually the contiguous dimension (e.g. seq_len).
-
-    const int64_t i0 = i % ne0;
+    // x shape: [ne0, ne1, ne2, ne3]; alpha/beta: [ne1] per-channel.
     const int64_t i1 = (i / ne0) % ne1;
 
-    const float val = x[i];
+    const float val = snake_load<Tx>(x, i);
     const float a = alpha[i1];
     const float b = beta[i1];
 
-    // Snake formula: x + (1/b) * sin^2(a * x)
-    // To be numerically stable, we use exp(a) and exp(b) if the model was trained with them
-    // The reference Python implementation uses:
-    // self.alpha = nn.Parameter(torch.ones(1, channels, 1))
-    // x + (1 / exp(self.beta)) * torch.pow(torch.sin(exp(self.alpha) * x), 2)
-    
-    // Wait, let's look at the C++ ref again:
-    // struct ggml_tensor * alpha_exp = ggml_exp(ctx, alpha);
-    // ...
-    // struct ggml_tensor * inv_beta_exp = ggml_exp(ctx, neg_beta);
-    
-    float ea = expf(a);
-    float eb = expf(b);
+    const float ea = expf(a);
+    const float eb = expf(b);
 
-    // s² via plain multiply, not powf(s, 2) — CUDA's powf is exp(y*log(x))
-    // and returns NaN when s < 0 (it doesn't fast-path integer y).
+    // s² via plain multiply, not powf(s, 2) — CUDA's powf returns NaN for s<0
+    // (it doesn't fast-path integer exponent).
     const float s = sinf(ea * val);
-    dst[i] = val + (1.0f / eb) * (s * s);
+    snake_store<Ty>(dst, i, val + (1.0f / eb) * (s * s));
 }
 
 void ggml_cuda_op_snake(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -48,7 +65,6 @@ void ggml_cuda_op_snake(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src2 = dst->src[2]; // beta
 
     void * dst_d = dst->data;
-    const float * src0_d = (const float *)src0->data;
     const float * src1_d = (const float *)src1->data;
     const float * src2_d = (const float *)src2->data;
 
@@ -56,14 +72,28 @@ void ggml_cuda_op_snake(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_ASSERT(ggml_is_contiguous(dst));
     GGML_ASSERT(ggml_is_contiguous(src0));
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src2->type == GGML_TYPE_F32);
 
     const int64_t n = ggml_nelements(dst);
     const int64_t ne0 = dst->ne[0];
     const int64_t ne1 = dst->ne[1];
-
     const int64_t num_blocks = (n + CUDA_SNAKE_BLOCK_SIZE - 1) / CUDA_SNAKE_BLOCK_SIZE;
 
-    snake_f32<<<num_blocks, CUDA_SNAKE_BLOCK_SIZE, 0, stream>>>(src0_d, src1_d, src2_d, (float *)dst_d, ne0, ne1, n);
+#define DISPATCH_SNAKE(TX, TY)                                                            \
+    snake_kernel<TX, TY><<<num_blocks, CUDA_SNAKE_BLOCK_SIZE, 0, stream>>>(               \
+        (const TX *) src0->data, src1_d, src2_d, (TY *) dst_d, ne0, ne1, n)
+
+    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        DISPATCH_SNAKE(float, float);
+    } else if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
+        DISPATCH_SNAKE(float, __half);
+    } else if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
+        DISPATCH_SNAKE(__half, float);
+    } else {
+        DISPATCH_SNAKE(__half, __half);
+    }
+#undef DISPATCH_SNAKE
 }

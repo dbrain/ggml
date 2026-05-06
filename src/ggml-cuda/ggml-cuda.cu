@@ -5098,11 +5098,17 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1]->type;
-                // F16 weights handled by the smem-tiled wmma kernel in
-                // conv-transpose-1d.cu; F32 weights by the legacy naive kernel.
-                if (src1_type != GGML_TYPE_F32) return false;
-                if (src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16) {
-                    return true;
+                ggml_type  dst_type = op->type;
+                // F16 weights → smem-tiled wmma kernel (supports F32/F16
+                // input + dst, accumulator stays F32). F32 weights → legacy
+                // naive kernel (F32 only).
+                if (src0_type == GGML_TYPE_F16) {
+                    const bool x_ok = src1_type == GGML_TYPE_F32 || src1_type == GGML_TYPE_F16;
+                    const bool y_ok =  dst_type == GGML_TYPE_F32 ||  dst_type == GGML_TYPE_F16;
+                    return x_ok && y_ok;
+                }
+                if (src0_type == GGML_TYPE_F32) {
+                    return src1_type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F32;
                 }
                 return false;
             } break;

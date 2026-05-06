@@ -73,8 +73,12 @@ static void conv_transpose_1d_f32_f32_cuda(
 // Layout (matches ggml_conv_transpose_1d in ggml.c):
 //     w   [kernel, out_ch, in_ch]   F16, contiguous.
 //                                   Flat (innermost first): w_data[ic*(out_ch*kernel) + oc*kernel + kk]
-//     x   [in_seq, in_ch, batch]    F32, contiguous.
-//     dst [out_seq, out_ch, batch]  F32.
+//     x   [in_seq, in_ch, batch]    F32 or F16, contiguous.
+//     dst [out_seq, out_ch, batch]  F32 or F16.
+//
+// X and Y dtypes are independent; the wmma c_frag accumulator stays F32 so
+// only the load/store endpoints vary. Used to keep the cascade in F16 between
+// transpose blocks (halves every dec_block intermediate).
 //
 // GEMM mapping per output tile [oc_base : oc_base+BM, t_base : t_base+BN):
 //     C[oc, t] = sum over (ic, kk) of A[oc, ic*kernel+kk] * B[ic*kernel+kk, t]
@@ -97,10 +101,37 @@ static void conv_transpose_1d_f32_f32_cuda(
 #define BK 16
 #define WARPS_PER_BLOCK 4
 
+template <typename Tx>
+__device__ __forceinline__ float ct1d_load_x(const Tx * x, int64_t idx);
+
+template <>
+__device__ __forceinline__ float ct1d_load_x<float>(const float * x, int64_t idx) {
+    return x[idx];
+}
+
+template <>
+__device__ __forceinline__ float ct1d_load_x<__half>(const __half * x, int64_t idx) {
+    return __half2float(x[idx]);
+}
+
+template <typename Ty>
+__device__ __forceinline__ void ct1d_store_y(Ty * y, int64_t idx, float v);
+
+template <>
+__device__ __forceinline__ void ct1d_store_y<float>(float * y, int64_t idx, float v) {
+    y[idx] = v;
+}
+
+template <>
+__device__ __forceinline__ void ct1d_store_y<__half>(__half * y, int64_t idx, float v) {
+    y[idx] = __float2half(v);
+}
+
+template <typename Tx, typename Ty>
 __global__ void conv_transpose_1d_mma_kernel(
     const __half * __restrict__ w,        // [in_ch, out_ch, kernel] flat
-    const float  * __restrict__ x,        // [batch, in_ch, in_seq]
-    float        * __restrict__ y,        // [batch, out_ch, out_seq]
+    const Tx     * __restrict__ x,        // [batch, in_ch, in_seq]
+    Ty           * __restrict__ y,        // [batch, out_ch, out_seq]
     int in_seq, int out_seq,
     int in_ch,  int out_ch,
     int kernel, int s0,
@@ -154,7 +185,7 @@ __global__ void conv_transpose_1d_mma_kernel(
                 if (t_minus_k >= 0 && (t_minus_k % s0) == 0) {
                     const int in_t = t_minus_k / s0;
                     if (in_t < in_seq) {
-                        const float xv = x[batch_i * x_stride_b + ic * x_stride_c + in_t];
+                        const float xv = ct1d_load_x<Tx>(x, batch_i * x_stride_b + ic * x_stride_c + in_t);
                         v = __float2half(xv);
                     }
                 }
@@ -183,27 +214,10 @@ __global__ void conv_transpose_1d_mma_kernel(
         const int oc = oc_base + m;
         const int t  = t_base + n;
         if (oc < out_ch && t < out_seq) {
-            y[batch_i * y_stride_b + (int64_t)oc * y_stride_c + t] = c_smem[m * BN + n];
+            ct1d_store_y<Ty>(y, batch_i * y_stride_b + (int64_t)oc * y_stride_c + t,
+                             c_smem[m * BN + n]);
         }
     }
-}
-
-static void conv_transpose_1d_f16_f32_cuda(
-        const int s0,
-        int in_seq, int out_seq, int in_ch, int out_ch, int kernel, int batch,
-        int64_t x_stride_b, int64_t x_stride_c,
-        int64_t y_stride_b, int64_t y_stride_c,
-        const __half * w_d, const float * x_d, float * y_d,
-        cudaStream_t stream) {
-
-    const int blocks_n = (out_seq + BN - 1) / BN;
-    const int blocks_m = (out_ch  + BM - 1) / BM;
-    dim3 grid(blocks_n, blocks_m, batch);
-    dim3 block(WARPS_PER_BLOCK * 32);
-
-    conv_transpose_1d_mma_kernel<<<grid, block, 0, stream>>>(
-        w_d, x_d, y_d, in_seq, out_seq, in_ch, out_ch, kernel, s0,
-        x_stride_b, x_stride_c, y_stride_b, y_stride_c);
 }
 
 // === Dispatch ================================================================
@@ -212,8 +226,8 @@ void ggml_cuda_op_conv_transpose_1d(ggml_backend_cuda_context & ctx, ggml_tensor
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
-    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
     GGML_ASSERT(ggml_is_contiguous(src0));
     GGML_ASSERT(ggml_is_contiguous(src1));
     GGML_ASSERT(ggml_is_contiguous(dst));
@@ -233,19 +247,36 @@ void ggml_cuda_op_conv_transpose_1d(ggml_backend_cuda_context & ctx, ggml_tensor
         const int batch   = (int) src1->ne[2];
         const int out_seq = (int) dst->ne[0];
 
-        const int64_t x_stride_b = src1->nb[2] / sizeof(float);
-        const int64_t x_stride_c = src1->nb[1] / sizeof(float);
-        const int64_t y_stride_b = dst->nb[2]  / sizeof(float);
-        const int64_t y_stride_c = dst->nb[1]  / sizeof(float);
+        const size_t x_elem = (src1->type == GGML_TYPE_F32) ? sizeof(float) : sizeof(__half);
+        const size_t y_elem = ( dst->type == GGML_TYPE_F32) ? sizeof(float) : sizeof(__half);
+        const int64_t x_stride_b = src1->nb[2] / x_elem;
+        const int64_t x_stride_c = src1->nb[1] / x_elem;
+        const int64_t y_stride_b =  dst->nb[2] / y_elem;
+        const int64_t y_stride_c =  dst->nb[1] / y_elem;
 
         const __half * w_d = (const __half *) src0->data;
-        const float  * x_d = (const float  *) src1->data;
-        float        * y_d = (float        *) dst->data;
 
-        conv_transpose_1d_f16_f32_cuda(s0,
-            in_seq, out_seq, in_ch, out_ch, kernel, batch,
-            x_stride_b, x_stride_c, y_stride_b, y_stride_c,
-            w_d, x_d, y_d, stream);
+        const int blocks_n = (out_seq + BN - 1) / BN;
+        const int blocks_m = (out_ch  + BM - 1) / BM;
+        dim3 grid(blocks_n, blocks_m, batch);
+        dim3 block(WARPS_PER_BLOCK * 32);
+
+#define DISPATCH_CT1D(TX, TY)                                                             \
+        conv_transpose_1d_mma_kernel<TX, TY><<<grid, block, 0, stream>>>(                 \
+            w_d, (const TX *) src1->data, (TY *) dst->data,                               \
+            in_seq, out_seq, in_ch, out_ch, kernel, s0,                                   \
+            x_stride_b, x_stride_c, y_stride_b, y_stride_c)
+
+        if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            DISPATCH_CT1D(float, float);
+        } else if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
+            DISPATCH_CT1D(float, __half);
+        } else if (src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
+            DISPATCH_CT1D(__half, float);
+        } else {
+            DISPATCH_CT1D(__half, __half);
+        }
+#undef DISPATCH_CT1D
 
         GGML_UNUSED(p0);
         GGML_UNUSED(d0);
