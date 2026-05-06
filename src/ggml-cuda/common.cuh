@@ -1227,7 +1227,15 @@ struct ggml_cuda_graph {
     std::vector<node_properties> node_props;
 
     bool is_enabled() const {
-        static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
+        // Check env value, not just presence — `=0` should ENABLE, not
+        // disable. (Upstream ggml's presence-only check turned every fork
+        // that set GGML_CUDA_DISABLE_GRAPHS=0 into a forcibly-disabled run,
+        // including this one until 2026-05-06.) Empty string / "0" means
+        // enabled; any non-zero value means disabled.
+        static const bool disable_cuda_graphs_due_to_env = []() {
+            const char * env = getenv("GGML_CUDA_DISABLE_GRAPHS");
+            return env != nullptr && env[0] != '\0' && env[0] != '0';
+        }();
         return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
     }
 #endif
