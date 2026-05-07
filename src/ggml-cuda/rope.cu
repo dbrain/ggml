@@ -60,7 +60,7 @@ static __global__ void rope_norm(const T *            x,
                                  const rope_corr_dims corr_dims,
                                  const float          theta_scale,
                                  const float *        freq_factors,
-                                 const int64_t *      row_indices,
+                                 const int32_t *      row_indices,
                                  const int            set_rows_stride) {
     const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
 
@@ -132,7 +132,7 @@ static __global__ void rope_neox(const T *            x,
                                  const rope_corr_dims corr_dims,
                                  const float          theta_scale,
                                  const float *        freq_factors,
-                                 const int64_t *      row_indices,
+                                 const int32_t *      row_indices,
                                  const int            set_rows_stride) {
     ggml_cuda_pdl_lc();
     const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
@@ -352,7 +352,7 @@ static void rope_norm_cuda(const T *            x,
                            const float          attn_factor,
                            const rope_corr_dims corr_dims,
                            const float *        freq_factors,
-                           const int64_t *      row_indices,
+                           const int32_t *      row_indices,
                            const int            set_rows_stride,
                            cudaStream_t         stream) {
     GGML_ASSERT(ne00 % 2 == 0);
@@ -394,7 +394,7 @@ static void rope_neox_cuda(const T *            x,
                            const float          attn_factor,
                            const rope_corr_dims corr_dims,
                            const float *        freq_factors,
-                           const int64_t *      row_indices,
+                           const int32_t *      row_indices,
                            const int            set_rows_stride,
                            cudaStream_t         stream) {
     GGML_ASSERT(ne00 % 2 == 0);
@@ -515,14 +515,18 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
     const float * src1_d = (const float *)src1->data;
 
     void *          dst_d           = dst->data;
-    const int64_t * row_indices     = nullptr;
+    const int32_t * row_indices     = nullptr;
     ggml_type       dst_type        = dst->type;
     int             set_rows_stride = 0;
 
     if (set_rows != nullptr) {
         GGML_ASSERT(forward);
+        // dbrain/qwen3-tts fork: rope+view+set_rows fusion takes I32 row_indices
+        // (the project always passes I32 inp_pos). The matching gate is in
+        // ggml_cuda_should_fuse_rope_set_rows.
+        GGML_ASSERT(set_rows->src[1]->type == GGML_TYPE_I32);
         dst_d           = set_rows->data;
-        row_indices     = (const int64_t *) set_rows->src[1]->data;
+        row_indices     = (const int32_t *) set_rows->src[1]->data;
         dst_type        = set_rows->type;
         set_rows_stride = set_rows->nb[1] / ggml_type_size(set_rows->type);
     }

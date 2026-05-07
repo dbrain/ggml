@@ -3379,7 +3379,9 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
         return false;
     }
 
-    if (set_rows->src[1]->type != GGML_TYPE_I64) {
+    // dbrain/qwen3-tts fork: rope+view+set_rows fusion accepts I32 row_indices
+    // (matches the kernel signature in rope.cu — fork only ever passes I32 inp_pos).
+    if (set_rows->src[1]->type != GGML_TYPE_I32) {
         return false;
     }
 
