@@ -115,10 +115,26 @@ typedef void (*ggml_cuda_graph_begin_hook_fn)(
     ggml_backend_cuda_context * ctx,
     const ggml_cgraph *         cgraph);
 void ggml_cuda_set_graph_begin_hook(ggml_cuda_graph_begin_hook_fn fn);
+
+// Generic per-op hook. Called at the top of ggml_cuda_compute_forward for
+// every node. Returns true if the hook fully handled the op (ggml-cuda's
+// dispatch will be skipped); false to fall through to ggml's path.
+//
+// qwen3-tts megakernel uses this to fold sequences of small ops
+// (rms_norm + mul-norm-weight + quantize_x → Q8_1, rope + set_rows, etc.)
+// into a single launch — anchor on the first op of the chain, run the
+// fused kernel, return true; subsequent ops in the chain look themselves
+// up in the per-graph plan and return true (no-op).
+typedef bool (*ggml_cuda_op_hook_fn)(
+    ggml_backend_cuda_context * ctx,
+    ggml_tensor *               dst,
+    cudaStream_t                stream);
+void ggml_cuda_set_op_hook(ggml_cuda_op_hook_fn fn);
 }  // extern "C"
 
 static ggml_cuda_mul_mat_hook_fn   g_ggml_cuda_mul_mat_hook    = nullptr;
 static ggml_cuda_graph_begin_hook_fn g_ggml_cuda_graph_begin_hook = nullptr;
+static ggml_cuda_op_hook_fn        g_ggml_cuda_op_hook         = nullptr;
 
 extern "C" void ggml_cuda_set_mul_mat_hook(ggml_cuda_mul_mat_hook_fn fn) {
     g_ggml_cuda_mul_mat_hook = fn;
@@ -126,6 +142,10 @@ extern "C" void ggml_cuda_set_mul_mat_hook(ggml_cuda_mul_mat_hook_fn fn) {
 
 extern "C" void ggml_cuda_set_graph_begin_hook(ggml_cuda_graph_begin_hook_fn fn) {
     g_ggml_cuda_graph_begin_hook = fn;
+}
+
+extern "C" void ggml_cuda_set_op_hook(ggml_cuda_op_hook_fn fn) {
+    g_ggml_cuda_op_hook = fn;
 }
 
 [[noreturn]]
@@ -2673,6 +2693,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    // Per-op hook for qwen3-tts megakernel sub-op fusion. If the hook
+    // handles this dst, skip ggml's dispatch entirely. Note: GGML_OP_NONE
+    // / RESHAPE / VIEW / PERMUTE / TRANSPOSE are no-ops in ggml-cuda
+    // anyway, so the hook need not handle them.
+    if (g_ggml_cuda_op_hook && g_ggml_cuda_op_hook(&ctx, dst, ctx.stream())) {
+        return true;
+    }
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
