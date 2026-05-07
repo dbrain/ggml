@@ -110,7 +110,7 @@ __global__ void conv1d_mma_kernel(
             const int k_local = i % BK;
             const int oc      = oc_base + m;
             const int k_idx   = k_outer + k_local;
-            __half v = __float2half(0.0f);
+            __half v = __ushort_as_half(0);
             if (oc < out_ch && k_idx < K) {
                 v = w[(int64_t)oc * K + k_idx];
             }
@@ -124,7 +124,7 @@ __global__ void conv1d_mma_kernel(
             const int k_local = i % BK;
             const int t       = t_base + n_local;
             const int k_idx   = k_outer + k_local;
-            __half v = __float2half(0.0f);
+            __half v = __ushort_as_half(0);
             if (t < out_seq && k_idx < K) {
                 const int ic   = k_idx / kernel;
                 const int k    = k_idx % kernel;
@@ -224,4 +224,5 @@ void ggml_cuda_op_conv_1d_direct(ggml_backend_cuda_context & ctx, ggml_tensor * 
         DISPATCH_CONV1D(__half, __half);
     }
 #undef DISPATCH_CONV1D
+    CUDA_CHECK(cudaGetLastError());
 }
