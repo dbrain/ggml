@@ -213,6 +213,9 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         case GGML_TYPE_F16:
             concat_dispatch<half>(ctx, dst);
             break;
+        case GGML_TYPE_I32:
+            concat_dispatch<int32_t>(ctx, dst);
+            break;
         default:
             GGML_ABORT("ggml_cuda_op_concat: unsupported dtype %s", ggml_type_name(src0->type));
     }
