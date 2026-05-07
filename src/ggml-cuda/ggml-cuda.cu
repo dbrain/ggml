@@ -108,12 +108,25 @@ typedef bool (*ggml_cuda_mul_mat_hook_fn)(
     cudaStream_t                stream);
 
 void ggml_cuda_set_mul_mat_hook(ggml_cuda_mul_mat_hook_fn fn);
+
+// Optional graph-compute-begin hook. Called once at the top of every
+// ggml_backend_cuda_graph_compute invocation, before any node executes.
+// qwen3-tts megakernel uses this to invalidate cross-graph caches (e.g.,
+// the Q8_1 staging buffer) since pool allocators may give the same
+// pointer to a different logical tensor across graph computes.
+typedef void (*ggml_cuda_graph_begin_hook_fn)(ggml_backend_cuda_context * ctx);
+void ggml_cuda_set_graph_begin_hook(ggml_cuda_graph_begin_hook_fn fn);
 }  // extern "C"
 
-static ggml_cuda_mul_mat_hook_fn g_ggml_cuda_mul_mat_hook = nullptr;
+static ggml_cuda_mul_mat_hook_fn   g_ggml_cuda_mul_mat_hook    = nullptr;
+static ggml_cuda_graph_begin_hook_fn g_ggml_cuda_graph_begin_hook = nullptr;
 
 extern "C" void ggml_cuda_set_mul_mat_hook(ggml_cuda_mul_mat_hook_fn fn) {
     g_ggml_cuda_mul_mat_hook = fn;
+}
+
+extern "C" void ggml_cuda_set_graph_begin_hook(ggml_cuda_graph_begin_hook_fn fn) {
+    g_ggml_cuda_graph_begin_hook = fn;
 }
 
 [[noreturn]]
@@ -4493,6 +4506,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    if (g_ggml_cuda_graph_begin_hook) {
+        g_ggml_cuda_graph_begin_hook(cuda_ctx);
+    }
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
