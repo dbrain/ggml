@@ -97,11 +97,15 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 // hook handled the op, false to fall through to the generic path. The kernel code
 // itself lives outside ggml; only the indirection is here.
 extern "C" {
+// Hook is passed the active compute stream so it can launch on the same
+// non-blocking stream ggml uses; launching on stream 0 would race because
+// ggml's per-context streams are created with cudaStreamNonBlocking.
 typedef bool (*ggml_cuda_mul_mat_hook_fn)(
     ggml_backend_cuda_context * ctx,
     const ggml_tensor *         src0,
     const ggml_tensor *         src1,
-    ggml_tensor *               dst);
+    ggml_tensor *               dst,
+    cudaStream_t                stream);
 
 void ggml_cuda_set_mul_mat_hook(ggml_cuda_mul_mat_hook_fn fn);
 }  // extern "C"
@@ -2557,7 +2561,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    if (g_ggml_cuda_mul_mat_hook && g_ggml_cuda_mul_mat_hook(&ctx, src0, src1, dst)) {
+    if (g_ggml_cuda_mul_mat_hook && g_ggml_cuda_mul_mat_hook(&ctx, src0, src1, dst, ctx.stream())) {
         return;
     }
 
