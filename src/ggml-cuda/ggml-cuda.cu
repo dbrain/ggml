@@ -5186,9 +5186,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_POOL_2D:
             return true;
         case GGML_OP_ACC:
-            // TODO: extend support like so:
-            //return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]);
-            return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+            // Kernel preconditions (acc.cu:46-52): src0/src1/dst must share
+            // dtype, dtype must be F32 or F16, src1 must be contiguous,
+            // dst must be element-tight + contiguously-allocated.
+            return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   op->src[0]->type == op->src[1]->type &&
+                   op->type == op->src[0]->type &&
+                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
         case GGML_OP_SUM:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_TOP_K:
@@ -5232,8 +5236,23 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_SNAKE:
+            // snake.cu:73-78: contiguous src0/dst, src0/dst F32 or F16,
+            // src1/src2 (alpha/beta) must be F32.
+            return ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op) &&
+                   (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+                   op->src[1] && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2] && op->src[2]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_1D_DIRECT:
-            return true;
+            // conv-1d-direct.cu:174-179: weights (src0) must be F16, input
+            // (src1) and dst F32 or F16, all three contiguous.
+            return op->src[0]->type == GGML_TYPE_F16 &&
+                   (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
+                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+                   ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op);
 
         default:
             return false;
