@@ -92,6 +92,26 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
 
+// Optional hook for shape-specialized matmul implementations (qwen3-tts megakernel
+// Phase A). When set, called at the top of ggml_cuda_mul_mat. Returns true if the
+// hook handled the op, false to fall through to the generic path. The kernel code
+// itself lives outside ggml; only the indirection is here.
+extern "C" {
+typedef bool (*ggml_cuda_mul_mat_hook_fn)(
+    ggml_backend_cuda_context * ctx,
+    const ggml_tensor *         src0,
+    const ggml_tensor *         src1,
+    ggml_tensor *               dst);
+
+void ggml_cuda_set_mul_mat_hook(ggml_cuda_mul_mat_hook_fn fn);
+}  // extern "C"
+
+static ggml_cuda_mul_mat_hook_fn g_ggml_cuda_mul_mat_hook = nullptr;
+
+extern "C" void ggml_cuda_set_mul_mat_hook(ggml_cuda_mul_mat_hook_fn fn) {
+    g_ggml_cuda_mul_mat_hook = fn;
+}
+
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
     int id = -1; // in case cudaGetDevice fails
@@ -2537,6 +2557,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (g_ggml_cuda_mul_mat_hook && g_ggml_cuda_mul_mat_hook(&ctx, src0, src1, dst)) {
+        return;
+    }
+
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
