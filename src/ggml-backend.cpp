@@ -491,6 +491,13 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
 #endif // NDEBUG
         size_t nbytes = ggml_nbytes(src);
         void * data = malloc(nbytes);
+        if (!data) {
+            GGML_LOG_ERROR("%s: malloc(%zu) failed during slow tensor copy from %s to %s\n",
+                           __func__, nbytes,
+                           ggml_backend_buffer_name(src->buffer),
+                           ggml_backend_buffer_name(dst->buffer));
+            return;
+        }
         ggml_backend_tensor_get(src, data, 0, nbytes);
         ggml_backend_tensor_set(dst, data, 0, nbytes);
         free(data);
@@ -1528,7 +1535,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             ggml_backend_synchronize(sched->backends[i]);
         }
 
-        ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+            GGML_LOG_ERROR("%s: failed to reserve graph\n", __func__);
+            return false;
+        }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
@@ -1751,8 +1761,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 
     // initialize hash table
-    // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
-    sched->hash_set    = ggml_hash_set_new(graph_size);
+    // hash_set holds both nodes and leaves (weight inputs); the assert at
+    // ggml_backend_sched_split_graph requires (n_nodes + n_leafs) <=
+    // hash_set.size, so size at 2 * graph_size to account for the leaf side.
+    sched->hash_set    = ggml_hash_set_new(2 * graph_size);
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
 
