@@ -57,6 +57,11 @@ void ggml_cuda_op_acc(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s3     = dst->op_params[2] / elem;
     const int64_t offset = dst->op_params[3] / elem;
 
+    // The kernel divides src1_idx by s3/s2/s1 to recover (i13,i12,i11,i10);
+    // a zero stride from a malformed caller would div-by-zero on GPU. Stock
+    // ggml_acc fills nb1/nb2/nb3 from dst's strides so this is defensive.
+    GGML_ASSERT(s1 > 0 && s2 > 0 && s3 > 0);
+
     const int64_t n_elements = ggml_nelements(dst);
     const int num_blocks = (n_elements + CUDA_ACC_BLOCK_SIZE - 1) / CUDA_ACC_BLOCK_SIZE;
 
@@ -69,4 +74,5 @@ void ggml_cuda_op_acc(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             (const __half *) src0->data, (const __half *) src1->data, (__half *) dst->data,
             n_elements, src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], s1, s2, s3, offset);
     }
+    CUDA_CHECK(cudaGetLastError());
 }

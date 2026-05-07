@@ -160,7 +160,7 @@ __global__ void conv_transpose_1d_mma_kernel(
             const int k_local = i % BK;
             const int oc      = oc_base + m;
             const int k_idx   = k_outer + k_local;
-            __half v = __float2half(0.0f);
+            __half v = __ushort_as_half(0);
             if (oc < out_ch && k_idx < K) {
                 const int ic = k_idx / kernel;
                 const int kk = k_idx % kernel;
@@ -177,7 +177,7 @@ __global__ void conv_transpose_1d_mma_kernel(
             const int k_local = i % BK;
             const int t       = t_base + n_local;
             const int k_idx   = k_outer + k_local;
-            __half v = __float2half(0.0f);
+            __half v = __ushort_as_half(0);
             if (t < out_seq && k_idx < K) {
                 const int ic = k_idx / kernel;
                 const int kk = k_idx % kernel;
@@ -277,6 +277,7 @@ void ggml_cuda_op_conv_transpose_1d(ggml_backend_cuda_context & ctx, ggml_tensor
             DISPATCH_CT1D(__half, __half);
         }
 #undef DISPATCH_CT1D
+        CUDA_CHECK(cudaGetLastError());
 
         GGML_UNUSED(p0);
         GGML_UNUSED(d0);
@@ -295,4 +296,5 @@ void ggml_cuda_op_conv_transpose_1d(ggml_backend_cuda_context & ctx, ggml_tensor
         src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
         dst->ne[0],  dst->ne[1],  dst->ne[2],  dst->ne[3],
         src0_d, src1_d, dst_d, stream);
+    CUDA_CHECK(cudaGetLastError());
 }
