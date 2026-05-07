@@ -108,8 +108,12 @@ void ggml_cuda_set_mul_mat_hook(ggml_cuda_mul_mat_hook_fn fn);
 // ggml_backend_cuda_graph_compute invocation, before any node executes.
 // qwen3-tts megakernel uses this to invalidate cross-graph caches (e.g.,
 // the Q8_1 staging buffer) since pool allocators may give the same
-// pointer to a different logical tensor across graph computes.
-typedef void (*ggml_cuda_graph_begin_hook_fn)(ggml_backend_cuda_context * ctx);
+// pointer to a different logical tensor across graph computes — and to
+// pre-scan the cgraph for fusable patterns (Q→K→V, gate→up) so the
+// per-op hook can short-circuit follow-up ops it has already fused.
+typedef void (*ggml_cuda_graph_begin_hook_fn)(
+    ggml_backend_cuda_context * ctx,
+    const ggml_cgraph *         cgraph);
 void ggml_cuda_set_graph_begin_hook(ggml_cuda_graph_begin_hook_fn fn);
 }  // extern "C"
 
@@ -4312,7 +4316,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_set_device(cuda_ctx->device);
 
     if (g_ggml_cuda_graph_begin_hook) {
-        g_ggml_cuda_graph_begin_hook(cuda_ctx);
+        g_ggml_cuda_graph_begin_hook(cuda_ctx, cgraph);
     }
 
     bool use_cuda_graph             = false;
