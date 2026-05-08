@@ -22,6 +22,22 @@ extern "C" {
 // backend API
 GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 
+// Stream priority hints — relative, clamped to the device's
+// cudaDeviceGetStreamPriorityRange. Passed to cudaStreamCreateWithPriority
+// when streams are first created on the returned backend.
+//   DEFAULT: same behavior as ggml_backend_cuda_init (cudaStreamCreateWithFlags).
+//   LOW:     yield SM time to higher-priority streams on the same device
+//            (e.g. async-vocoder backend yielding to the talker backend).
+//   HIGH:    preempt LOW/DEFAULT streams on the same device.
+// On devices with a single priority level the hints are no-ops.
+enum ggml_cuda_stream_priority {
+    GGML_CUDA_STREAM_PRIORITY_DEFAULT =  0,
+    GGML_CUDA_STREAM_PRIORITY_LOW     =  1,
+    GGML_CUDA_STREAM_PRIORITY_HIGH    = -1,
+};
+
+GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init_with_priority(int device, int priority);
+
 GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 
 // device buffer
