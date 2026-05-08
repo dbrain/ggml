@@ -9,15 +9,33 @@ Some of the development is currently happening in the [llama.cpp](https://github
 
 ## This fork
 
-> ⚠️See warning / rant over here: https://github.com/dbrain/qwen3-tts.cpp#added-in-this-fork ⚠️
-> 
-> TL;DR Robot generated guff, technically a software engineer and I'm sure I could "work this out myself" if I wanted to, but in its currently state it's entirely "Claude take the wheel"
-> 
-> Background: I wanted to play with qwen3-tts and the current state was unusable on my hardware (RTX 3060 12GB). The changes here and at https://github.com/dbrain/qwen3-tts.cpp took me from 0.1 RTS -> 2.8 RTS on Q8, i.e. "would need to pre-process text" to "I can TTS at 2x" with no quality drops that I can perceive (but I may be tone deaf).
-> 
-> If I couldn't "hey claude, stop being a quitter and do that massive change you said might boost performance" on a loop I probably would have started looking at this and maybe even learnt to translate what the commit messages are saying to human (in between mma_syncing my gemms), but I definitely would have just bailed before getting to any kind of useful progress.
->
-> Probably a "never upstream change" - I'm sure as hell not creating a PR for (likely horrible) code I may never bother to understand properly. Potentially a "Only works on my hardware". Basically "Here be dragons".
+This is a Qwen3-TTS-specific fork of [`ggml-org/ggml`](https://github.com/ggml-org/ggml) used as the backing tensor library for [`dbrain/qwen3-tts.cpp`](https://github.com/dbrain/qwen3-tts.cpp). 13 commits ahead of upstream `master`.
+
+What it adds, by area:
+
+**Vocoder kernels (CUDA):**
+- `GGML_OP_SNAKE` (CPU + CUDA, F32/F16) — fused `α·sin(βx)² + γx` for the WavTokenizer-class vocoder activation. Replaces a `pow(sin(αx), 2) / α + β·x` broadcast chain with ~10× tensor-broadcast overhead.
+- `GGML_OP_CONV_1D_DIRECT` — smem-tiled CUDA kernel with a tensor-core `wmma` variant (F16 weights). Single biggest win on the vocoder side of the qwen3-tts fork (see [`dbrain/qwen3-tts.cpp/docs/ARCHITECTURE.md`](https://github.com/dbrain/qwen3-tts.cpp/blob/main/docs/ARCHITECTURE.md)).
+- smem-tiled F16 wmma `conv_transpose_1d` kernel.
+- F16 in/out paths through `conv_1d_direct`, `conv_transpose_1d`, `snake`, `acc` + `ggml_*_to` dst-type API variants — keeps the cascade in F16 instead of F32 and halves the scheduler arena.
+- `concat` F16 + I32 paths (was F32-only via assert).
+
+**Talker / megakernel infrastructure (CUDA):**
+- `mul_mat` dispatcher hook (`ggml_cuda_set_mul_mat_hook`) — lets external code install shape-specialized matmul kernels at runtime, falling through to ggml's generic path on miss.
+- `graph_compute_begin` hook + cgraph-aware variant — per-cgraph plan rebuild trigger; receives the cgraph so external code can scan for fusion opportunities before dispatch.
+- Generic per-op hook — for sub-op fusion (currently unused in production; the fusions that needed it didn't pay).
+- `Q4_K` `get_rows` CUDA kernel (was missing — Q4_K_M models couldn't get_rows on GPU and fell back to CPU).
+- I32 `row_indices` in the `ROPE+VIEW+SET_ROWS` fusion path — unblocks talker streaming KV writes.
+
+**Multi-backend / latency-sensitive workloads:**
+- `ggml_backend_cuda_init_with_priority` + `params="priority=low|high"` parsing in `device_init_backend`. Lets a process pin specific backends (e.g. talker = HIGH, vocoder = default) so high-priority work preempts low-priority work for SM time. (No-op on consumer Ampere where `cudaDeviceGetStreamPriorityRange` returns `[-5, 0]` and least == default; useful on devices with a real priority range below default.)
+- Sched fixes: `hash_set` 2× `graph_size`; `reserve_n` failure check; null-check on tensor-copy malloc.
+- Kernel-launch error checks in `conv_1d_direct`, `snake`, `acc`.
+- `supports_op` tightening for `CONV_1D_DIRECT`, `SNAKE`, `ACC`.
+
+These are mostly Qwen3-TTS-specific layouts (`wmma` shapes, F16 conv variants tuned around the cascade arena budget, the snake activation) or invasive enough that they don't merge upstream as-is. The fork exists so the qwen3-tts.cpp build can pin a known-working ggml without waiting on PR cycles for project-specific kernels.
+
+For the project this powers, see [`dbrain/qwen3-tts.cpp`](https://github.com/dbrain/qwen3-tts.cpp). Performance numbers, methodology, and the lever-by-lever architecture story live in that repo's README + `docs/`.
 
 ## Features
 
