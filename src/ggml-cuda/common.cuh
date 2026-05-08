@@ -1402,6 +1402,11 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // Relative stream priority hint (see ggml_cuda_stream_priority). 0 keeps
+    // historical cudaStreamCreateWithFlags behavior; non-zero swaps in
+    // cudaStreamCreateWithPriority on first stream() call per (device,no).
+    int stream_priority_hint = 0;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
@@ -1459,6 +1464,12 @@ struct ggml_backend_cuda_context {
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
+    ggml_backend_cuda_context(int device, int stream_priority_hint) :
+        device(device),
+        name(GGML_CUDA_NAME + std::to_string(device)),
+        stream_priority_hint(stream_priority_hint) {
+    }
+
     ggml_cuda_stream_context concurrent_stream_context;
 
     ~ggml_backend_cuda_context();
@@ -1466,7 +1477,17 @@ struct ggml_backend_cuda_context {
     cudaStream_t stream(int device, int stream) {
         if (streams[device][stream] == nullptr) {
             ggml_cuda_set_device(device);
-            CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
+            if (stream_priority_hint == 0) {
+                CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
+            } else {
+                int least_priority = 0;
+                int greatest_priority = 0;
+                CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority));
+                // CUDA priority: lower numerical value = higher priority.
+                // Hint > 0 → least (lowest) priority; hint < 0 → greatest (highest).
+                int cuda_priority = (stream_priority_hint > 0) ? least_priority : greatest_priority;
+                CUDA_CHECK(cudaStreamCreateWithPriority(&streams[device][stream], cudaStreamNonBlocking, cuda_priority));
+            }
         }
         return streams[device][stream];
     }

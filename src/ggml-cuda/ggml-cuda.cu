@@ -5101,9 +5101,27 @@ static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_back
 }
 
 static ggml_backend_t ggml_backend_cuda_device_init_backend(ggml_backend_dev_t dev, const char * params) {
-    GGML_UNUSED(params);
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
-    return ggml_backend_cuda_init(ctx->device);
+
+    // Optional comma-separated key=value params. Currently honored:
+    //   priority=low | priority=high | priority=default
+    // Anything else is ignored so callers can pass shared params strings.
+    int priority = GGML_CUDA_STREAM_PRIORITY_DEFAULT;
+    if (params && *params) {
+        const char * p = strstr(params, "priority=");
+        if (p) {
+            p += 9;
+            if (strncmp(p, "low", 3) == 0) {
+                priority = GGML_CUDA_STREAM_PRIORITY_LOW;
+            } else if (strncmp(p, "high", 4) == 0) {
+                priority = GGML_CUDA_STREAM_PRIORITY_HIGH;
+            }
+        }
+    }
+    if (priority == GGML_CUDA_STREAM_PRIORITY_DEFAULT) {
+        return ggml_backend_cuda_init(ctx->device);
+    }
+    return ggml_backend_cuda_init_with_priority(ctx->device, priority);
 }
 
 static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_backend_dev_t dev) {
@@ -5778,12 +5796,16 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
 }
 
 ggml_backend_t ggml_backend_cuda_init(int device) {
+    return ggml_backend_cuda_init_with_priority(device, GGML_CUDA_STREAM_PRIORITY_DEFAULT);
+}
+
+ggml_backend_t ggml_backend_cuda_init_with_priority(int device, int priority) {
     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
         return nullptr;
     }
 
-    ggml_backend_cuda_context * ctx = new ggml_backend_cuda_context(device);
+    ggml_backend_cuda_context * ctx = new ggml_backend_cuda_context(device, priority);
     if (ctx == nullptr) {
         GGML_LOG_ERROR("%s: failed to allocate context\n", __func__);
         return nullptr;
