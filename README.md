@@ -1,5 +1,11 @@
 # ggml
 
+> ⚠️ PSAs/TLDRs from the potato that told Claude to make [khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp) usable on my hardware, and brought ggml along for the ride
+> - LLM generated noise - I'm a software engineer but I won't pretend to know anything about this space, I just wanted my stuff to run quickerer and when the wins started rolling in framed the goal as "go insane" then "while true; echo 'NOT INSANE ENOUGH, I WANT RTF TO BE AT LEAST.... 3 TIMES AS BIG/SMALL AS THIS!'; done". Current master is the result of the Claudes starting to push back with evidence that we were at the cap. Will ask Mythos if it ever comes out instead of just being pre-shilled around the internet.
+> - Entirely tested and targetted at my hardware (RTX 3060 12GB, AMD misc), may explode on anything else or run slower. Likely any CUDA device would benefit but I'm no nvidiaologist
+> - See [dbrain/qwen3-tts.cpp](https://github.com/dbrain/qwen3-tts.cpp) for full list so I don't need to copy paste - essentially any changes here are to drive that or the other projects I'm doing the same "make it quickerer" run on (parakeet/siglip2).
+> - TL;DR TL;DR "Works for me, too embarassing to upstream because I'm not going to be 'that guy' who PRs something he does not understand short of laughing at 'megakernel' sticking in claudes brain". Here be dragons.
+
 [Manifesto](https://github.com/ggerganov/llama.cpp/discussions/205)
 
 Tensor library for machine learning
