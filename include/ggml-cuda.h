@@ -61,6 +61,19 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
+// VRAM-probe helper. Reports how many cudaGraph_t/cudaGraphExec_t entries
+// are currently held in this backend's capture cache (one entry per unique
+// first-node ptr / topology key). Returns 0/0 if cuda-graph support is
+// disabled at build time. cudaGraph driver-side state is opaque, so the
+// total cudaGraphExec memory consumption is not directly reportable — use
+// `total_node_count` (sum of num_nodes across cached graphs) as a proxy.
+// Pass NULL to skip an output field. Safe to call on non-CUDA backends
+// (sets both to 0 and returns).
+GGML_BACKEND_API void ggml_backend_cuda_get_graph_cache_stats(
+    ggml_backend_t backend,
+    int    * out_graph_count,
+    size_t * out_total_node_count);
+
 #ifdef  __cplusplus
 }
 #endif

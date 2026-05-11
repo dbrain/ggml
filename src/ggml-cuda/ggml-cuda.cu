@@ -4713,6 +4713,28 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
     CUDA_CHECK(cudaMemGetInfo(free, total));
 }
 
+void ggml_backend_cuda_get_graph_cache_stats(ggml_backend_t backend,
+                                             int *    out_graph_count,
+                                             size_t * out_total_node_count) {
+    int    n_graphs = 0;
+    size_t n_nodes  = 0;
+#ifdef USE_CUDA_GRAPH
+    if (backend && ggml_backend_is_cuda(backend)) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+        if (cuda_ctx) {
+            n_graphs = (int) cuda_ctx->cuda_graphs.size();
+            for (const auto & [k, g] : cuda_ctx->cuda_graphs) {
+                if (g) n_nodes += g->num_nodes;
+            }
+        }
+    }
+#else
+    GGML_UNUSED(backend);
+#endif
+    if (out_graph_count)      *out_graph_count      = n_graphs;
+    if (out_total_node_count) *out_total_node_count = n_nodes;
+}
+
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
     if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
         return false;
