@@ -1080,9 +1080,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "ROPE_PE",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1192,9 +1194,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "rope_pe(x)",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4346,6 +4350,33 @@ struct ggml_tensor * ggml_rope_inplace(
     return ggml_rope_impl(
         ctx, a, b, NULL, n_dims, NULL, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, true
     );
+}
+
+// ggml_rope_pe — longcat-avatar fused interleaved RoPE from precomputed pe (cos/sin).
+// a:  [d_head, n_head, L, N]   pe: [2, 2, d_head/2, L]
+// out:[d_head, L, n_head*N]    (matches Rope::apply_rope rope_interleaved=true)
+struct ggml_tensor * ggml_rope_pe(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * pe) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(pe->type == GGML_TYPE_F32);
+    const int64_t d_head = a->ne[0];
+    const int64_t n_head = a->ne[1];
+    const int64_t L      = a->ne[2];
+    const int64_t N      = a->ne[3];
+    GGML_ASSERT(d_head % 2 == 0);
+    GGML_ASSERT(pe->ne[0] == 2 && pe->ne[1] == 2);
+    GGML_ASSERT(pe->ne[2] == d_head / 2);
+    GGML_ASSERT(pe->ne[3] == L);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_head, L, n_head * N);
+
+    result->op     = GGML_OP_ROPE_PE;
+    result->src[0] = a;
+    result->src[1] = pe;
+
+    return result;
 }
 
 struct ggml_tensor * ggml_rope_ext(
