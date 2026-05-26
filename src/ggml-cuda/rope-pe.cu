@@ -60,8 +60,22 @@ static __global__ void rope_pe_f32(
 
     // dst contiguous [d_head, L, HN]: element (i0, t, h) = i0 + d_head*t + d_head*L*h
     const int64_t d_base = (2 * j) + d_head * t + d_head * L * h;
-    dst[d_base]     = x_e * c - x_o * s;
-    dst[d_base + 1] = x_o * c + x_e * s;
+    // IEEE-exact match to the apply_rope chain (separate ggml_mul + ggml_add, NO
+    // fused multiply-add). nvcc contracts `a*b + c*d` to fmaf by default, which
+    // skips the intermediate product rounding and makes the op output differ from
+    // the chain at ~1e-5 — small in isolation, but it compounds over 48 blocks x
+    // 8 DMD steps and drifts the (chaotic) denoise trajectory off the 99 dB gate.
+    // __fmul_rn / __fadd_rn / __fsub_rn are un-contractable round-to-nearest
+    // primitives, so each product is rounded to F32 before the add — bit-identical
+    // to the chain's mul-then-add. The chain stores -sin and does cos*x_e + (-sin)*x_o
+    // for the even lane (negation is exact, so == x_e*c - x_o*s) and sin*x_e + cos*x_o
+    // for the odd lane.
+    const float pe_e = __fmul_rn(x_e, c);  // x_e * cos
+    const float po_e = __fmul_rn(x_o, s);  // x_o * sin
+    dst[d_base]     = __fsub_rn(pe_e, po_e);          // x_e*cos - x_o*sin
+    const float pe_o = __fmul_rn(x_e, s);  // x_e * sin
+    const float po_o = __fmul_rn(x_o, c);  // x_o * cos
+    dst[d_base + 1] = __fadd_rn(pe_o, po_o);          // x_e*sin + x_o*cos
 }
 
 void ggml_cuda_op_rope_pe(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
