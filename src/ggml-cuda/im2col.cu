@@ -125,24 +125,35 @@ static  __global__ void im2col_3d_kernel(
         int64_t IC_KD_KH_KW, int64_t OW_KD_KH_KW, int64_t OD_OH_OW_IC_KD_KH_KW, int64_t OH_OW_IC_KD_KH_KW,
         int64_t OW_IC_KD_KH_KW, int64_t N_OD_OH, int64_t OD_OH,
         int64_t stride_q, int64_t stride_z, int64_t stride_y, int64_t stride_x,
-        int s0, int s1, int s2, int p0, int p1, int p2, int d0, int d1, int d2) {
+        int s0, int s1, int s2, int p0, int p1, int p2, int d0, int d1, int d2,
+        uint3 fd_kdkhkw, uint3 fd_khkw, uint3 fd_kw, uint3 fd_odoh, uint3 fd_oh) {
     const int64_t i = threadIdx.x + blockIdx.x * blockDim.x;
     if (i >= IC_KD_KH_KW) {
         return;
     }
     GGML_UNUSED(N); GGML_UNUSED(OC); GGML_UNUSED(OH_OW); GGML_UNUSED(OD); GGML_UNUSED(OW); GGML_UNUSED(KD); GGML_UNUSED(KH);
     GGML_UNUSED(ID_IH_IW); GGML_UNUSED(IH_IW); GGML_UNUSED(IC_ID_IH_IW); GGML_UNUSED(OW_KD_KH_KW);
+    GGML_UNUSED(KD_KH_KW); GGML_UNUSED(KH_KW); GGML_UNUSED(KW);
 
-    const int64_t iic = i / KD_KH_KW;
-    const int64_t ikd = (i - iic * KD_KH_KW) / KH_KW;
-    const int64_t ikh = (i - iic * KD_KH_KW - ikd * KH_KW) / KW;
-    const int64_t ikw = i % KW;
+    // Decompose i -> (iic, ikd, ikh, ikw) via fast (multiply-shift) division.
+    // The 3060 has no hw int64 divide; the old int64 div/mod chain was the bottleneck
+    // (im2col_3d was ALU-bound at ~7% of mem BW). fast_div_modulo is bit-exact here
+    // (all indices/divisors fit u32), so the im2col output is unchanged. (lap-21)
+    const uint2 dm_ic = fast_div_modulo((uint32_t) i,    fd_kdkhkw);   // iic, rem(kd*kh*kw)
+    const uint2 dm_kd = fast_div_modulo(dm_ic.y,         fd_khkw);     // ikd, rem(kh*kw)
+    const uint2 dm_kh = fast_div_modulo(dm_kd.y,         fd_kw);       // ikh, ikw
+    const int64_t iic = dm_ic.x;
+    const int64_t ikd = dm_kd.x;
+    const int64_t ikh = dm_kh.x;
+    const int64_t ikw = dm_kh.y;
 
     for (int64_t iow = blockIdx.y; iow < OW; iow += MAX_GRIDDIM_Y) {
         for (int64_t iz = blockIdx.z; iz < N_OD_OH; iz += MAX_GRIDDIM_Z) {
-            const int64_t in  = iz / OD_OH;
-            const int64_t iod = (iz - in*OD_OH) / OH;
-            const int64_t ioh = iz % OH;
+            const uint2 dm_n  = fast_div_modulo((uint32_t) iz, fd_odoh);  // in, rem(od*oh)
+            const uint2 dm_d  = fast_div_modulo(dm_n.y,        fd_oh);    // iod, ioh
+            const int64_t in  = dm_n.x;
+            const int64_t iod = dm_d.x;
+            const int64_t ioh = dm_d.y;
 
             const int64_t iiw = iow * s0 + ikw * d0 - p0;
             const int64_t iih = ioh * s1 + ikh * d1 - p1;
@@ -182,6 +193,12 @@ static void im2col_3d_cuda(const float * src, T* dst,
     const int64_t OW_IC_KD_KH_KW = OW*IC*KD*KH*KW;
     const int64_t num_blocks = (IC_KD_KH_KW + CUDA_IM2COL_BLOCK_SIZE - 1) / CUDA_IM2COL_BLOCK_SIZE;
     dim3 block_nums(num_blocks, MIN(OW, MAX_GRIDDIM_Y), MIN(N_OD_OH, MAX_GRIDDIM_Z));
+    // Precompute multiply-shift divisors for the kernel's index decomposition (loop-invariant).
+    const uint3 fd_kdkhkw = init_fastdiv_values((uint64_t) KD_KH_KW);
+    const uint3 fd_khkw   = init_fastdiv_values((uint64_t) KH_KW);
+    const uint3 fd_kw     = init_fastdiv_values((uint64_t) KW);
+    const uint3 fd_odoh   = init_fastdiv_values((uint64_t) OD_OH);
+    const uint3 fd_oh     = init_fastdiv_values((uint64_t) OH);
     // [IM2COL_PROF] env-gated per-call shape/bandwidth probe (LONGCAT_IM2COL_PROF).
     // Times THIS im2col_3d launch and reports achieved write-bandwidth vs the GPU peak
     // so we can tell if the op is a memory-bound materialization at peak (=> only an
@@ -194,7 +211,8 @@ static void im2col_3d_cuda(const float * src, T* dst,
                                                                                            IC_KD_KH_KW, OW_KD_KH_KW, OD_OH_OW_IC_KD_KH_KW,
                                                                                            OH_OW_IC_KD_KH_KW, OW_IC_KD_KH_KW, N_OD_OH, OD_OH,
                                                                                            stride_q, stride_z, stride_y, stride_x,
-                                                                                           s0, s1, s2, p0, p1, p2, d0, d1, d2);
+                                                                                           s0, s1, s2, p0, p1, p2, d0, d1, d2,
+                                                                                           fd_kdkhkw, fd_khkw, fd_kw, fd_odoh, fd_oh);
     if (lc_im2col_prof) {
         cudaEventRecord(lc_ev1, stream); cudaEventSynchronize(lc_ev1);
         float lc_ms = 0.0f; cudaEventElapsedTime(&lc_ms, lc_ev0, lc_ev1);
