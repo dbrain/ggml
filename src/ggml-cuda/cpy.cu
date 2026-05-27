@@ -415,6 +415,13 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     const bool can_be_transposed = nb01 == (int64_t)ggml_element_size(src0) &&
         src0->ne[3] == 1 && nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0);
 
+    // [CONT_PROF] env-gated per-call cpy/cont classification + timing (LONGCAT_CONT_PROF).
+    // Reports src shape/strides, the dispatch path (memcpy / transpose / scalar-strided),
+    // and achieved bandwidth, so the VAE pixel-shuffle CONT hot-spot can be localized.
+    const bool lc_cont_prof = getenv("LONGCAT_CONT_PROF") != nullptr;
+    cudaEvent_t lc_e0 = nullptr, lc_e1 = nullptr;
+    if (lc_cont_prof) { cudaEventCreate(&lc_e0); cudaEventCreate(&lc_e1); cudaEventRecord(lc_e0, main_stream); }
+
     if (src0->type == src1->type && contiguous_srcs) {
         GGML_ASSERT(ggml_nbytes(src0) == ggml_nbytes(src1));
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
@@ -557,6 +564,20 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     } else {
         GGML_ABORT("%s: unsupported type combination (%s to %s)\n", __func__,
                 ggml_type_name(src0->type), ggml_type_name(src1->type));
+    }
+
+    if (lc_cont_prof) {
+        cudaEventRecord(lc_e1, main_stream); cudaEventSynchronize(lc_e1);
+        float ms = 0.f; cudaEventElapsedTime(&ms, lc_e0, lc_e1);
+        const char * path = contiguous_srcs ? "memcpy" : (can_be_transposed ? "transpose" : "SCALAR");
+        const double bytes = (double) ggml_nbytes(src0) + (double) ggml_nbytes(src1);
+        const double gbps  = ms > 0 ? (bytes / 1e9) / (ms / 1e3) : 0.0;
+        fprintf(stderr, "[CONT_PROF] %-9s %s->%s ne=[%ld,%ld,%ld,%ld] srcnb=[%ld,%ld,%ld,%ld] | %.3f ms | %.1f MiB | %.0f GB/s\n",
+                path, ggml_type_name(src0->type), ggml_type_name(src1->type),
+                (long)ne00,(long)ne01,(long)ne02,(long)src0->ne[3],
+                (long)nb00,(long)nb01,(long)nb02,(long)nb03,
+                ms, bytes/1048576.0, gbps);
+        cudaEventDestroy(lc_e0); cudaEventDestroy(lc_e1);
     }
 }
 
