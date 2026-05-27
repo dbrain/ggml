@@ -1,5 +1,7 @@
 #include "im2col.cuh"
 
+#include <cstring>  // memcmp (LONGCAT_IM2COL_VERIFY)
+
 #define MAX_GRIDDIM_Y 65535
 #define MAX_GRIDDIM_Z 65535
 
@@ -171,6 +173,209 @@ static  __global__ void im2col_3d_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// lap-23: shared-memory halo-tiled im2col_3d (fast path: stride=1, dilation=1,
+// pad=0 — the Wan-VAE CausalConv3d shapes, which pre-pad the input externally
+// so the im2col itself sees pad=0 ⇒ every tap is in-bounds, no boundary checks).
+//
+// The fastdiv kernel (above) is gather-read-latency bound: each output tap does
+// an independent, cache-line-wasteful global load of the 3x3x3xICh neighborhood
+// (~51 GB/s = 14% of peak). Here a block stages the reused input window for a
+// (channel-block CB x all-OD x TOHxTOW) output tile into shared memory ONCE
+// (coalesced global read), then threads write the im2col columns from smem.
+// Input is re-read only ~1.4x (halo overlap) instead of the ~10x cache-line
+// amplification of the scattered gather; writes stay coalesced (the contiguous
+// dst column slab CB*KD*KH*KW is owned by consecutive threadIdx.x).
+//
+// Thread layout: blockDim.x = (CB*KD*KH*KW)/VEC (each thread owns VEC consecutive
+// entries of one output's CB-channel column slab, coalesced), blockDim.y = P
+// output positions processed concurrently (all sharing the staged smem). Each
+// (tx,ty) loops the tile's OD*TOH*TOW outputs. VEC=2 (F16 only) packs the two
+// consecutive F16 column entries into one 32-bit `half2` store — widening the
+// per-warp write transaction 64B→128B, the lever past the ~155 GB/s scalar-store
+// plateau. Falls back (host returns false) on any shape it can't cover.
+// Bit-exact vs the fastdiv kernel (pure data movement, no arithmetic on values).
+template <typename T, int VEC>
+static __global__ void im2col_3d_tiled_kernel(
+        const float * __restrict__ src, T * __restrict__ dst,
+        int IC, int ID, int IH, int IW,
+        int KD, int KH, int KW, int OD, int OH, int OW,
+        int CB, int TOH, int TOW,
+        int KH_KW, int KD_KH_KW,
+        int64_t IC_KD_KH_KW, int64_t OW_IC_KD_KH_KW, int64_t OH_OW_IC_KD_KH_KW, int64_t OD_OH_OW_IC_KD_KH_KW,
+        int num_cblocks, int n_oh_tiles, int n_ow_tiles,
+        uint3 fd_kdkhkw, uint3 fd_khkw, uint3 fd_kw, uint3 fd_tow, uint3 fd_towtoh,
+        uint3 fd_ncblocks, uint3 fd_nohtiles) {
+    extern __shared__ char smem_raw[];
+    float * smem = (float *) smem_raw;
+
+    const int SH = TOH + KH - 1;          // staged input rows  (halo)
+    const int SW = TOW + KW - 1;          // staged input cols  (halo)
+    const int DHW = ID * SH * SW;         // smem stride per channel
+
+    // Decode blockIdx.z -> (n, channel-block); blockIdx.y -> (?, oh-tile) [n folded in z]
+    const int bz = blockIdx.z;
+    const int in = fastdiv((uint32_t) bz, fd_ncblocks);
+    const int cb = bz - in * num_cblocks;
+    const int cb0 = cb * CB;
+    const int CBeff = min(CB, IC - cb0);
+
+    const int oh0 = blockIdx.y * TOH;
+    const int ow0 = blockIdx.x * TOW;
+
+    const int tid    = threadIdx.y * blockDim.x + threadIdx.x;
+    const int nthreads = blockDim.x * blockDim.y;
+
+    // ---- stage input window into smem (coalesced over the W/col dim) ----
+    const int64_t src_chan_base = (int64_t)(in * IC + cb0) * ID * IH * IW;
+    const int smem_elems = CBeff * DHW;
+    for (int e = tid; e < smem_elems; e += nthreads) {
+        int t = e;
+        const int sc  = t % SW;  t /= SW;
+        const int sr  = t % SH;  t /= SH;
+        const int iid = t % ID;  t /= ID;
+        const int icl = t;                       // < CBeff
+        const int iih = oh0 + sr;
+        const int iiw = ow0 + sc;
+        float v = 0.0f;
+        if (iih < IH && iiw < IW) {
+            v = src[src_chan_base + (int64_t)icl * ID * IH * IW + (int64_t)iid * IH * IW + (int64_t)iih * IW + iiw];
+        }
+        smem[(int64_t)icl * DHW + ((int64_t)iid * SH + sr) * SW + sc] = v;
+    }
+    __syncthreads();
+
+    // ---- decode this thread's VEC consecutive column-slab entries ----
+    const int c0 = threadIdx.x * VEC;            // block-local column start
+    int s_icl[VEC], s_ikd[VEC], s_ikh[VEC], s_ikw[VEC];
+    bool any_active = false;
+#pragma unroll
+    for (int j = 0; j < VEC; ++j) {
+        const uint2 d_icl = fast_div_modulo((uint32_t)(c0 + j), fd_kdkhkw);
+        const uint2 d_ikd = fast_div_modulo(d_icl.y,            fd_khkw);
+        const uint2 d_ikh = fast_div_modulo(d_ikd.y,            fd_kw);
+        s_icl[j] = d_icl.x; s_ikd[j] = d_ikd.x; s_ikh[j] = d_ikh.x; s_ikw[j] = d_ikh.y;
+        any_active |= (d_icl.x < CBeff);
+    }
+    const int64_t col = (int64_t) cb0 * KD_KH_KW + c0;   // contiguous dst column index
+
+    // ---- iterate the tile's output positions (each written from smem) ----
+    const int n_out = OD * TOH * TOW;
+    for (int o = threadIdx.y; o < n_out; o += blockDim.y) {
+        const uint2 d_iod = fast_div_modulo((uint32_t) o, fd_towtoh);  // iod, rem(toh*tow)
+        const uint2 d_loh = fast_div_modulo(d_iod.y,      fd_tow);     // loh, low
+        const int iod = d_iod.x;
+        const int loh = d_loh.x;
+        const int low = d_loh.y;
+        const int oh  = oh0 + loh;
+        const int ow  = ow0 + low;
+        if (!any_active || oh >= OH || ow >= OW) {
+            continue;
+        }
+        const int64_t base = (int64_t) in * OD_OH_OW_IC_KD_KH_KW
+                           + (int64_t) iod * OH_OW_IC_KD_KH_KW
+                           + (int64_t) oh  * OW_IC_KD_KH_KW
+                           + (int64_t) ow  * IC_KD_KH_KW
+                           + col;
+        // smem[icl][iid=iod+ikd][srow=loh+ikh][scol=low+ikw]
+        float v[VEC];
+#pragma unroll
+        for (int j = 0; j < VEC; ++j) {
+            v[j] = (s_icl[j] < CBeff)
+                 ? smem[(int64_t)s_icl[j] * DHW + ((int64_t)(iod + s_ikd[j]) * SH + (loh + s_ikh[j])) * SW + (low + s_ikw[j])]
+                 : 0.0f;
+        }
+        if constexpr (VEC == 2 && sizeof(T) == 2) {  // F16: one aligned half2 store
+            __half2 h2 = __floats2half2_rn(v[0], v[1]);
+            *reinterpret_cast<__half2 *>(&dst[base]) = h2;
+        } else {
+#pragma unroll
+            for (int j = 0; j < VEC; ++j) {
+                if (s_icl[j] < CBeff) dst[base + j] = v[j];
+            }
+        }
+    }
+    GGML_UNUSED(n_oh_tiles); GGML_UNUSED(n_ow_tiles);
+    GGML_UNUSED(fd_nohtiles);
+}
+
+// Launch the tiled fast path. Returns false (no launch) for shapes it doesn't
+// cover, so the caller falls back to the fastdiv kernel (correctness can't regress).
+template <typename T>
+static bool im2col_3d_tiled_try(const float * src, T * dst,
+    int64_t N, int64_t IC, int64_t ID, int64_t IH, int64_t IW,
+    int64_t KD, int64_t KH, int64_t KW, int64_t OD, int64_t OH, int64_t OW,
+    int s0, int s1, int s2, int p0, int p1, int p2, int d0, int d1, int d2, cudaStream_t stream) {
+    // Fast path only: unit stride/dilation, zero pad (input pre-padded by the
+    // CausalConv3d). Then OD=ID-KD+1 etc. ⇒ every tap in-bounds (no clamps).
+    if (!(s0 == 1 && s1 == 1 && s2 == 1 && d0 == 1 && d1 == 1 && d2 == 1 &&
+          p0 == 0 && p1 == 0 && p2 == 0)) {
+        return false;
+    }
+    if (getenv("LONGCAT_IM2COL_NOTILE")) {
+        return false;
+    }
+
+    // Tunable tile (env LONGCAT_IM2COL_TILE="CB,TOH,TOW,P"); default measured-good
+    // (sm_86 / RTX 3060, lap-23 sweep). VEC=2 packs two F16 column entries into a
+    // half2 store (env LONGCAT_IM2COL_NOVEC2 forces the scalar store path).
+    int CB = 8, TOH = 8, TOW = 8, P = 4;
+    if (const char * t = getenv("LONGCAT_IM2COL_TILE")) {
+        sscanf(t, "%d,%d,%d,%d", &CB, &TOH, &TOW, &P);
+    }
+    const int KD_KH_KW = (int)(KD * KH * KW);
+    const int cols = CB * KD_KH_KW;              // CB-channel contiguous dst column slab
+    // VEC=2 requires F16 dst, an even slab, and IC%CB==0 (every block full ⇒ the
+    // half2 pair never straddles into an out-of-range channel).
+    const int VEC = (sizeof(T) == 2 && (cols % 2) == 0 && (IC % CB) == 0 &&
+                     !getenv("LONGCAT_IM2COL_NOVEC2")) ? 2 : 1;
+    const int tpx = cols / VEC;                  // blockDim.x
+    if (tpx > 1024 || (int64_t) tpx * P > 1024) {
+        return false;
+    }
+    const int SH = TOH + (int) KH - 1;
+    const int SW = TOW + (int) KW - 1;
+    const size_t smem_bytes = (size_t) CB * ID * SH * SW * sizeof(float);
+    if (smem_bytes > 48 * 1024) {                // stay within the default opt-out-free limit
+        return false;
+    }
+
+    const int num_cblocks = (int)((IC + CB - 1) / CB);
+    const int n_oh_tiles  = (int)((OH + TOH - 1) / TOH);
+    const int n_ow_tiles  = (int)((OW + TOW - 1) / TOW);
+    const int64_t gz = N * num_cblocks;
+    if (n_ow_tiles > MAX_GRIDDIM_Y || n_oh_tiles > MAX_GRIDDIM_Y || gz > MAX_GRIDDIM_Z) {
+        return false;
+    }
+
+    const int64_t IC_KD_KH_KW          = IC * KD * KH * KW;
+    const int64_t OW_IC_KD_KH_KW       = OW * IC_KD_KH_KW;
+    const int64_t OH_OW_IC_KD_KH_KW    = OH * OW_IC_KD_KH_KW;
+    const int64_t OD_OH_OW_IC_KD_KH_KW = OD * OH_OW_IC_KD_KH_KW;
+
+    const uint3 fd_kdkhkw  = init_fastdiv_values((uint64_t) KD_KH_KW);
+    const uint3 fd_khkw    = init_fastdiv_values((uint64_t)(KH * KW));
+    const uint3 fd_kw      = init_fastdiv_values((uint64_t) KW);
+    const uint3 fd_tow     = init_fastdiv_values((uint64_t) TOW);
+    const uint3 fd_towtoh  = init_fastdiv_values((uint64_t)(TOW * TOH));
+    const uint3 fd_ncblocks= init_fastdiv_values((uint64_t) num_cblocks);
+    const uint3 fd_nohtiles= init_fastdiv_values((uint64_t) n_oh_tiles);
+
+    dim3 grid(n_ow_tiles, n_oh_tiles, (unsigned) gz);
+    dim3 block(tpx, P, 1);
+#define LC_TILED_LAUNCH(VECN) \
+    im2col_3d_tiled_kernel<T, VECN><<<grid, block, smem_bytes, stream>>>( \
+        src, dst, (int)IC, (int)ID, (int)IH, (int)IW, \
+        (int)KD, (int)KH, (int)KW, (int)OD, (int)OH, (int)OW, \
+        CB, TOH, TOW, (int)(KH * KW), KD_KH_KW, \
+        IC_KD_KH_KW, OW_IC_KD_KH_KW, OH_OW_IC_KD_KH_KW, OD_OH_OW_IC_KD_KH_KW, \
+        num_cblocks, n_oh_tiles, n_ow_tiles, \
+        fd_kdkhkw, fd_khkw, fd_kw, fd_tow, fd_towtoh, fd_ncblocks, fd_nohtiles)
+    if (VEC == 2) { LC_TILED_LAUNCH(2); } else { LC_TILED_LAUNCH(1); }
+#undef LC_TILED_LAUNCH
+    return true;
+}
+
 // [N*IC, ID, IH, IW] => [N*OD, OH, OW, IC * KD * KH * KW]
 template <typename T>
 static void im2col_3d_cuda(const float * src, T* dst,
@@ -203,16 +408,28 @@ static void im2col_3d_cuda(const float * src, T* dst,
     // Times THIS im2col_3d launch and reports achieved write-bandwidth vs the GPU peak
     // so we can tell if the op is a memory-bound materialization at peak (=> only an
     // implicit-GEMM / direct conv beats it) or an improvable kernel. Adds a sync; off by default.
-    const bool lc_im2col_prof = getenv("LONGCAT_IM2COL_PROF") != nullptr;
-    cudaEvent_t lc_ev0, lc_ev1;
-    if (lc_im2col_prof) { cudaEventCreate(&lc_ev0); cudaEventCreate(&lc_ev1); cudaEventRecord(lc_ev0, stream); }
-    im2col_3d_kernel<<<block_nums, MIN(IC_KD_KH_KW, CUDA_IM2COL_BLOCK_SIZE) , 0, stream>>>(src, dst, N, IC, ID, IH, IW, OC, KD, KH, KW, OD, OH, OW,
+    // fastdiv kernel launch (the universal fallback path).
+    auto launch_fastdiv = [&](T * out) {
+        im2col_3d_kernel<<<block_nums, MIN(IC_KD_KH_KW, CUDA_IM2COL_BLOCK_SIZE) , 0, stream>>>(src, out, N, IC, ID, IH, IW, OC, KD, KH, KW, OD, OH, OW,
                                                                                            OH_OW, KD_KH_KW, ID_IH_IW, KH_KW, IH_IW, IC_ID_IH_IW,
                                                                                            IC_KD_KH_KW, OW_KD_KH_KW, OD_OH_OW_IC_KD_KH_KW,
                                                                                            OH_OW_IC_KD_KH_KW, OW_IC_KD_KH_KW, N_OD_OH, OD_OH,
                                                                                            stride_q, stride_z, stride_y, stride_x,
                                                                                            s0, s1, s2, p0, p1, p2, d0, d1, d2,
                                                                                            fd_kdkhkw, fd_khkw, fd_kw, fd_odoh, fd_oh);
+    };
+
+    const bool lc_im2col_prof = getenv("LONGCAT_IM2COL_PROF") != nullptr;
+    cudaEvent_t lc_ev0, lc_ev1;
+    if (lc_im2col_prof) { cudaEventCreate(&lc_ev0); cudaEventCreate(&lc_ev1); cudaEventRecord(lc_ev0, stream); }
+
+    // lap-23: try the smem-tiled fast path; fall back to fastdiv on uncovered shapes.
+    const bool used_tiled = im2col_3d_tiled_try<T>(src, dst, N, IC, ID, IH, IW, KD, KH, KW, OD, OH, OW,
+                                                   s0, s1, s2, p0, p1, p2, d0, d1, d2, stream);
+    if (!used_tiled) {
+        launch_fastdiv(dst);
+    }
+
     if (lc_im2col_prof) {
         cudaEventRecord(lc_ev1, stream); cudaEventSynchronize(lc_ev1);
         float lc_ms = 0.0f; cudaEventElapsedTime(&lc_ms, lc_ev0, lc_ev1);
@@ -220,10 +437,38 @@ static void im2col_3d_cuda(const float * src, T* dst,
         const double wbytes    = out_elems * (double)sizeof(T);             // write traffic (dominant)
         const double rbytes    = (double)IC_ID_IH_IW * (double)N * 4.0;     // input read once (F32)
         const double gbps_w    = lc_ms > 0 ? (wbytes / 1e9) / (lc_ms / 1e3) : 0.0;
-        fprintf(stderr, "[IM2COL_PROF] N=%ld IC=%ld ID=%ld IH=%ld IW=%ld K=%ldx%ldx%ld OD=%ld OH=%ld OW=%ld | %.3f ms | wrote %.1f MiB (%.0f GB/s) | in %.1f MiB | expand x%ld\n",
+        fprintf(stderr, "[IM2COL_PROF] %s N=%ld IC=%ld ID=%ld IH=%ld IW=%ld K=%ldx%ldx%ld OD=%ld OH=%ld OW=%ld | %.3f ms | wrote %.1f MiB (%.0f GB/s) | in %.1f MiB | expand x%ld\n",
+                used_tiled ? "TILED" : "fastd",
                 (long)N,(long)IC,(long)ID,(long)IH,(long)IW,(long)KD,(long)KH,(long)KW,(long)OD,(long)OH,(long)OW,
                 lc_ms, wbytes/1048576.0, gbps_w, rbytes/1048576.0, (long)KD_KH_KW);
         cudaEventDestroy(lc_ev0); cudaEventDestroy(lc_ev1);
+    }
+
+    // [IM2COL_VERIFY] env-gated bit-exactness check: re-run fastdiv into a temp
+    // buffer and byte-compare. im2col is pure data movement so the tiled path
+    // must be byte-identical; this proves it per-call without a full render.
+    if (used_tiled && getenv("LONGCAT_IM2COL_VERIFY")) {
+        const int64_t out_elems = OD_OH_OW_IC_KD_KH_KW * N;
+        const size_t  nbytes    = (size_t) out_elems * sizeof(T);
+        T * ref = nullptr;
+        if (cudaMalloc(&ref, nbytes) == cudaSuccess) {
+            launch_fastdiv(ref);
+            cudaStreamSynchronize(stream);
+            std::vector<char> h_tiled(nbytes), h_ref(nbytes);
+            cudaMemcpy(h_tiled.data(), dst, nbytes, cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_ref.data(),   ref, nbytes, cudaMemcpyDeviceToHost);
+            int mism = memcmp(h_tiled.data(), h_ref.data(), nbytes);
+            int64_t nmis = 0;
+            if (mism != 0) {
+                for (int64_t e = 0; e < out_elems; ++e) {
+                    if (((const T *)h_tiled.data())[e] != ((const T *)h_ref.data())[e]) nmis++;
+                }
+            }
+            fprintf(stderr, "[IM2COL_VERIFY] %s | %ld elems | %s (mismatched=%ld)\n",
+                    mism == 0 ? "BIT-EXACT" : "MISMATCH",
+                    (long) out_elems, mism == 0 ? "ok" : "DIFF", (long) nmis);
+            cudaFree(ref);
+        }
     }
 }
 
