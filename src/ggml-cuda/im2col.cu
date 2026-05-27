@@ -182,12 +182,31 @@ static void im2col_3d_cuda(const float * src, T* dst,
     const int64_t OW_IC_KD_KH_KW = OW*IC*KD*KH*KW;
     const int64_t num_blocks = (IC_KD_KH_KW + CUDA_IM2COL_BLOCK_SIZE - 1) / CUDA_IM2COL_BLOCK_SIZE;
     dim3 block_nums(num_blocks, MIN(OW, MAX_GRIDDIM_Y), MIN(N_OD_OH, MAX_GRIDDIM_Z));
+    // [IM2COL_PROF] env-gated per-call shape/bandwidth probe (LONGCAT_IM2COL_PROF).
+    // Times THIS im2col_3d launch and reports achieved write-bandwidth vs the GPU peak
+    // so we can tell if the op is a memory-bound materialization at peak (=> only an
+    // implicit-GEMM / direct conv beats it) or an improvable kernel. Adds a sync; off by default.
+    const bool lc_im2col_prof = getenv("LONGCAT_IM2COL_PROF") != nullptr;
+    cudaEvent_t lc_ev0, lc_ev1;
+    if (lc_im2col_prof) { cudaEventCreate(&lc_ev0); cudaEventCreate(&lc_ev1); cudaEventRecord(lc_ev0, stream); }
     im2col_3d_kernel<<<block_nums, MIN(IC_KD_KH_KW, CUDA_IM2COL_BLOCK_SIZE) , 0, stream>>>(src, dst, N, IC, ID, IH, IW, OC, KD, KH, KW, OD, OH, OW,
                                                                                            OH_OW, KD_KH_KW, ID_IH_IW, KH_KW, IH_IW, IC_ID_IH_IW,
                                                                                            IC_KD_KH_KW, OW_KD_KH_KW, OD_OH_OW_IC_KD_KH_KW,
                                                                                            OH_OW_IC_KD_KH_KW, OW_IC_KD_KH_KW, N_OD_OH, OD_OH,
                                                                                            stride_q, stride_z, stride_y, stride_x,
                                                                                            s0, s1, s2, p0, p1, p2, d0, d1, d2);
+    if (lc_im2col_prof) {
+        cudaEventRecord(lc_ev1, stream); cudaEventSynchronize(lc_ev1);
+        float lc_ms = 0.0f; cudaEventElapsedTime(&lc_ms, lc_ev0, lc_ev1);
+        const double out_elems = (double)OD_OH_OW_IC_KD_KH_KW * (double)N;   // im2col output elements
+        const double wbytes    = out_elems * (double)sizeof(T);             // write traffic (dominant)
+        const double rbytes    = (double)IC_ID_IH_IW * (double)N * 4.0;     // input read once (F32)
+        const double gbps_w    = lc_ms > 0 ? (wbytes / 1e9) / (lc_ms / 1e3) : 0.0;
+        fprintf(stderr, "[IM2COL_PROF] N=%ld IC=%ld ID=%ld IH=%ld IW=%ld K=%ldx%ldx%ld OD=%ld OH=%ld OW=%ld | %.3f ms | wrote %.1f MiB (%.0f GB/s) | in %.1f MiB | expand x%ld\n",
+                (long)N,(long)IC,(long)ID,(long)IH,(long)IW,(long)KD,(long)KH,(long)KW,(long)OD,(long)OH,(long)OW,
+                lc_ms, wbytes/1048576.0, gbps_w, rbytes/1048576.0, (long)KD_KH_KW);
+        cudaEventDestroy(lc_ev0); cudaEventDestroy(lc_ev1);
+    }
 }
 
 static void im2col_3d_cuda_f16(const float * src, half * dst,
