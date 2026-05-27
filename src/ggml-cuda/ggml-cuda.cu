@@ -4404,6 +4404,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // [OP_PROFILE] LONGCAT_OP_PROFILE=1 → per-op-TYPE wall aggregator (a cudaEvent
+            // pair + full sync around each node). Inflates absolute time (serializes the
+            // stream) but the PROPORTIONS are exact. Prints a sorted breakdown after each
+            // graph_compute with a meaningful node count — in resident mode that isolates
+            // the monolithic DiT step (re lap-03/08; reverted-then-restored profiler).
+            const bool lc_op_profile = getenv("LONGCAT_OP_PROFILE") != nullptr;
+            double lc_op_ms[GGML_OP_COUNT]  = {0};
+            int    lc_op_cnt[GGML_OP_COUNT] = {0};
+            cudaEvent_t lc_ev0 = nullptr, lc_ev1 = nullptr;
+            if (lc_op_profile) {
+                cudaEventCreate(&lc_ev0);
+                cudaEventCreate(&lc_ev1);
+            }
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4471,7 +4485,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                if (lc_op_profile) {
+                    cudaEventRecord(lc_ev0, cuda_ctx->stream());
+                }
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                if (lc_op_profile) {
+                    cudaEventRecord(lc_ev1, cuda_ctx->stream());
+                    cudaEventSynchronize(lc_ev1);
+                    float ms = 0.f;
+                    cudaEventElapsedTime(&ms, lc_ev0, lc_ev1);
+                    lc_op_ms[node->op]  += ms;
+                    lc_op_cnt[node->op] += 1;
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -4480,6 +4505,29 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+            }
+
+            if (lc_op_profile) {
+                double tot = 0.0;
+                int    nn  = 0;
+                for (int o = 0; o < GGML_OP_COUNT; ++o) { tot += lc_op_ms[o]; nn += lc_op_cnt[o]; }
+                if (nn > 1000) {  // only the big graphs (resident DiT step ~13.7k nodes; VAE tiles)
+                    GGML_LOG_INFO("[OP_PROFILE] graph nodes=%d profiled_calls=%d total=%.1fms\n",
+                                  cgraph->n_nodes, nn, tot);
+                    for (int rank = 0; rank < 14; ++rank) {
+                        int best = -1;
+                        for (int o = 0; o < GGML_OP_COUNT; ++o) {
+                            if (lc_op_cnt[o] > 0 && (best < 0 || lc_op_ms[o] > lc_op_ms[best])) best = o;
+                        }
+                        if (best < 0 || lc_op_ms[best] <= 0.0) break;
+                        GGML_LOG_INFO("[OP_PROFILE]   %-20s %9.1f ms  %5.1f%%  calls=%d\n",
+                                      ggml_op_name((ggml_op)best), lc_op_ms[best],
+                                      tot > 0 ? 100.0 * lc_op_ms[best] / tot : 0.0, lc_op_cnt[best]);
+                        lc_op_ms[best] = -1.0;  // consumed
+                    }
+                }
+                if (lc_ev0) cudaEventDestroy(lc_ev0);
+                if (lc_ev1) cudaEventDestroy(lc_ev1);
             }
         }
 
