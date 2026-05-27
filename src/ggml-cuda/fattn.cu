@@ -11,6 +11,22 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
 
+    // lap-26 experiment: env override of the query-tile width ncols1 (bit-exact —
+    // same softmax math, just a smaller q tile per block → lower register pressure /
+    // higher occupancy). The auto-heuristic always picks the max (64/ncols2) for the
+    // avatar's huge L_q, which is register-capped at 16.6% occupancy on sm_86. A/B it.
+    static const int fa_ncols1_env = []{ const char * s = getenv("LONGCAT_FA_NCOLS1"); return s ? atoi(s) : 0; }();
+    if (fa_ncols1_env > 0) {
+        if constexpr (ncols2 <= 8) {
+            if (fa_ncols1_env <= 8/ncols2) { ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst); return; }
+        }
+        if constexpr (ncols2 <= 16) {
+            if (fa_ncols1_env <= 16/ncols2) { ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst); return; }
+        }
+        if (fa_ncols1_env <= 32/ncols2) { ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst); return; }
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst); return;
+    }
+
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
