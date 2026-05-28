@@ -4710,10 +4710,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 double tot = 0.0;
                 int    nn  = 0;
                 for (int o = 0; o < GGML_OP_COUNT; ++o) { tot += lc_op_ms[o]; nn += lc_op_cnt[o]; }
-                if (nn > 1000) {  // only the big graphs (resident DiT step ~13.7k nodes; VAE tiles)
+                // LongCat lap-32: nn-threshold env override + raised rank cap so the
+                // FLASH_ATTN_EXT + GATED_DELTA_NET + tail ops are always visible.
+                // Default 1000 matches the lap-29.2 prod behavior (DiT step ~13.7k nodes,
+                // VAE tile ~5k nodes); LONGCAT_OP_PROFILE_MIN=50 surfaces the smaller
+                // pre-sampling sub-graphs (Whisper, VAE encode tiles) too.
+                const int nn_threshold = []{ const char *s = getenv("LONGCAT_OP_PROFILE_MIN"); return s ? atoi(s) : 1000; }();
+                if (nn > nn_threshold) {
                     GGML_LOG_INFO("[OP_PROFILE] graph nodes=%d profiled_calls=%d total=%.1fms\n",
                                   cgraph->n_nodes, nn, tot);
-                    for (int rank = 0; rank < 14; ++rank) {
+                    for (int rank = 0; rank < 32; ++rank) {
                         int best = -1;
                         for (int o = 0; o < GGML_OP_COUNT; ++o) {
                             if (lc_op_cnt[o] > 0 && (best < 0 || lc_op_ms[o] > lc_op_ms[best])) best = o;
