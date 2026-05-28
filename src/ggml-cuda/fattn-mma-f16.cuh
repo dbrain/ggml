@@ -536,6 +536,46 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
     }
 }
 
+// LongCat lap-29.2: sparse early-skip helper. Reduces the loaded mask tile to
+// "any K position allowed for any Q in this tile?" predicate. Returns true if
+// any cell is NOT -INF (= the matmul has at least one non-zero softmax weight
+// contribution). When false the iter can skip QK + softmax + VKQ entirely (the
+// math is exp(-INF) = 0, mathematically bit-exact to skipping). Useful for any
+// FA call with -INF-style denial mask: BSA (LongCat avatar), causal (LLM),
+// arbitrary user masks. Pure overhead (≲50 cycles) for masks that never have
+// fully-denied tiles (e.g. ALiBi).
+template <int ncols1, int nbatch_fa, int nwarps>
+static __device__ __forceinline__ bool flash_attn_sparse_tile_any_allowed(
+        const half * const __restrict__ tile_mask) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    __shared__ int s_any_allowed;
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        s_any_allowed = 0;
+    }
+    __syncthreads();
+
+    // F16 -INF == 0xFC00. tile_mask has stride (nbatch_fa + 8) per Q row.
+    const int total       = ncols1 * nbatch_fa;
+    const int per_block   = nwarps * warp_size;
+    int local_any         = 0;
+    #pragma unroll
+    for (int i = (int) (threadIdx.y * warp_size + threadIdx.x);
+         i < total;
+         i += per_block) {
+        const int j = i / nbatch_fa;
+        const int k = i % nbatch_fa;
+        // __hisinf returns -1 for -INF, +1 for +INF, 0 otherwise.
+        // BSA / causal masks use -INF for denial; any non-(-INF) cell = "allowed".
+        if (__hisinf(tile_mask[j * (nbatch_fa + 8) + k]) != -1) {
+            local_any = 1;
+            break;
+        }
+    }
+    if (local_any) atomicOr(&s_any_allowed, 1);
+    __syncthreads();
+    return s_any_allowed != 0;
+}
+
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
     bool use_logit_softcap, bool V_is_K_view, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check,
     typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ>
@@ -598,6 +638,28 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         constexpr bool use_cp_async = true;
         cp_async_wait_all();
         __syncthreads();
+
+        // LongCat lap-29.2: sparse early-skip. If the mask tile (pre-loaded by
+        // prev iter's tail prefetch) is fully -INF, the QK matmul, softmax accum,
+        // and VKQ matmul are all bit-exactly zero contributions to the output.
+        // Skip them; just issue the next iter's prefetch and return. Only fires
+        // when mask is present (mask_h != nullptr) AND the iter's slice happens
+        // to be fully denied — for the avatar's BSA r=1+self_frame config that's
+        // roughly 50-70% of K tiles per consume self-attn call.
+        if (mask_h != nullptr) {
+            const bool any_allowed = flash_attn_sparse_tile_any_allowed<ncols1, nbatch_fa, nwarps>(tile_mask);
+            if (!any_allowed) {
+                // Reissue prefetch for next iter (mirrors the end-of-iter pattern).
+                if (!last_iter) {
+                    flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
+                        (mask_h + (k_VKQ_0 + nbatch_fa), tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
+                    flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
+                        (K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
+                }
+                return;
+            }
+        }
+
         flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
             (V_h2 + int64_t(k_VKQ_0)*stride_V, tile_V, nbatch_V2, stride_V, k_VKQ_sup);
     } else {
@@ -605,6 +667,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if (ncols2 > 1 || mask_h) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (mask_h + k_VKQ_0, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
+            // LongCat lap-29.2 (synchronous-load path, used when nstages<=1, i.e.
+            // ncols2==1 or cp.async unavailable): same sparse early-skip as the
+            // multi-stage branch above. Mask was just loaded synchronously, so we
+            // can read it immediately. If all-deny, skip QK + softmax + VKQ — math
+            // is bit-exact (-INF cells contribute exp(-INF)=0 to softmax).
+            if (mask_h != nullptr) {
+                if (use_cp_async) {
+                    cp_async_wait_all();
+                }
+                __syncthreads();
+                const bool any_allowed = flash_attn_sparse_tile_any_allowed<ncols1, nbatch_fa, nwarps>(tile_mask);
+                if (!any_allowed) {
+                    return;
+                }
+            }
         }
     }
 
