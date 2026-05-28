@@ -4282,6 +4282,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // 4D view). The executor skips RESHAPE/VIEW/TRANSPOSE/PERMUTE at compute time, but
     // they remain in cgraph->nodes and break the standard adjacency-based fusion check.
     // Walk past them and verify the chain via view_src / RESHAPE.src[0] tracing.
+    static const bool lc_dbg_norm_fuse = getenv("LONGCAT_DEBUG_NORM_FUSE") != nullptr;
+    if (lc_dbg_norm_fuse && node->op == GGML_OP_NORM) {
+        const char* nm = node->name[0] ? node->name : "<unnamed>";
+        // walk forward to find what's at i+1, i+2, i+3
+        const char* op_i1 = (i + 1 < cgraph->n_nodes) ? ggml_op_name(cgraph->nodes[i+1]->op) : "EOF";
+        const char* op_i2 = (i + 2 < cgraph->n_nodes) ? ggml_op_name(cgraph->nodes[i+2]->op) : "EOF";
+        const char* op_i3 = (i + 3 < cgraph->n_nodes) ? ggml_op_name(cgraph->nodes[i+3]->op) : "EOF";
+        const char* op_i4 = (i + 4 < cgraph->n_nodes) ? ggml_op_name(cgraph->nodes[i+4]->op) : "EOF";
+        GGML_LOG_INFO("[NORM-FUSE-DBG] i=%d NORM(%s) next=[%s %s %s %s] uses=%d\n",
+                      i, nm, op_i1, op_i2, op_i3, op_i4,
+                      ggml_node_get_use_count(cgraph, i));
+    }
     if (node->op == GGML_OP_NORM) {
         auto is_view_like = [](ggml_op op) {
             return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
