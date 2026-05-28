@@ -51,6 +51,7 @@
 #include "ggml-cuda/top-k.cuh"
 #include "ggml-cuda/mean.cuh"
 #include "ggml-cuda/mul_add_bcast.cuh"
+#include "ggml-cuda/scale_cast.cuh"
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/unary.cuh"
@@ -4447,6 +4448,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     }
                 }
             }
+        }
+    }
+
+    // LongCat lap-28.5: fused SCALE -> CPY(F32->F16). Used by the avatar's flash-attn
+    // wrapper for the kv_scale prescale path (and the lap-28.2 cond-cache consume
+    // prescale): the existing chain runs SCALE (read F32 / write F32) then CPY (read
+    // F32 / write F16). Collapse into a single read-F32 / write-F16 pass — saves
+    // ~306 MB bandwidth per pair at the avatar's noise k/v size.
+    if (node->op == GGML_OP_SCALE && i + 1 < cgraph->n_nodes &&
+        cgraph->nodes[i + 1]->op == GGML_OP_CPY) {
+        ggml_tensor * cpy_n = cgraph->nodes[i + 1];
+        if (cpy_n->src[0] == node &&                             // CPY consumes SCALE directly
+            node->type    == GGML_TYPE_F32 &&
+            cpy_n->type   == GGML_TYPE_F16 &&
+            ggml_is_contiguous(node) &&
+            ggml_is_contiguous(cpy_n) &&
+            ggml_nelements(node) == ggml_nelements(cpy_n) &&
+            ggml_node_get_use_count(cgraph, i) == 1) {
+            float scale_f = 0.0f, bias_f = 0.0f;
+            memcpy(&scale_f, (float *) node->op_params + 0, sizeof(float));
+            memcpy(&bias_f,  (float *) node->op_params + 1, sizeof(float));
+            ggml_cuda_op_scale_cast_f16(*cuda_ctx, (const ggml_tensor *) node->src[0],
+                                        cpy_n, scale_f, bias_f);
+            return 1;
         }
     }
 
