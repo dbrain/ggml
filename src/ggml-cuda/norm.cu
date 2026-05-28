@@ -1,10 +1,30 @@
 #include "norm.cuh"
 #include <cstdint>
 
-template <int block_size>
-static __global__ void norm_f32(
-        const float * x, float * dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
-        const int64_t stride_sample, const float eps) {
+template <int block_size, bool do_multiply = false, bool do_add = false>
+static __global__ void norm_f32(const float * x,
+                                float *       dst,
+                                const int     ncols,
+                                const int64_t stride_row,
+                                const int64_t stride_channel,
+                                const int64_t stride_sample,
+                                const float   eps,
+                                const float * mul                  = nullptr,
+                                const int64_t mul_stride_row       = 0,
+                                const int64_t mul_stride_channel   = 0,
+                                const int64_t mul_stride_sample    = 0,
+                                const uint3   mul_ncols_packed     = make_uint3(0, 0, 0),
+                                const uint3   mul_nrows_packed     = make_uint3(0, 0, 0),
+                                const uint3   mul_nchannels_packed = make_uint3(0, 0, 0),
+                                const uint3   mul_nsamples_packed  = make_uint3(0, 0, 0),
+                                const float * add                  = nullptr,
+                                const int64_t add_stride_row       = 0,
+                                const int64_t add_stride_channel   = 0,
+                                const int64_t add_stride_sample    = 0,
+                                const uint3   add_ncols_packed     = make_uint3(0, 0, 0),
+                                const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
+                                const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
+                                const uint3   add_nsamples_packed  = make_uint3(0, 0, 0)) {
     const int nrows     = gridDim.x;
     const int nchannels = gridDim.y;
 
@@ -13,8 +33,24 @@ static __global__ void norm_f32(
     const int sample    = blockIdx.z;
     const int tid       = threadIdx.x;
 
+    static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
+
     x   += sample*stride_sample + channel*stride_channel + row*stride_row;
     dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    if constexpr (do_multiply) {
+        const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+        const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+        const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+        mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+    }
+
+    if constexpr (do_add) {
+        const int add_row     = fastmodulo(row, add_nrows_packed);
+        const int add_channel = fastmodulo(channel, add_nchannels_packed);
+        const int add_sample  = fastmodulo(sample, add_nsamples_packed);
+        add += add_sample * add_stride_sample + add_channel * add_stride_channel + add_row * add_stride_row;
+    }
 
     float2 mean_var = make_float2(0.0f, 0.0f);
 
@@ -34,7 +70,26 @@ static __global__ void norm_f32(
     const float inv_std = rsqrtf(var + eps);
 
     for (int col = tid; col < ncols; col += block_size) {
-        dst[col] = (x[col] - mean) * inv_std;
+        // LongCat lap-27: emit explicit IEEE round-to-nearest mul/add to match the
+        // unfused {NORM, MUL, ADD} chain's rounding (each separate kernel writes its
+        // FP32 result back to memory between ops, forcing a round). Without these,
+        // -use_fast_math collapses the `*mul + add` tail into a single FMA, which has
+        // fewer rounds and produces a numerically-different (drift ~1e-5/elt) result,
+        // breaking the bit-exact gate. The intermediate `(x-mean)*inv_std` also gets
+        // explicit __fmul_rn so its round matches the original NORM kernel's store.
+        const float xc = x[col] - mean;
+        const float xn = __fmul_rn(xc, inv_std);
+        if constexpr (do_multiply && do_add) {
+            const int mul_col = fastmodulo(col, mul_ncols_packed);
+            const int add_col = fastmodulo(col, add_ncols_packed);
+            const float xn_mul = __fmul_rn(xn, mul[mul_col]);
+            dst[col]           = __fadd_rn(xn_mul, add[add_col]);
+        } else if constexpr (do_multiply) {
+            const int mul_col = fastmodulo(col, mul_ncols_packed);
+            dst[col]          = __fmul_rn(xn, mul[mul_col]);
+        } else {
+            dst[col] = xn;
+        }
     }
 }
 
@@ -290,6 +345,85 @@ static void norm_f32_cuda(
     }
 }
 
+// Fused LayerNorm + (optional MUL) + (optional ADD). The MUL/ADD broadcast operands
+// are F32 with arbitrary strides (fastmodulo on each axis), mirroring rms_norm_mul_f32_cuda.
+// At LongCat's modulate hot shape ncols=hidden_size=4096 -> the 1024-block path.
+static void norm_mul_f32_cuda(const float *  x,
+                              const float *  mul,
+                              const float *  add,
+                              float *        dst,
+                              const int      ncols,
+                              const int      nrows,
+                              const int      nchannels,
+                              const int      nsamples,
+                              const int64_t  stride_row,
+                              const int64_t  stride_channel,
+                              const int64_t  stride_sample,
+                              const int64_t  mul_stride_row,
+                              const int64_t  mul_stride_channel,
+                              const int64_t  mul_stride_sample,
+                              const uint32_t mul_ncols,
+                              const uint32_t mul_nrows,
+                              const uint32_t mul_nchannels,
+                              const uint32_t mul_nsamples,
+                              const int64_t  add_stride_row,
+                              const int64_t  add_stride_channel,
+                              const int64_t  add_stride_sample,
+                              const uint32_t add_ncols,
+                              const uint32_t add_nrows,
+                              const uint32_t add_nchannels,
+                              const uint32_t add_nsamples,
+                              const float    eps,
+                              cudaStream_t   stream) {
+    const dim3 blocks_num(nrows, nchannels, nsamples);
+    if (mul == nullptr) {
+        norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
+        return;
+    }
+    if (add == nullptr) {
+        const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
+        const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
+        const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
+        const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
+        if (ncols < 1024) {
+            const dim3 block_dims(WARP_SIZE, 1, 1);
+            norm_f32<WARP_SIZE, true><<<blocks_num, block_dims, 0, stream>>>(
+                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+        } else {
+            const dim3 block_dims(1024, 1, 1);
+            norm_f32<1024, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float2): 0, stream>>>(
+                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+        }
+    } else {
+        const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
+        const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
+        const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
+        const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
+
+        const uint3 add_ncols_packed     = init_fastdiv_values(add_ncols);
+        const uint3 add_nrows_packed     = init_fastdiv_values(add_nrows);
+        const uint3 add_nchannels_packed = init_fastdiv_values(add_nchannels);
+        const uint3 add_nsamples_packed  = init_fastdiv_values(add_nsamples);
+        if (ncols < 1024) {
+            const dim3 block_dims(WARP_SIZE, 1, 1);
+            norm_f32<WARP_SIZE, true, true><<<blocks_num, block_dims, 0, stream>>>(
+                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
+                add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
+                add_nchannels_packed, add_nsamples_packed);
+        } else {
+            const dim3 block_dims(1024, 1, 1);
+            norm_f32<1024, true, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float2): 0, stream>>>(
+                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
+                add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
+                add_nchannels_packed, add_nsamples_packed);
+        }
+    }
+}
+
 static void group_norm_f32_cuda(
         const float * x, float * dst, const int num_groups, const float eps, const int group_size, const int ne_elements, cudaStream_t stream) {
     if (group_size < 1024) {
@@ -454,6 +588,184 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+// Fused LayerNorm + MUL (mirror of ggml_cuda_op_rms_norm_fused).
+// LongCat lap-27: shape/strides come from mul_tensor (not norm_src). modulate's MUL
+// runs over a 4D RESHAPE view of NORM_out — shape and contiguous-strides match the
+// 4D form, but the broadcast computation of `mul_src` depends on the per-frame
+// (channel=T) axis exposed by the reshape. norm_src's data is shared with the MUL
+// view (contiguous F32), so reading x via the 4D strides yields the same bytes.
+void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
+    const ggml_tensor * norm_src = (ggml_tensor *) dst->src[0];
+    float eps = 0.0f;
+
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+    const float *       src0_d  = (const float *) norm_src->data;
+    const float *       mul_d   = nullptr;
+    const ggml_tensor * mul_src = nullptr;
+
+    // Trace src[0]/src[1] through any RESHAPE/VIEW chains back to dst (the NORM node).
+    // The non-traced side is the broadcast operand (scale1).
+    auto traces_to = [](const ggml_tensor * t, const ggml_tensor * root) {
+        while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW ||
+                     t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_PERMUTE)) {
+            t = t->src[0];
+        }
+        return t == root;
+    };
+    if (traces_to(mul_tensor->src[0], dst)) {
+        mul_d   = (float *) mul_tensor->src[1]->data;
+        mul_src = mul_tensor->src[1];
+    } else if (traces_to(mul_tensor->src[1], dst)) {
+        mul_d   = (float *) mul_tensor->src[0]->data;
+        mul_src = mul_tensor->src[0];
+    } else {
+        GGML_ASSERT(false);
+    }
+
+    float *      dst_d  = (float *) mul_tensor->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(norm_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(mul_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(eps >= 0.0f);
+
+    // Shape/strides from mul_tensor (4D after modulate's reshape; same shape as norm_src
+    // when the reshape is a no-op). norm_src's data layout is contiguous so the 4D strides
+    // also describe the underlying bytes correctly.
+    const int64_t ne00 = mul_tensor->ne[0];
+    const int64_t ne01 = mul_tensor->ne[1];
+    const int64_t ne02 = mul_tensor->ne[2];
+    const int64_t ne03 = mul_tensor->ne[3];
+
+    const size_t ts0 = ggml_type_size(mul_tensor->type);
+    GGML_ASSERT(mul_tensor->nb[0] == ts0);
+    const int64_t s01 = mul_tensor->nb[1] / ts0;
+    const int64_t s02 = mul_tensor->nb[2] / ts0;
+    const int64_t s03 = mul_tensor->nb[3] / ts0;
+
+    const size_t ts_mul = ggml_type_size(mul_src->type);
+    GGML_ASSERT(mul_src->nb[0] == ts_mul);
+    const int64_t mul_s01 = mul_src->nb[1] / ts_mul;
+    const int64_t mul_s02 = mul_src->nb[2] / ts_mul;
+    const int64_t mul_s03 = mul_src->nb[3] / ts_mul;
+
+    const int mul_ncols     = mul_src->ne[0];
+    const int mul_nrows     = mul_src->ne[1];
+    const int mul_nchannels = mul_src->ne[2];
+    const int mul_nsamples  = mul_src->ne[3];
+
+    norm_mul_f32_cuda(src0_d, mul_d, nullptr, dst_d,
+                      ne00, ne01, ne02, ne03,
+                      s01, s02, s03,
+                      mul_s01, mul_s02, mul_s03,
+                      mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                      0, 0, 0,
+                      0, 0, 0, 0,
+                      eps, stream);
+}
+
+// Fused LayerNorm + MUL + ADD (mirror of ggml_cuda_op_rms_norm_fused_add).
+// LongCat lap-27: shape/strides come from mul_tensor (post-reshape 4D in modulate).
+void ggml_cuda_op_norm_fused_add(ggml_backend_cuda_context & ctx,
+                                 ggml_tensor *               dst,
+                                 ggml_tensor *               mul_tensor,
+                                 ggml_tensor *               add_tensor) {
+    const ggml_tensor * norm_src = (ggml_tensor *) dst->src[0];
+    float               eps      = 0.0f;
+
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+    const float *       src0_d  = (const float *) norm_src->data;
+    const float *       mul_d   = nullptr;
+    const ggml_tensor * mul_src = nullptr;
+
+    auto traces_to = [](const ggml_tensor * t, const ggml_tensor * root) {
+        while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW ||
+                     t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_PERMUTE)) {
+            t = t->src[0];
+        }
+        return t == root;
+    };
+    if (traces_to(mul_tensor->src[0], dst)) {
+        mul_d   = (float *) mul_tensor->src[1]->data;
+        mul_src = mul_tensor->src[1];
+    } else if (traces_to(mul_tensor->src[1], dst)) {
+        mul_d   = (float *) mul_tensor->src[0]->data;
+        mul_src = mul_tensor->src[0];
+    } else {
+        GGML_ASSERT(false);
+    }
+
+    const float *       add_d   = nullptr;
+    const ggml_tensor * add_src = nullptr;
+
+    if (traces_to(add_tensor->src[0], mul_tensor)) {
+        add_d   = (float *) add_tensor->src[1]->data;
+        add_src = add_tensor->src[1];
+    } else if (traces_to(add_tensor->src[1], mul_tensor)) {
+        add_d   = (float *) add_tensor->src[0]->data;
+        add_src = add_tensor->src[0];
+    } else {
+        GGML_ASSERT(false);
+    }
+
+    float *      dst_d  = (float *) add_tensor->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(norm_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(mul_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(add_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(eps >= 0.0f);
+
+    // Use mul_tensor's shape/strides (4D after the modulate reshape; norm_src's data
+    // is contiguous and shares bytes with the reshape view, so these strides also
+    // index the underlying x correctly).
+    const int64_t ne00 = mul_tensor->ne[0];
+    const int64_t ne01 = mul_tensor->ne[1];
+    const int64_t ne02 = mul_tensor->ne[2];
+    const int64_t ne03 = mul_tensor->ne[3];
+
+    const size_t ts0 = ggml_type_size(mul_tensor->type);
+    GGML_ASSERT(mul_tensor->nb[0] == ts0);
+    const int64_t s01 = mul_tensor->nb[1] / ts0;
+    const int64_t s02 = mul_tensor->nb[2] / ts0;
+    const int64_t s03 = mul_tensor->nb[3] / ts0;
+
+    const size_t ts_mul = ggml_type_size(mul_src->type);
+    GGML_ASSERT(mul_src->nb[0] == ts_mul);
+    const int64_t mul_s01 = mul_src->nb[1] / ts_mul;
+    const int64_t mul_s02 = mul_src->nb[2] / ts_mul;
+    const int64_t mul_s03 = mul_src->nb[3] / ts_mul;
+
+    const int mul_ncols     = mul_src->ne[0];
+    const int mul_nrows     = mul_src->ne[1];
+    const int mul_nchannels = mul_src->ne[2];
+    const int mul_nsamples  = mul_src->ne[3];
+
+    const size_t ts_add = ggml_type_size(add_src->type);
+    GGML_ASSERT(add_src->nb[0] == ts_add);
+    const int64_t add_s01 = add_src->nb[1] / ts_add;
+    const int64_t add_s02 = add_src->nb[2] / ts_add;
+    const int64_t add_s03 = add_src->nb[3] / ts_add;
+
+    const int add_ncols     = add_src->ne[0];
+    const int add_nrows     = add_src->ne[1];
+    const int add_nchannels = add_src->ne[2];
+    const int add_nsamples  = add_src->ne[3];
+
+    norm_mul_f32_cuda(src0_d, mul_d, add_d, dst_d,
+                      ne00, ne01, ne02, ne03,
+                      s01, s02, s03,
+                      mul_s01, mul_s02, mul_s03,
+                      mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                      add_s01, add_s02, add_s03,
+                      add_ncols, add_nrows, add_nchannels, add_nsamples,
+                      eps, stream);
 }
 
 void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

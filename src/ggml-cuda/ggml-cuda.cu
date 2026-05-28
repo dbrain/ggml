@@ -4276,6 +4276,69 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // LongCat lap-27: fused LayerNorm + (RESHAPE-skipped) + MUL + ADD (+ trailing RESHAPE).
+    // Catches the avatar's modulate(norm(x), shift, scale) sequence — but unlike the RMS
+    // path, modulate has a RESHAPE between NORM and MUL (the per-frame broadcast needs a
+    // 4D view). The executor skips RESHAPE/VIEW/TRANSPOSE/PERMUTE at compute time, but
+    // they remain in cgraph->nodes and break the standard adjacency-based fusion check.
+    // Walk past them and verify the chain via view_src / RESHAPE.src[0] tracing.
+    if (node->op == GGML_OP_NORM) {
+        auto is_view_like = [](ggml_op op) {
+            return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
+                   op == GGML_OP_TRANSPOSE || op == GGML_OP_PERMUTE;
+        };
+        auto trace_back = [](ggml_tensor * t) {
+            // walk through RESHAPE-chains and view chains to the underlying compute node
+            while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW ||
+                         t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_PERMUTE)) {
+                t = t->src[0];
+            }
+            return t;
+        };
+        // skip view-like nodes after NORM
+        int j = i + 1;
+        while (j < cgraph->n_nodes && is_view_like(cgraph->nodes[j]->op)) {
+            ++j;
+        }
+        // expect MUL whose src traces back to NORM
+        if (j + 1 < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_MUL) {
+            ggml_tensor * mul_n = cgraph->nodes[j];
+            ggml_tensor * norm_chain_src = nullptr;
+            if (trace_back(mul_n->src[0]) == node) { norm_chain_src = mul_n->src[1]; }
+            else if (trace_back(mul_n->src[1]) == node) { norm_chain_src = mul_n->src[0]; }
+            if (norm_chain_src) {
+                int mul_idx = j;
+                ++j;
+                while (j < cgraph->n_nodes && is_view_like(cgraph->nodes[j]->op)) {
+                    ++j;
+                }
+                // expect ADD whose src traces back to MUL
+                if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_ADD) {
+                    ggml_tensor * add_n = cgraph->nodes[j];
+                    int add_idx = j;
+                    if (trace_back(add_n->src[0]) == mul_n || trace_back(add_n->src[1]) == mul_n) {
+                        // both NORM and MUL must have exactly one downstream use (i.e. just
+                        // the next op in the chain via the intermediate views).
+                        if (ggml_node_get_use_count(cgraph, i) == 1 &&
+                            ggml_node_get_use_count(cgraph, mul_idx) == 1) {
+                            ggml_cuda_op_norm_fused_add(*cuda_ctx, node, mul_n, add_n);
+                            // skip ALL nodes between i+1 and add_idx inclusive
+                            return add_idx - i;
+                        }
+                    }
+                }
+            }
+        }
+        // Two-op variant: NORM + (RESHAPE-skipped) + MUL
+        if (j == i + 1 && cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
+            // pure consecutive — keep the original simple path
+            if (ggml_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL })) {
+                ggml_cuda_op_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+                return 1;
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
