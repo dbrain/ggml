@@ -1,10 +1,34 @@
 #include "common.cuh"
+
+// LongCat lap-31.2 — fattn.cu owns the device-resident bsa-bitmap symbols. Define
+// them BEFORE pulling in fattn-mma-f16.cuh so the kernel template body (which
+// references the symbols) sees the definitions in this TU. Other TUs (template
+// instances) get the symbols via the extern declarations in
+// longcat-fa-bsa-bitmap.cuh, included from fattn-mma-f16.cuh.
+__device__ const uint32_t * g_longcat_fa_bsa_bitmap_dev = nullptr;
+__device__ int              g_longcat_fa_bsa_n_kwords_dev = 0;
+__device__ int              g_longcat_fa_bsa_n_qtiles_dev = 0;
+#define LONGCAT_FA_BSA_BITMAP_DEFINING_TU
+
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
+#include "ggml-cuda.h"
+
+void ggml_cuda_set_longcat_fa_bsa_bitmap(const void * device_bitmap_u32,
+                                          int n_qtiles, int n_kwords) {
+    // Copy the pointer + dims into the device-resident symbols. We use
+    // cudaMemcpyToSymbol because the symbols are __device__ memory; passing a
+    // nullptr clears the state (the FA kernel reads g_..._bitmap_dev and skips
+    // the bitmap path when it's null).
+    const void * ptr = device_bitmap_u32;
+    CUDA_CHECK(cudaMemcpyToSymbol(g_longcat_fa_bsa_bitmap_dev, &ptr, sizeof(void *)));
+    CUDA_CHECK(cudaMemcpyToSymbol(g_longcat_fa_bsa_n_kwords_dev, &n_kwords, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(g_longcat_fa_bsa_n_qtiles_dev, &n_qtiles, sizeof(int)));
+}
 
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

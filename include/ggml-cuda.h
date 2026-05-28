@@ -74,6 +74,16 @@ GGML_BACKEND_API void ggml_backend_cuda_get_graph_cache_stats(
     int    * out_graph_count,
     size_t * out_total_node_count);
 
+// LongCat lap-31.2: CPU-precomputed per-(Q-tile, K-tile) all-deny bitmap for the
+// avatar's BSA self-attn. Set the device pointer + dimensions before issuing FA
+// calls that should consult it; pass nullptr to disable. The FA dispatcher only
+// uses the bitmap when DKQ=DV=128, ncols=64, ncols2=1 (the avatar's hot shape) AND
+// the FA op carries a non-null mask AND the bitmap is set — every other FA caller
+// is unaffected. Stored as one packed uint32 word per 32 K-tiles, n_qtiles rows,
+// row stride = n_kwords words (so bitmap[jt * n_kwords + word_idx]).
+GGML_BACKEND_API void ggml_cuda_set_longcat_fa_bsa_bitmap(const void * device_bitmap_u32,
+                                                          int n_qtiles, int n_kwords);
+
 #ifdef  __cplusplus
 }
 #endif

@@ -2,6 +2,7 @@
 #include "cp-async.cuh"
 #include "mma.cuh"
 #include "fattn-common.cuh"
+#include "longcat-fa-bsa-bitmap.cuh"  // LongCat lap-31.2 — extern __device__ symbols (defined in fattn.cu)
 
 using namespace ggml_cuda_mma;
 
@@ -1355,10 +1356,43 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             (K_h2 + int64_t(kb0)*nbatch_fa*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
     }
 
+    // LongCat lap-31.2: load the per-Q-tile slice of the CPU-precomputed BSA bitmap
+    // into shared memory once per CTA, then skip K-tile iters whose bit is clear
+    // (== "every cell in this (jt × kb) cube is -INF; iter would output zero
+    // contributions"). Only engages for the ncols2==1 path (BSA's shape) AND when
+    // the avatar runner has set the bitmap; otherwise the loop runs uncompacted
+    // exactly as before (lap-29.2 in-iter sparse-skip is still in place as a
+    // second-line filter when the bitmap doesn't catch a denied tile).
+    // 16 words = 512 K-tiles cap (avatar's worst case at 480p is 6 words / 171 K-tiles).
+    __shared__ uint32_t s_bsa_bitmap_words[16];
+    bool bsa_bitmap_active = false;
+    if constexpr (ncols2 == 1) {
+        if (mask_h != nullptr && g_longcat_fa_bsa_bitmap_dev != nullptr &&
+            jt < g_longcat_fa_bsa_n_qtiles_dev) {
+            const int n_kw = g_longcat_fa_bsa_n_kwords_dev;
+            // n_kw is bounded by the avatar's resolution (≤16 in practice); fall
+            // through the bitmap path quietly if the runner mis-sized it.
+            if (n_kw > 0 && n_kw <= 16) {
+                bsa_bitmap_active = true;
+                if ((int)(threadIdx.y * blockDim.x + threadIdx.x) < n_kw) {
+                    const int tid_linear = threadIdx.y * blockDim.x + threadIdx.x;
+                    s_bsa_bitmap_words[tid_linear] = g_longcat_fa_bsa_bitmap_dev[jt * n_kw + tid_linear];
+                }
+                __syncthreads();
+            }
+        }
+    }
+
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
     if constexpr (ncols2 == 1) {
         constexpr bool oob_check = true;
         for (; kb0 < kb0_stop-1; ++kb0) {
+            if (bsa_bitmap_active) {
+                const uint32_t word = s_bsa_bitmap_words[kb0 >> 5];
+                if (!(word & (1u << (kb0 & 31)))) {
+                    continue;  // K-tile fully denied — skip the iter dispatch entirely
+                }
+            }
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_f16_iter
