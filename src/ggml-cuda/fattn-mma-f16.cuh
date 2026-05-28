@@ -59,7 +59,16 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128,  8, 128, 2, 128,  64,  64,  64, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 16, 128, 2,  64,  64,  64,  64, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 32, 128, 2,  64,  64,  64,  64, 2, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 64, 128, 2,  64,  64,  64,  64, 2, true);
+    // LongCat lap-29.1: occupancy 2→3 for the avatar's hot consume self-attn shape
+    // (DKQ=DV=128, ncols=64 — Q=9360, K=10920, num_heads=32). Per lap-28 ncu profile
+    // the kernel was register+smem-capped at 16.66% occupancy (2 blocks/SM) with
+    // ~50% of CPI lost to L1TEX ldmatrix-dependency stalls; telling nvcc to launch_bound
+    // for 3 blocks/SM (25% occupancy) gives the SM more concurrent warps to hide that
+    // ldmatrix latency. Compiler fits with zero register spills — pure free latency
+    // hiding, bit-exact (same softmax math). Sampling 121.04→107.60s = -11.1% (wall
+    // 155.11→142.0s = -8.5%, all 480/25f/--steps 8 RESIDENT). occupancy=4 starts
+    // spilling and gives back ~2s — 3 is the sweet spot on sm_86.
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 64, 128, 3,  64,  64,  64,  64, 2, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128,  8,  64, 4,  64,  96,  64,  64, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 16,  64, 4,  32,  96,  64,  64, 2, true);
