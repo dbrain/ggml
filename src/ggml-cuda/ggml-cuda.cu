@@ -50,6 +50,7 @@
 #include "ggml-cuda/sumrows.cuh"
 #include "ggml-cuda/top-k.cuh"
 #include "ggml-cuda/mean.cuh"
+#include "ggml-cuda/mul_add_bcast.cuh"
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/unary.cuh"
@@ -4363,6 +4364,88 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL })) {
                 ggml_cuda_op_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
                 return 1;
+            }
+        }
+    }
+
+    // LongCat lap-28.3: fused MUL+ADD with broadcast for the avatar's gate_add
+    // pattern: y_4d = RESHAPE(y, [d0, d1, d2, Nb]); y_mul = MUL(y_4d, gate)
+    // where gate is [d0, 1, d2, Nb] broadcasting on dim 1; y_3d = RESHAPE(y_mul,
+    // [d0, d1*d2, Nb]); dst = ADD(x, y_3d). The RESHAPEs are view-only — at the
+    // cgraph node level we see MUL then ADD (after skipping intermediate
+    // view-likes), with the ADD consuming MUL through the view chain.
+    //
+    // 96 chains/consume step × 7 consume steps = 672 chains per render. Each
+    // chain currently materializes a ~178 MB intermediate buffer between MUL
+    // and ADD; the fused kernel reads y / gate / x and writes dst in one pass
+    // (no intermediate). __fmul_rn + __fadd_rn keep it bit-exact vs the unfused
+    // chain (two roundings, not the single-rounding FMA the compiler would emit).
+    if (node->op == GGML_OP_MUL) {
+        auto is_view_like = [](ggml_op op) {
+            return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
+                   op == GGML_OP_TRANSPOSE || op == GGML_OP_PERMUTE;
+        };
+        auto trace_back = [](ggml_tensor * t) {
+            while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW ||
+                         t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_PERMUTE)) {
+                t = t->src[0];
+            }
+            return t;
+        };
+        ggml_tensor * mul_n = node;
+        ggml_tensor * s0    = mul_n->src[0];
+        ggml_tensor * s1    = mul_n->src[1];
+        // Identify the broadcast operand (gate). For gate_add it's a [d0, 1, d2, Nb]
+        // tensor against a [d0, d1, d2, Nb] tensor with d1 > 1.
+        ggml_tensor * y_view = nullptr;
+        ggml_tensor * gate   = nullptr;
+        if (s0 && s1 && s0->type == GGML_TYPE_F32 && s1->type == GGML_TYPE_F32) {
+            const bool s0_bcast = (s0->ne[1] == 1 && s1->ne[1] >  1);
+            const bool s1_bcast = (s1->ne[1] == 1 && s0->ne[1] >  1);
+            if (s0_bcast ^ s1_bcast) {
+                if (s1_bcast) { y_view = s0; gate = s1; }
+                else          { y_view = s1; gate = s0; }
+            }
+        }
+        // Must match the gate_add 4D broadcast pattern exactly.
+        if (y_view && gate &&
+            mul_n->ne[0] == gate->ne[0] && gate->ne[1] == 1 &&
+            mul_n->ne[2] == gate->ne[2] && mul_n->ne[3] == gate->ne[3] &&
+            ggml_is_contiguous(gate) &&
+            ggml_node_get_use_count(cgraph, i) == 1) {
+            // Walk past view-likes to find the next compute node — expect ADD.
+            int j = i + 1;
+            while (j < cgraph->n_nodes && is_view_like(cgraph->nodes[j]->op)) {
+                ++j;
+            }
+            if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_ADD) {
+                ggml_tensor * add_n = cgraph->nodes[j];
+                // ADD must have one side tracing back to MUL via views; the other
+                // side is `x` (residual). Same-shape ADD (no further broadcast).
+                ggml_tensor * x_side = nullptr;
+                if (trace_back(add_n->src[0]) == mul_n) {
+                    x_side = add_n->src[1];
+                } else if (trace_back(add_n->src[1]) == mul_n) {
+                    x_side = add_n->src[0];
+                }
+                if (x_side &&
+                    add_n->type == GGML_TYPE_F32 &&
+                    x_side->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(add_n) &&
+                    ggml_is_contiguous(x_side) &&
+                    ggml_nelements(x_side) == ggml_nelements(mul_n) &&
+                    ggml_nelements(add_n)  == ggml_nelements(mul_n)) {
+                    // The y view: must trace to a contiguous F32 tensor.
+                    ggml_tensor * y_root = trace_back(y_view);
+                    if (y_root && y_root->type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(y_root) &&
+                        ggml_nelements(y_root) == ggml_nelements(mul_n)) {
+                        ggml_cuda_op_mul_add_bcast(*cuda_ctx, mul_n, add_n,
+                                                   x_side, y_view, gate);
+                        // Skip all nodes from i+1 through add_n inclusive.
+                        return j - i;
+                    }
+                }
             }
         }
     }
