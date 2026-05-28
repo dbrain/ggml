@@ -4318,6 +4318,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_tensor * norm_chain_src = nullptr;
             if (trace_back(mul_n->src[0]) == node) { norm_chain_src = mul_n->src[1]; }
             else if (trace_back(mul_n->src[1]) == node) { norm_chain_src = mul_n->src[0]; }
+            if (lc_dbg_norm_fuse && !norm_chain_src) {
+                GGML_LOG_INFO("[NORM-FUSE-DBG]   reject: MUL.src does not trace back to NORM (mul_src[0]=%p mul_src[1]=%p NORM=%p)\n",
+                              (void*)mul_n->src[0], (void*)mul_n->src[1], (void*)node);
+            }
             if (norm_chain_src) {
                 int mul_idx = j;
                 ++j;
@@ -4331,15 +4335,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     if (trace_back(add_n->src[0]) == mul_n || trace_back(add_n->src[1]) == mul_n) {
                         // both NORM and MUL must have exactly one downstream use (i.e. just
                         // the next op in the chain via the intermediate views).
-                        if (ggml_node_get_use_count(cgraph, i) == 1 &&
-                            ggml_node_get_use_count(cgraph, mul_idx) == 1) {
+                        int uc_norm = ggml_node_get_use_count(cgraph, i);
+                        int uc_mul  = ggml_node_get_use_count(cgraph, mul_idx);
+                        if (uc_norm == 1 && uc_mul == 1) {
                             ggml_cuda_op_norm_fused_add(*cuda_ctx, node, mul_n, add_n);
                             // skip ALL nodes between i+1 and add_idx inclusive
                             return add_idx - i;
                         }
+                        if (lc_dbg_norm_fuse) {
+                            GGML_LOG_INFO("[NORM-FUSE-DBG]   reject: use_count NORM=%d MUL=%d (need both ==1)\n", uc_norm, uc_mul);
+                        }
+                    } else if (lc_dbg_norm_fuse) {
+                        GGML_LOG_INFO("[NORM-FUSE-DBG]   reject: ADD.src does not trace back to MUL\n");
                     }
+                } else if (lc_dbg_norm_fuse) {
+                    const char* op_j = (j < cgraph->n_nodes) ? ggml_op_name(cgraph->nodes[j]->op) : "EOF";
+                    GGML_LOG_INFO("[NORM-FUSE-DBG]   reject: after-MUL view-skip lands on %s, not ADD\n", op_j);
                 }
             }
+        } else if (lc_dbg_norm_fuse && node->op == GGML_OP_NORM) {
+            const char* op_j = (j < cgraph->n_nodes) ? ggml_op_name(cgraph->nodes[j]->op) : "EOF";
+            GGML_LOG_INFO("[NORM-FUSE-DBG]   reject: after-NORM view-skip lands on %s, not MUL\n", op_j);
         }
         // Two-op variant: NORM + (RESHAPE-skipped) + MUL
         if (j == i + 1 && cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
