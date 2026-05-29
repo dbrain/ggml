@@ -563,18 +563,40 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
             int ax_b[2], nb_i = 0;
             for (int a = 1; a < 4; ++a) { if (a != perm_f) ax_b[nb_i++] = a; }
             const int p = ax_b[0], q = ax_b[1];
+            // dst is contiguous (coal/perm precondition). Its per-axis strides must be
+            // derived from src0's LOGICAL ne, NOT src1->nb — cont_2d/cont_3d collapse
+            // the dst to fewer dims, so src1->nb[perm_f/p/q] no longer map to src0's
+            // axes (e.g. siglip2's head-72 attention cont). Using the stale src1->nb
+            // here scattered writes out of bounds -> segfault. Contiguous stride of
+            // axis a = product of src0->ne[0..a-1]; identical to src1->nb for a full
+            // ggml_cont, correct for the collapsed case.
+            const int64_t cs[4] = { 1,
+                                    (int64_t)src0->ne[0],
+                                    (int64_t)src0->ne[0]*src0->ne[1],
+                                    (int64_t)src0->ne[0]*src0->ne[1]*src0->ne[2] };
             ggml_cpy_perm_transpose_cuda<float>(
                 src0_ddc, src1_ddc,
                 (int)src0->ne[0], (int)src0->ne[perm_f], (int)src0->ne[p], (int)src0->ne[q],
                 src0->nb[0]/elsz, src0->nb[perm_f]/elsz, src0->nb[p]/elsz, src0->nb[q]/elsz,
-                src1->nb[0]/elsz, src1->nb[perm_f]/elsz, src1->nb[p]/elsz, src1->nb[q]/elsz,
+                cs[0], cs[perm_f], cs[p], cs[q],
                 main_stream);
         } else if (coal_ok) {
+            // dst is contiguous (coal_ok precondition). Derive the dst strides from
+            // src0's LOGICAL ne — NOT src1->nb — because cont_2d/cont_3d collapse the
+            // dst to fewer dims (e.g. [128,16,2,1] -> [128,32,1,1]), which makes
+            // src1->nb[2,3] no longer correspond to src0's axes 2,3. The contiguous
+            // byte layout of [ne0,ne1,ne2,ne3] is identical regardless of reshape, so
+            // the correct dst offset for logical (i1,i2,i3) is just the contiguous
+            // stride product of src0's dims. (For a full ggml_cont where dst ne ==
+            // src0 ne, this equals the old src1->nb values — so no change there.)
+            const int64_t dd1 = (int64_t)src0->ne[0];
+            const int64_t dd2 = dd1 * (int64_t)src0->ne[1];
+            const int64_t dd3 = dd2 * (int64_t)src0->ne[2];
             ggml_cpy_perm_coalesced_cuda<float>(
                 src0_ddc, src1_ddc,
                 (int)src0->ne[0], (int)src0->ne[1], (int)src0->ne[2], (int)src0->ne[3],
                 src0->nb[1]/elsz, src0->nb[2]/elsz, src0->nb[3]/elsz,
-                src1->nb[1]/elsz, src1->nb[2]/elsz, src1->nb[3]/elsz,
+                dd1, dd2, dd3,
                 main_stream);
         } else if (can_be_transposed) {
             ggml_cpy_scalar_cuda<float, float, true>
