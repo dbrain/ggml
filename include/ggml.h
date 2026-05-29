@@ -586,6 +586,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_ROPE_PE,  // longcat-avatar: fused interleaved RoPE from precomputed pe (cos/sin), CUDA-only
+        GGML_OP_COL2IM_1D,  // acestep: scatter-add GEMM columns back to 1D signal (ConvT)
 
         GGML_OP_COUNT,
     };
@@ -2077,6 +2078,15 @@ extern "C" {
         int                   d0, // dilation dimension 0
         int                   d1, // dilation dimension 1
         bool                  is_2D);
+
+    // col2im_1d: scatter-add GEMM columns back to 1D signal (acestep VAE ConvT).
+    // a: [K*OC, T_in]; result: [T_out, OC], T_out = (T_in-1)*s0 + K - 2*p0
+    GGML_API struct ggml_tensor * ggml_col2im_1d(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,   // columns [K*OC, T_in]
+        int                   s0,  // stride
+        int                   oc,  // output channels
+        int                   p0); // padding to crop from both sides
 
     GGML_API struct ggml_tensor * ggml_conv_1d(
             struct ggml_context * ctx,

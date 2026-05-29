@@ -42,6 +42,7 @@
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
 #include "ggml-cuda/snake.cuh"
+#include "ggml-cuda/col2im-1d.cuh"
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
@@ -3187,6 +3188,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SNAKE:
             ggml_cuda_op_snake(ctx, dst);
             break;
+        case GGML_OP_COL2IM_1D:
+            ggml_cuda_op_col2im_1d(ctx, dst);
+            break;
         case GGML_OP_CONV_1D_DIRECT:
             ggml_cuda_op_conv_1d_direct(ctx, dst);
             break;
@@ -5812,6 +5816,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_TRI:
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
+        case GGML_OP_COL2IM_1D:
+            return op->src[0]->type == GGML_TYPE_F32 ||
+                   op->src[0]->type == GGML_TYPE_F16 ||
+                   op->src[0]->type == GGML_TYPE_BF16;
         case GGML_OP_SNAKE:
             // snake.cu:73-78: contiguous src0/dst, src0/dst F32 or F16,
             // src1/src2 (alpha/beta) must be F32.

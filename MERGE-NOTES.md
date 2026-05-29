@@ -57,6 +57,27 @@ longcat merge must reconcile (not blindly add):
 - Lineage caveat: leejet/ggml carries sd.cpp-specific base patches; longcat's commits sit on
   those, so the merge is a port (cherry-pick + adapt), not a clean rebase.
 
+## Step 4: longcat-avatar ggml folded in → branch `consolidated-v0.13`
+KEY: leejet/ggml v0.12.0 (`0ce7ad34`) IS a ggml-org commit (direct ancestor of v0.13.0),
+so longcat's work is **same-lineage** — cherry-pick, not cross-fork port. sd.cpp keeps its
+ggml current with ggml-org.
+- Cherry-picked longcat's 19 net feature commits onto sync-upstream-v0.13 (→ `consolidated-v0.13`,
+  43 commits / +3072 over v0.13.0; longcat delta 19 files / +1691).
+- **SKIPPED the conv-3d-direct saga** (7 commits, `88270c05`..`38ffc528`): added then removed
+  upstream ("never beat im2col+cuBLAS") → nets to zero. Used two cherry-pick ranges around it.
+- **concat F16** (`3e0d0db1`): SKIPPED as empty — dbrain's concat already does F32/F16/**I32**
+  (superset). longcat's F16 fully redundant.
+- **ggml.c op-count**: ROPE_PE enum auto-merged; only the `GGML_OP_COUNT` static_assert
+  conflicted (98 dbrain vs 97 longcat-parent) → resolved to **99** (98 + ROPE_PE).
+- **ggml-cuda.h**: adjacency conflict — kept BOTH dbrain's graph-cache-stats API and longcat's
+  BSA-bitmap API.
+- Everything else auto-merged (rope-pe/scale_cast/mul_add_bcast = new files; im2col_3d additive
+  to dbrain's upstream-grid-stride im2col; cpy/norm/fattn-mma layered cleanly).
+- Net new longcat features now on the branch: GGML_OP_ROPE_PE, scale_cast (SCALE→CPY-F16),
+  mul_add_bcast, norm LayerNorm+MUL+ADD fusion, im2col_3d (smem-halo/fastdiv/F16), cpy
+  coalesced perm-copy, fattn-mma occupancy 2→3 + BSA sparse-skip + bitmap, ggml-alloc
+  view-output fix.
+
 ## Not yet validated
 This branch is rebased but **not yet compiled**. Validation = build a consumer
 (siglip2 first — has the cosine gate) against it; v0.13.0 has 120 commits of API drift, so
