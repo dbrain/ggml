@@ -2602,8 +2602,147 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+// ADDITIVE: mul_mat with an F16 destination (output) tensor.
+// Computes A^T * B using a cuBLAS GEMM with F16 inputs and F32 ACCUMULATION
+// (CUBLAS_COMPUTE_32F), storing the result directly as F16 (CUDA_R_16F) into
+// dst->data -- so an encoder can keep activations in F16 across matmuls without a
+// separate F32->F16 cast. NO F16 accumulation is used (precision). Handles both
+// the 2D case and 3D+ batched/broadcast case (attention). This path is only ever
+// reached when dst->type == GGML_TYPE_F16; the F32-dst dispatch above is untouched.
+static void ggml_cuda_mul_mat_f16_dst(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(!ggml_is_transposed(src0));
+    GGML_ASSERT(!ggml_is_transposed(src1));
+    GGML_ASSERT(!ggml_backend_buft_is_cuda_split(src0->buffer->buft));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    cudaStream_t main_stream = ctx.stream();
+    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), main_stream));
+
+    // src0 -> F16 (weights are usually already F16)
+    ggml_cuda_pool_alloc<half> src0_alloc(ctx.pool());
+    const half * src0_ptr;
+    if (src0->type == GGML_TYPE_F16) {
+        src0_ptr = (const half *) src0->data;
+    } else {
+        // contiguous-only F32->F16 convert: a contiguous src0 has nb00==ts(F32) so
+        // the original nb01/nb00, nb0X/nb00 element strides used in the GEMM below
+        // describe the contiguous F16 temp exactly.
+        GGML_ASSERT(ggml_is_contiguous(src0));
+        const to_fp16_cuda_t to_fp16_cuda = ggml_get_to_fp16_cuda(src0->type);
+        GGML_ASSERT(to_fp16_cuda != nullptr);
+        const int64_t ne_src0 = ggml_nelements(src0);
+        src0_alloc.alloc(ne_src0);
+        to_fp16_cuda(src0->data, src0_alloc.get(), ne_src0, main_stream);
+        src0_ptr = src0_alloc.get();
+    }
+
+    // src1 -> F16 (activations); convert (incl. de-stride) if not already F16
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    GGML_ASSERT(nb10 == ts_src1);
+    int64_t s11 = nb11 / ts_src1;
+    int64_t s12 = nb12 / ts_src1;
+    int64_t s13 = nb13 / ts_src1;
+
+    ggml_cuda_pool_alloc<half> src1_alloc(ctx.pool());
+    const half * src1_ptr;
+    if (src1->type == GGML_TYPE_F16) {
+        src1_ptr = (const half *) src1->data;
+    } else {
+        const auto convert_func = ggml_get_to_fp16_nc_cuda(src1->type);
+        GGML_ASSERT(convert_func != nullptr);
+        const int64_t ne_src1 = ggml_nelements(src1);
+        src1_alloc.alloc(ne_src1);
+        convert_func(src1->data, src1_alloc.get(), ne10, ne11, ne12, ne13, s11, s12, s13, main_stream);
+        src1_ptr = src1_alloc.get();
+        s11 = ne10;
+        s12 = ne11*s11;
+        s13 = ne12*s12;
+    }
+
+    half * dst_ptr = (half *) dst->data;
+
+    // F32 accumulation, F16 inputs, F16 store
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    const cublasComputeType_t cu_compute_type = CUBLAS_COMPUTE_32F;
+
+    GGML_ASSERT(ne12 % ne02 == 0);
+    GGML_ASSERT(ne13 % ne03 == 0);
+    const int64_t r2 = ne12/ne02;
+    const int64_t r3 = ne13/ne03;
+
+    const bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
+    const bool is_src1_cont_2 = (src1->type == GGML_TYPE_F16) ? ggml_is_contiguous_2(src1) : true;
+
+    // dst is contiguous F16: strides in elements
+    const int64_t nbd2 = ne0*ne1;
+    const int64_t nbd3 = ne0*ne1*ne2;
+
+    if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
+        const int64_t sma = ne02 == 1 ? nb03/nb00 : nb02/nb00;
+        const int64_t smb = ne12 == 1 ? s13       : s12;
+        CUBLAS_CHECK(
+        cublasGemmStridedBatchedEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                ne01, ne11, ne10,
+                &alpha, src0_ptr, CUDA_R_16F, nb01/nb00, sma,
+                        src1_ptr, CUDA_R_16F, s11,       smb,
+                &beta,  dst_ptr,  CUDA_R_16F, ne0,       ne1*ne0,
+                ne12*ne13,
+                cu_compute_type,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    } else {
+        const int64_t ne23 = ne12*ne13;
+        ggml_cuda_pool_alloc<const void *> ptrs_src(ctx.pool(), 2*ne23);
+        ggml_cuda_pool_alloc<      void *> ptrs_dst(ctx.pool(), 1*ne23);
+
+        const int threads_x = 16;
+        const int threads_y = 16;
+        dim3 block_dims(threads_x, threads_y);
+        dim3 grid_dims(
+            (ne13 + threads_x - 1) / threads_x,
+            (ne12 + threads_y - 1) / threads_y);
+        k_compute_batched_ptrs<<<grid_dims, block_dims, 0, main_stream>>>(
+                src0_ptr, src1_ptr, (char *) dst_ptr,
+                ptrs_src.get(), ptrs_dst.get(),
+                ne12, ne13,
+                ne23,
+                nb02, nb03,
+                (src1->type == GGML_TYPE_F16) ? nb12 : s12*sizeof(half),
+                (src1->type == GGML_TYPE_F16) ? nb13 : s13*sizeof(half),
+                nbd2*sizeof(half), nbd3*sizeof(half),
+                r2, r3);
+        CUDA_CHECK(cudaGetLastError());
+
+        CUBLAS_CHECK(
+        cublasGemmBatchedEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                ne01, ne11, ne10,
+                &alpha, (const void **) (ptrs_src.get() + 0*ne23), CUDA_R_16F, nb01/nb00,
+                        (const void **) (ptrs_src.get() + 1*ne23), CUDA_R_16F, s11,
+                &beta,  (      void **) (ptrs_dst.get() + 0*ne23), CUDA_R_16F, ne0,
+                ne23,
+                cu_compute_type,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     if (g_ggml_cuda_mul_mat_hook && g_ggml_cuda_mul_mat_hook(&ctx, src0, src1, dst, ctx.stream())) {
+        return;
+    }
+
+    // ADDITIVE F16-dst path (F32 accumulation, F16 store). Byte-identical F32-dst
+    // dispatch below is unaffected -- only taken when dst is F16.
+    if (dst->type == GGML_TYPE_F16
+            && !ggml_backend_buft_is_cuda_split(src0->buffer->buft)
+            && (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32)
+            && (src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_F32)
+            && !ggml_is_transposed(src0) && !ggml_is_transposed(src1)) {
+        ggml_cuda_mul_mat_f16_dst(ctx, src0, src1, dst);
         return;
     }
 
@@ -4304,7 +4443,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                       i, nm, op_i1, op_i2, op_i3, op_i4,
                       ggml_node_get_use_count(cgraph, i));
     }
-    if (node->op == GGML_OP_NORM) {
+    // The fused norm+mul(+add) kernels are F32-only; for F16 activations fall through to
+    // the regular (now F16-capable) ggml_cuda_op_norm so F16 layernorm doesn't hit the
+    // F32 assert in the fused path.
+    if (node->op == GGML_OP_NORM && node->src[0]->type == GGML_TYPE_F32) {
         auto is_view_like = [](ggml_op op) {
             return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
                    op == GGML_OP_TRANSPOSE || op == GGML_OP_PERMUTE;
@@ -5510,6 +5652,23 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
                     return false;
+                }
+                // ADDITIVE: an F16 destination is only supported via the dedicated
+                // F32-accumulation cuBLAS F16-store path, which handles only
+                // (src0,src1) in {F16,F32} and non-split, non-transposed inputs.
+                // Any other op->type stays F32-dst as before (no behaviour change).
+                if (op->type == GGML_TYPE_F16) {
+                    if (op->op != GGML_OP_MUL_MAT) {
+                        return false; // mul_mat_id F16-dst not implemented
+                    }
+                    if (!((a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_F32) &&
+                          (b->type == GGML_TYPE_F16 || b->type == GGML_TYPE_F32))) {
+                        return false;
+                    }
+                    if (a->buffer && ggml_backend_buft_is_cuda_split(a->buffer->buft)) {
+                        return false;
+                    }
+                    return true;
                 }
 #ifdef GGML_USE_MUSA
                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
