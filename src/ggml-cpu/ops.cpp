@@ -387,6 +387,21 @@ static void ggml_compute_forward_dup_bytes(
                     id += rs * (ne01 - ir1);
                 }
             }
+        } else if (type_size == 4) {
+            for (int64_t i03 = 0; i03 < ne03; i03++) {
+                for (int64_t i02 = 0; i02 < ne02; i02++) {
+                    id += rs * ir0;
+                    for (int64_t i01 = ir0; i01 < ir1; i01++) {
+                        for (int64_t i00 = 0; i00 < ne00; i00++) {
+                            const char * src0_ptr = (char *) src0->data + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03;
+                            memcpy(dst_ptr + id, src0_ptr, 4);
+
+                            id += 4;
+                        }
+                    }
+                    id += rs * (ne01 - ir1);
+                }
+            }
         } else {
             //printf("%s: this is not optimal - fix me\n", __func__);
 
@@ -1894,204 +1909,45 @@ void ggml_compute_forward_repeat_back(
 
 // ggml_compute_forward_concat
 
-static void ggml_compute_forward_concat_any(
-    const ggml_compute_params * params,
-    ggml_tensor * dst) {
-
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
-
-    const size_t len = ggml_type_size(src0->type);
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
-    GGML_TENSOR_BINARY_OP_LOCALS
-
-    const int32_t dim = ggml_get_op_params_i32(dst, 0);
-
-    GGML_ASSERT(dim >= 0 && dim < 4);
-
-    int64_t o[4] = {0, 0, 0, 0};
-    o[dim] = src0->ne[dim];
-
-    const char * x;
-
-    // TODO: smarter multi-theading
-    for (int i3 = 0; i3 < ne3; i3++) {
-        for (int i2 = ith; i2 < ne2; i2 += nth) {
-            for (int i1 = 0; i1 < ne1; i1++) {
-                for (int i0 = 0; i0 < ne0; i0++) {
-                    if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-                        x = (const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03;
-                    } else {
-                        x = (const char *)src1->data + (i0 - o[0])*nb10 + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13;
-                    }
-
-                    char * y = (char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3;
-
-                    memcpy(y, x, len);
-                }
-            }
-        }
-    }
-}
-
-static void ggml_compute_forward_concat_i8(
-    const ggml_compute_params * params,
-    ggml_tensor * dst) {
-
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
-
-    GGML_ASSERT(ggml_type_size(src0->type) == sizeof(int8_t));
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
-    GGML_TENSOR_BINARY_OP_LOCALS
-
-    const int32_t dim = ggml_get_op_params_i32(dst, 0);
-
-    GGML_ASSERT(dim >= 0 && dim < 4);
-
-    int64_t o[4] = {0, 0, 0, 0};
-    o[dim] = src0->ne[dim];
-
-    const int8_t * x;
-
-    // TODO: smarter multi-theading
-    for (int i3 = 0; i3 < ne3; i3++) {
-        for (int i2 = ith; i2 < ne2; i2 += nth) {
-            for (int i1 = 0; i1 < ne1; i1++) {
-                for (int i0 = 0; i0 < ne0; i0++) {
-                    if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-                        x = (const int8_t *) ((const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03);
-                    } else {
-                        x = (const int8_t *) ((const char *)src1->data + (i0 - o[0])*nb10 + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13);
-                    }
-
-                    int8_t * y = (int8_t *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
-
-                    *y = *x;
-                }
-            }
-        }
-    }
-}
-
-static void ggml_compute_forward_concat_f16(
-    const ggml_compute_params * params,
-    ggml_tensor * dst) {
-
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
-
-    GGML_ASSERT(ggml_type_size(src0->type) == sizeof(ggml_fp16_t));
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
-    GGML_TENSOR_BINARY_OP_LOCALS
-
-    const int32_t dim = ggml_get_op_params_i32(dst, 0);
-
-    GGML_ASSERT(dim >= 0 && dim < 4);
-
-    int64_t o[4] = {0, 0, 0, 0};
-    o[dim] = src0->ne[dim];
-
-    const ggml_fp16_t * x;
-
-    // TODO: smarter multi-theading
-    for (int i3 = 0; i3 < ne3; i3++) {
-        for (int i2 = ith; i2 < ne2; i2 += nth) {
-            for (int i1 = 0; i1 < ne1; i1++) {
-                for (int i0 = 0; i0 < ne0; i0++) {
-                    if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-                        x = (const ggml_fp16_t *) ((const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03);
-                    } else {
-                        x = (const ggml_fp16_t *) ((const char *)src1->data + (i0 - o[0])*nb10 + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13);
-                    }
-
-                    ggml_fp16_t * y = (ggml_fp16_t *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
-
-                    *y = *x;
-                }
-            }
-        }
-    }
-}
-
-static void ggml_compute_forward_concat_f32(
-    const ggml_compute_params * params,
-    ggml_tensor * dst) {
-
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
-
-    GGML_ASSERT(ggml_type_size(src0->type) == sizeof(float));
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
-    GGML_TENSOR_BINARY_OP_LOCALS
-
-    const int32_t dim = ggml_get_op_params_i32(dst, 0);
-
-    GGML_ASSERT(dim >= 0 && dim < 4);
-
-    int64_t o[4] = {0, 0, 0, 0};
-    o[dim] = src0->ne[dim];
-
-    const float * x;
-
-    // TODO: smarter multi-theading
-    for (int i3 = 0; i3 < ne3; i3++) {
-        for (int i2 = ith; i2 < ne2; i2 += nth) {
-            for (int i1 = 0; i1 < ne1; i1++) {
-                for (int i0 = 0; i0 < ne0; i0++) {
-                    if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-                        x = (const float *) ((const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03);
-                    } else {
-                        x = (const float *) ((const char *)src1->data + (i0 - o[0])*nb10 + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13);
-                    }
-
-                    float * y = (float *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
-
-                    *y = *x;
-                }
-            }
-        }
-    }
-}
-
 void ggml_compute_forward_concat(
-    const ggml_compute_params * params,
-    ggml_tensor * dst) {
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
 
-    const ggml_tensor * src0 = dst->src[0];
+    GGML_TENSOR_LOCALS(int64_t, ne,  dst,  ne)
+    GGML_TENSOR_LOCALS(size_t,  nb,  dst,  nb)
 
-    switch (src0->type) {
-        case GGML_TYPE_F16:
-        case GGML_TYPE_BF16:
-        case GGML_TYPE_I16:
-            {
-                ggml_compute_forward_concat_f16(params, dst);
-            } break;
-        case GGML_TYPE_I8:
-            {
-                ggml_compute_forward_concat_i8(params, dst);
-            } break;
-        case GGML_TYPE_F32:
-        case GGML_TYPE_I32:
-            {
-                ggml_compute_forward_concat_f32(params, dst);
-            } break;
-        default:
-            {
-                ggml_compute_forward_concat_any(params, dst);
-            }
+    const int dim = ggml_get_op_params_i32(dst, 0);
+    ggml_tensor ** src = dst->src;
+
+    const int64_t ne123 = ne1 * ne2 * ne3;
+    const int64_t per_thread = (ne123 + params->nth - 1) / params->nth;
+    const int64_t start = params->ith * per_thread;
+    const int64_t end = std::min(start + per_thread, ne123);
+
+    for (int64_t i = start; i < end; ++i) {
+        const int64_t i3 = i / (ne2 * ne1);
+        const int64_t i2 = (i - i3 * ne2 * ne1) / ne1;
+        const int64_t i1 = i - i3 * ne2 * ne1 - i2 * ne1;
+
+        int t = 0; // index of the source tensor being processed
+        int64_t it[4] = {0, i1, i2, i3};
+        while (src[t] && it[dim] >= src[t]->ne[dim]) {
+            it[dim] -= src[t]->ne[dim];
+            t++;
+        }
+
+        char * dst_row = (char *) dst->data + i1 * nb1 + i2 * nb2 + i3 * nb3;
+
+        for (int64_t i0 = 0; i0 < ne0;) {
+            const int64_t n = src[t]->ne[0];
+            const size_t * nbt = src[t]->nb;
+            const char * src_row = (const char *) src[t]->data
+                + it[1] * nbt[1] + it[2] * nbt[2] + it[3] * nbt[3];
+
+            memcpy(dst_row + i0 * nb0, src_row, n * nb0);
+            i0 += n;
+            t += 1;
+        }
     }
 }
 
@@ -6930,8 +6786,8 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
         //im2col for a patch
         for (int64_t p = patch_start; p < patch_end; ++p) {
             const int64_t  batch_n     =  p / (dst_w * dst_h);
-            const int64_t  src_x       = (p / dst_w) % dst_h;
-            const int64_t  src_y       =  p % dst_w;
+            const int64_t  src_y       = (p / dst_w) % dst_h;
+            const int64_t  src_x       =  p % dst_w;
 
             const float * src_base = (const float *)((const char *)src_data + batch_n * src->nb[3]);
             char *        dst_row  = (char *) tmp + (p % patches_per_batch) * knl_n * traits->type_size;
@@ -6939,8 +6795,8 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
             for (int64_t ic = 0; ic < c_in; ++ic) {
                 for (int64_t ky = 0; ky < knl_h; ++ky) {
                     for (int64_t kx = 0; kx < knl_w; ++kx) {
-                        const int64_t sy = src_x * stride_y + ky * dilation_y - pad_y;
-                        const int64_t sx = src_y * stride_x + kx * dilation_x - pad_x;
+                        const int64_t sy = src_y * stride_y + ky * dilation_y - pad_y;
+                        const int64_t sx = src_x * stride_x + kx * dilation_x - pad_x;
 
                         int64_t dst_idx = ic * (knl_h * knl_w) + ky * knl_w + kx;
 
@@ -6995,6 +6851,92 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
     }
 }
 
+
+static void ggml_compute_forward_conv_2d_cwhn(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src = dst->src[1];
+    const ggml_tensor * kernel = dst->src[0];
+    GGML_ASSERT(ggml_is_contiguous_channels(src));    // [C_in W H N] in memory
+    GGML_ASSERT(ggml_is_contiguous_channels(kernel)   // [C_in W H C_out] in memory
+            || (kernel->ne[0] == 1 && kernel->ne[1] == 1));
+
+    const int32_t stride_x = dst->op_params[0];
+    const int32_t stride_y = dst->op_params[1];
+    const int32_t pad_x    = dst->op_params[2];
+    const int32_t pad_y    = dst->op_params[3];
+
+    const int64_t c_in  = src->ne[2];    // number of input channels
+    const int64_t c_out = kernel->ne[3]; // number of kernels / output channels
+    GGML_ASSERT(c_in == kernel->ne[2]);
+    const int64_t src_w = src->ne[0];
+    const int64_t src_h = src->ne[1];
+          float * src_data = (float *)src->data;
+    const int64_t knl_w = kernel->ne[0];
+    const int64_t knl_h = kernel->ne[1];
+          float * knl_data = (float *)kernel->data;
+    const int64_t dst_w = dst->ne[0];
+    const int64_t dst_h = dst->ne[1];
+          float * dst_data = (float *)dst->data;
+
+    // Handle 1x1 convolutions with stride 1
+    if (knl_w == 1 && knl_h == 1 && stride_x == 1 && stride_y == 1) {
+        int m = dst->ne[3] * dst_w * dst_h;
+        ggml_call_mul_mat(GGML_TYPE_F32, params, m, c_out, c_in, src_data, knl_data, dst_data);
+        return;
+    }
+
+    // Rewrite the convolution as a matrix multiplication (im2col)
+    const int64_t knl_n = c_in * knl_w * knl_h;
+    const int64_t patch_total = dst->ne[3] * dst_w * dst_h;
+    const int64_t batch_size = GGML_IM2COL_WORK_SIZE / (knl_n * sizeof(float));
+    const int64_t patches_per_batch = batch_size > 8 ? (batch_size / 8) * 8 : batch_size;
+    const int64_t batch_n = (patch_total + patches_per_batch - 1) / patches_per_batch;
+
+    GGML_ASSERT(params->wsize >= MIN(patch_total * knl_n * sizeof(float), GGML_IM2COL_WORK_SIZE));
+    float * tmp = (float *)params->wdata; // temporary buffer for im2col result
+
+    for (int64_t batch_i = 0; batch_i < batch_n; ++batch_i) {
+        const int64_t batch_start = batch_i * patches_per_batch;
+        const int64_t batch_end = MIN(batch_start + patches_per_batch, patch_total);
+        const int64_t patch_n = batch_end - batch_start;
+        const int64_t patch_per_thread = (patch_n + params->nth - 1) / params->nth;
+        const int64_t patch_start = batch_start + params->ith * patch_per_thread;
+        const int64_t patch_end = MIN(patch_start + patch_per_thread, batch_end);
+
+        for (int64_t patch_i = patch_start; patch_i < patch_end; ++patch_i) {
+            const int64_t b = patch_i / (dst_w * dst_h);
+            const int64_t dst_y = (patch_i / dst_w) % dst_h;
+            const int64_t dst_x = patch_i % dst_w;
+            const float * src_patch = src_data + (b * src_w * src_h * c_in);
+            float * tmp_patch = tmp + ((patch_i % patches_per_batch) * knl_n);
+
+            for (int64_t knl_y = 0; knl_y < knl_h; ++knl_y) {
+                float * tmp_row = tmp_patch + (knl_y * knl_w * c_in);
+                const int64_t src_y = dst_y * stride_y + knl_y - pad_y;
+                if (src_y < 0 || src_y >= src_h) {
+                    ggml_vec_set_f32(knl_w * c_in, tmp_row, 0);
+                } else {
+                    const int64_t src_x = dst_x * stride_x - pad_x;
+                    const int64_t left = MAX(0, -src_x);
+                    const int64_t right = MAX(0, src_x + knl_w - src_w);
+                    const int64_t center = knl_w - left - right;
+                    const float * src_start = src_patch + (src_y * src_w + src_x + left) * c_in;
+
+                    ggml_vec_set_f32(left * c_in, tmp_row, 0);
+                    ggml_vec_cpy_f32(center * c_in, tmp_row + left * c_in, src_start);
+                    ggml_vec_set_f32(right * c_in, tmp_row + (left + center) * c_in, 0);
+                }
+            }
+        } // for each patch
+        ggml_barrier(params->threadpool);
+
+        float * dst_data_offset = dst_data + batch_start * c_out;
+        ggml_call_mul_mat(GGML_TYPE_F32, params, patch_n, c_out, knl_n, tmp, knl_data, dst_data_offset);
+    } // for each batch
+}
+
 void ggml_compute_forward_conv_2d(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -7002,7 +6944,11 @@ void ggml_compute_forward_conv_2d(
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-    ggml_compute_forward_conv_2d_impl(params, src0, src1, dst, src0->type);
+    if (ggml_is_contiguous_channels(src1)) {
+        ggml_compute_forward_conv_2d_cwhn(params, dst);
+    } else {
+        ggml_compute_forward_conv_2d_impl(params, src0, src1, dst, src0->type);
+    }
 }
 
 // ggml_compute_forward_conv_3d
@@ -7271,6 +7217,316 @@ void ggml_compute_forward_conv_transpose_2d(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+// ggml_compute_forward_conv_2d_deform
+
+static float ggml_bilinear_interpolate_f32(
+    const float * src, int64_t w, int64_t h,
+    float x, float y) {
+
+    int64_t x0 = (int64_t)floorf(x);
+    int64_t y0 = (int64_t)floorf(y);
+    int64_t x1 = x0 + 1;
+    int64_t y1 = y0 + 1;
+
+    float dx = x - x0;
+    float dy = y - y0;
+
+    float v00 = x0 >= 0 && y0 >= 0 ? src[y0 * w + x0] : 0.0f;
+    float v01 = x1 <  w && y0 >= 0 ? src[y0 * w + x1] : 0.0f;
+    float v10 = x0 >= 0 && y1 <  h ? src[y1 * w + x0] : 0.0f;
+    float v11 = x1 <  w && y1 <  h ? src[y1 * w + x1] : 0.0f;
+
+    float val = (v00 * (1.0f - dx) + v01 * dx) * (1.0f - dy)
+              + (v10 * (1.0f - dx) + v11 * dx) * dy;
+    return val;
+}
+
+
+static void ggml_vec_bilinear_interpolate_f32(
+        int64_t n, float * dst, const float * src,
+        int64_t w, int64_t h,
+        float x, float y, float scale = 1.0f) {
+
+    int64_t x0 = (int64_t)floorf(x);
+    int64_t y0 = (int64_t)floorf(y);
+    int64_t x1 = x0 + 1;
+    int64_t y1 = y0 + 1;
+
+    float dx = x - x0;
+    float dy = y - y0;
+
+    const float * src00 = x0 >= 0 && y0 >= 0 ? src + (y0 * w + x0) * n : nullptr;
+    const float * src01 = x1 <  w && y0 >= 0 ? src + (y0 * w + x1) * n : nullptr;
+    const float * src10 = x0 >= 0 && y1 <  h ? src + (y1 * w + x0) * n : nullptr;
+    const float * src11 = x1 <  w && y1 <  h ? src + (y1 * w + x1) * n : nullptr;
+
+    int64_t n_pkg_end = 0;
+#if defined(__AVX__) && GGML_F32_EPR == 8
+    n_pkg_end = (n / GGML_F32_EPR) * GGML_F32_EPR;
+
+    GGML_F32_VEC zero = GGML_F32_VEC_ZERO;
+    GGML_F32_VEC one = GGML_F32_VEC_SET1(1.0f);
+    GGML_F32_VEC dx_vec = GGML_F32_VEC_SET1(dx);
+    GGML_F32_VEC dy_vec = GGML_F32_VEC_SET1(dy);
+    GGML_F32_VEC scale_vec = GGML_F32_VEC_SET1(scale);
+
+    for (int i = 0; i < n_pkg_end; i += GGML_F32_EPR) {
+        GGML_F32_VEC v00 = src00 ? GGML_F32_VEC_LOAD(src00 + i) : zero;
+        GGML_F32_VEC v01 = src01 ? GGML_F32_VEC_LOAD(src01 + i) : zero;
+        GGML_F32_VEC v10 = src10 ? GGML_F32_VEC_LOAD(src10 + i) : zero;
+        GGML_F32_VEC v11 = src11 ? GGML_F32_VEC_LOAD(src11 + i) : zero;
+
+        GGML_F32_VEC v0 = GGML_F32_VEC_ADD(
+            GGML_F32_VEC_MUL(v00, _mm256_sub_ps(one, dx_vec)), GGML_F32_VEC_MUL(v01, dx_vec));
+        GGML_F32_VEC v1 = GGML_F32_VEC_ADD(
+            GGML_F32_VEC_MUL(v10, _mm256_sub_ps(one, dx_vec)), GGML_F32_VEC_MUL(v11, dx_vec));
+        GGML_F32_VEC val = GGML_F32_VEC_ADD(
+            GGML_F32_VEC_MUL(v0, _mm256_sub_ps(one, dy_vec)), GGML_F32_VEC_MUL(v1, dy_vec));
+        GGML_F32_VEC_STORE(dst + i, GGML_F32_VEC_MUL(val, scale_vec));
+    }
+#endif
+
+    for (int i = n_pkg_end; i < n; ++i) {
+        float v00 = src00 ? src00[i] : 0.0f;
+        float v01 = src01 ? src01[i] : 0.0f;
+        float v10 = src10 ? src10[i] : 0.0f;
+        float v11 = src11 ? src11[i] : 0.0f;
+
+        float val = (v00 * (1.0f - dx) + v01 * dx) * (1.0f - dy)
+                  + (v10 * (1.0f - dx) + v11 * dx) * dy;
+        dst[i] = scale * val;
+    }
+}
+
+static void ggml_compute_forward_conv_2d_deform_cwhn(
+    ggml_compute_params * params,
+    const ggml_tensor * src,
+    const ggml_tensor * kernel,
+    const ggml_tensor * offset,
+    const ggml_tensor * mask,
+          ggml_tensor * dst) {
+
+    GGML_ASSERT(ggml_is_contiguous_channels(src));    // [C_in W  H  N] in memory
+    GGML_ASSERT(ggml_is_contiguous_channels(kernel)   // [C_in KW KH C_out] in memory
+            || (kernel->ne[0] == 1 && kernel->ne[1] == 1));
+
+    const int32_t stride_x = dst->op_params[0];
+    const int32_t stride_y = dst->op_params[1];
+    const int32_t pad_x    = dst->op_params[2];
+    const int32_t pad_y    = dst->op_params[3];
+
+    const int64_t c_in  = src->ne[2];    // number of input channels
+    const int64_t c_out = kernel->ne[3]; // number of kernels / output channels
+    const int64_t src_w = src->ne[0];
+    const int64_t src_h = src->ne[1];
+    const float * src_data = (const float *)src->data;
+    const int64_t knl_w = kernel->ne[0];
+    const int64_t knl_h = kernel->ne[1];
+    const int64_t knl_wh = knl_w * knl_h;
+    float *       knl_data = (float *)kernel->data;
+    const int64_t dst_w = dst->ne[0];
+    const int64_t dst_h = dst->ne[1];
+    float       * dst_data = (float *)dst->data;
+
+    GGML_ASSERT(kernel->ne[2] == c_in);
+    GGML_ASSERT(offset->ne[2] == 2 * knl_w * knl_h);    // [2*kw*kh dst_w dst_h batch] in memory
+    GGML_ASSERT(!mask || mask->ne[2] == knl_w * knl_h); // [kw*kh dst_w dst_h batch] in memory
+
+    const int64_t knl_n = c_in * knl_w * knl_h;
+    const int64_t patch_total = dst->ne[3] * dst_w * dst_h;
+    const int64_t batch_size = GGML_IM2COL_WORK_SIZE / (knl_n * sizeof(float));
+    const int64_t patches_per_batch = batch_size > 8 ? (batch_size / 8) * 8 : batch_size;
+    const int64_t batch_n = (patch_total + patches_per_batch - 1) / patches_per_batch;
+
+    GGML_ASSERT(params->wsize >= MIN(patch_total * knl_n * sizeof(float), GGML_IM2COL_WORK_SIZE));
+    float * tmp = (float *)params->wdata; // temporary buffer for im2col result
+
+    for (int64_t batch_i = 0; batch_i < batch_n; ++batch_i) {
+        const int64_t batch_start = batch_i * patches_per_batch;
+        const int64_t batch_end = MIN(batch_start + patches_per_batch, patch_total);
+        const int64_t patch_n = batch_end - batch_start;
+        const int64_t patch_per_thread = (patch_n + params->nth - 1) / params->nth;
+        const int64_t patch_start = batch_start + params->ith * patch_per_thread;
+        const int64_t patch_end = MIN(patch_start + patch_per_thread, batch_end);
+
+        for (int64_t patch_i = patch_start; patch_i < patch_end; ++patch_i) {
+            const int64_t b = patch_i / (dst_w * dst_h);
+            const int64_t dst_y = (patch_i / dst_w) % dst_h;
+            const int64_t dst_x = patch_i % dst_w;
+            const int64_t dst_coord = dst_y * dst_w + dst_x;
+            const float * src_batch = src_data + (b * src_w * src_h * c_in);
+            const float * off_patch = (const float*)offset->data + dst_coord * knl_wh * 2;
+            const float * msk_patch = mask ? (const float*)mask->data + dst_coord * knl_wh : nullptr;
+            float * tmp_patch = tmp + (patch_i % patches_per_batch) * knl_n;
+
+            for (int knl_y = 0; knl_y < knl_h; ++knl_y) {
+                for (int knl_x = 0; knl_x < knl_w; ++knl_x) {
+                    int knl_i = knl_y * knl_w + knl_x;
+
+                    float off_x = off_patch[knl_i * 2 + 1];
+                    float off_y = off_patch[knl_i * 2 + 0];
+                    float src_x = dst_x * stride_x + knl_x - pad_x + off_x;
+                    float src_y = dst_y * stride_y + knl_y - pad_y + off_y;
+
+                    if (src_x <= -1 || src_x >= src_w || src_y <= -1 || src_y >= src_h) {
+                        ggml_vec_set_f32(c_in, tmp_patch + knl_i * c_in, 0);
+                    } else {
+                        float weight = mask ? msk_patch[knl_i] : 1.0f;
+                        ggml_vec_bilinear_interpolate_f32(
+                            c_in, tmp_patch + knl_i * c_in, src_batch,
+                            src_w, src_h,
+                            src_x, src_y, weight);
+                    }
+                }
+            }
+        } // for each patch
+        ggml_barrier(params->threadpool);
+
+        float * dst_data_offset = dst_data + batch_start * c_out;
+        ggml_call_mul_mat(GGML_TYPE_F32, params, patch_n, c_out, knl_n, tmp, knl_data, dst_data_offset);
+    } // for each batch
+}
+
+static void ggml_compute_forward_conv_2d_deform_whcn(
+    const ggml_compute_params * params,
+    const ggml_tensor *         src,
+    const ggml_tensor *         kernel,
+    const ggml_tensor *         offset, // [dst_w, dst_h, 2*kw*kh, batch] in memory
+    const ggml_tensor *         mask,   // [dst_w, dst_h,   kw*kh, batch] in memory
+    ggml_tensor *               dst) {
+
+
+    GGML_ASSERT(ggml_is_contiguous(kernel));
+
+    const int32_t stride_x   = dst->op_params[0];
+    const int32_t stride_y   = dst->op_params[1];
+    const int32_t pad_x      = dst->op_params[2];
+    const int32_t pad_y      = dst->op_params[3];
+
+    const int64_t c_in  = src->ne[2];
+    const int64_t c_out = kernel->ne[3];
+    GGML_ASSERT(c_in == kernel->ne[2]);
+
+    const int64_t src_w = src->ne[0];
+    const int64_t src_h = src->ne[1];
+    const int64_t knl_w = kernel->ne[0];
+    const int64_t knl_h = kernel->ne[1];
+    const int64_t dst_w = dst->ne[0];
+    const int64_t dst_h = dst->ne[1];
+
+    const float * src_data = (float *) src->data;
+    void  * knl_data       = kernel->data;
+    float * dst_data       = (float *) dst->data;
+
+    const int64_t knl_n           = knl_w * knl_h * c_in;
+    const int64_t patch_total     = dst->ne[3] * dst_w * dst_h;
+
+    const int64_t space_per_patch   = knl_n * sizeof(float) + c_out * sizeof(float);
+    const int64_t batch_size        = params->wsize / space_per_patch;
+    const int64_t patches_per_batch = batch_size > 8 ? (batch_size / 8) * 8 : batch_size;
+    const int64_t batch_n           = (patch_total + patches_per_batch - 1) / patches_per_batch;
+
+    GGML_ASSERT(patches_per_batch > 0 && batch_size >= 1);
+
+    void * tmp = params->wdata;
+
+    for (int64_t batch_i = 0; batch_i < batch_n; ++batch_i) {
+
+        const int64_t patch_start_batch = batch_i * patches_per_batch;
+        const int64_t patch_end_batch   = std::min(patch_start_batch + patches_per_batch,
+                                              patch_total);
+        const int64_t patch_n           = patch_end_batch - patch_start_batch;
+
+        const int64_t patch_per_thread  = (patch_n + params->nth - 1) / params->nth;
+        const int64_t patch_start       = patch_start_batch + params->ith * patch_per_thread;
+        const int64_t patch_end         = std::min(patch_start + patch_per_thread, patch_end_batch);
+
+        //im2col for a patch
+        for (int64_t p = patch_start; p < patch_end; ++p) {
+            const int64_t  batch_n     =  p / (dst_w * dst_h);
+            const int64_t  src_y       = (p / dst_w) % dst_h;
+            const int64_t  src_x       =  p % dst_w;
+
+            const int64_t dst_coord = src_y * dst_w + src_x;
+
+            const float * src_base = (const float *)((const char *)src_data + batch_n * src->nb[3]);
+            char *        dst_row  = (char *) tmp + (p % patches_per_batch) * knl_n * sizeof(float);
+
+            const float * off_patch = (const float*)offset->data + dst_coord;
+            const float * msk_patch = mask ? (const float*)mask->data + dst_coord : nullptr;
+
+            for (int64_t ic = 0; ic < c_in; ++ic) {
+                for (int64_t ky = 0; ky < knl_h; ++ky) {
+                    for (int64_t kx = 0; kx < knl_w; ++kx) {
+                        int knl_i = ky * knl_w + kx;
+
+                        float off_x = off_patch[(2 * knl_i + 1) * (dst_w * dst_h)];
+                        float off_y = off_patch[(2 * knl_i + 0) * (dst_w * dst_h)];
+
+                        const float sy = float(src_y * stride_y + ky) - pad_y + off_y;
+                        const float sx = float(src_x * stride_x + kx) - pad_x + off_x;
+
+                        float src_val;
+                        if (sx <= -1 || sx >= src_w || sy <= -1 || sy >= src_h) {
+                            src_val = 0.0f;
+                        } else {
+                            const float * src_ptr = (const float *)((const char *)src_base + ic * src->nb[2]);
+                            float weight = mask ? msk_patch[knl_i * dst_w * dst_h] : 1.0f;
+                            src_val = weight * ggml_bilinear_interpolate_f32(src_ptr, src_w, src_h, sx, sy);
+                        }
+
+                        int64_t dst_idx = ic * (knl_h * knl_w) + ky * knl_w + kx;
+                        char * element_ptr = dst_row + dst_idx * sizeof(float);
+                        *(float *) element_ptr = src_val;
+                    }
+                }
+            }
+        }   // patches handled by this thread
+
+        ggml_barrier(params->threadpool);
+
+        float * gemm_output = (float *) ((char *) tmp + patches_per_batch * knl_n * sizeof(float));
+
+        GGML_ASSERT(gemm_output + patch_n * c_out <= (float*)tmp + params->wsize);
+
+        // GEMM: patches[patch_n, knl_n] × kernel[knl_n, c_out] = output[patch_n, c_out]
+        ggml_call_mul_mat(GGML_TYPE_F32, params, patch_n, c_out, knl_n, tmp, knl_data, gemm_output);
+
+        ggml_barrier(params->threadpool);
+
+        //permute back [OC, N, OH, OW] to [N, OC, OH, OW]
+        const int64_t permute_per_thread = (patch_n + params->nth - 1) / params->nth;
+        const int64_t permute_start = params->ith * permute_per_thread;
+        const int64_t permute_end = std::min(permute_start + permute_per_thread, patch_n);
+
+        for (int64_t i = permute_start; i < permute_end; ++i) {
+            const int64_t p       = patch_start_batch + i;
+            const int64_t batch_n = p / (dst_w * dst_h);
+            const int64_t dst_y   = (p / dst_w) % dst_h;
+            const int64_t dst_x   = p % dst_w;
+
+            for (int64_t oc = 0; oc < c_out; ++oc) {
+                const float value = gemm_output[i * c_out + oc];
+                float * dst_ptr = (float *)((char *)dst_data + dst_x * dst->nb[0] + dst_y * dst->nb[1] + oc * dst->nb[2] + batch_n * dst->nb[3]);
+                *dst_ptr = value;
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_conv_2d_deform(ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src = dst->src[1];
+    const ggml_tensor * kernel = dst->src[0];
+    const ggml_tensor * offset = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    if (!(ggml_is_contiguous(src) && ggml_is_contiguous(kernel))) {
+        ggml_compute_forward_conv_2d_deform_cwhn(params, src, kernel, offset, mask, dst);
+    } else {
+        ggml_compute_forward_conv_2d_deform_whcn(params, src, kernel, offset, mask, dst);
     }
 }
 

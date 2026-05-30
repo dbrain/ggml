@@ -268,6 +268,9 @@ void ggml_abort(const char * file, int line, const char * fmt, ...) {
         ggml_print_backtrace();
     }
 
+#if defined(_MSC_VER)
+    __debugbreak();
+#endif
     abort();
 }
 
@@ -1034,6 +1037,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CONV_2D",
     "CONV_3D",
     "CONV_2D_DW",
+    "CONV_2D_DEFORM",
     "CONV_TRANSPOSE_2D",
     "POOL_1D",
     "POOL_2D",
@@ -1085,7 +1089,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "COL2IM_1D",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1149,6 +1153,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "conv_2d(x)",
     "conv_3d(x)",
     "conv_2d_dw(x)",
+    "conv_2d_deform(x)",
     "conv_transpose_2d(x)",
     "pool_1d(x)",
     "pool_2d(x)",
@@ -1200,7 +1205,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "col2im_1d(x)",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1502,8 +1507,8 @@ bool ggml_is_permuted(const struct ggml_tensor * tensor) {
 
 bool ggml_is_contiguous_channels(const struct ggml_tensor * tensor) {
     return
-        tensor->nb[0] > tensor->nb[2] &&
-        tensor->nb[1] > tensor->nb[0] &&
+        tensor->nb[0] >= tensor->nb[2] &&
+        tensor->nb[1] >= tensor->nb[0] &&
         tensor->nb[2] == ggml_type_size(tensor->type);
 }
 
@@ -2591,31 +2596,49 @@ struct ggml_tensor * ggml_repeat_back(
 // ggml_concat
 
 struct ggml_tensor * ggml_concat(
-    struct ggml_context * ctx,
-    struct ggml_tensor  * a,
-    struct ggml_tensor  * b,
-    int                   dim) {
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        int                   dim) {
+
+    struct ggml_tensor * tensors[2] = { a, b };
+    return ggml_concat_n(ctx, tensors, 2, dim);
+}
+
+struct ggml_tensor * ggml_concat_n(
+        struct ggml_context * ctx,
+        struct ggml_tensor ** tensors,
+        int                   n_tensors,
+        int                   dim) {
     GGML_ASSERT(dim >= 0 && dim < GGML_MAX_DIMS);
-    GGML_ASSERT(a->type == b->type);
+    GGML_ASSERT(n_tensors > 1 && n_tensors <= GGML_MAX_SRC);
+
+    enum ggml_type type = tensors[0]->type;
+    GGML_ASSERT(tensors[0]->nb[0] == ggml_type_size(type));
 
     int64_t ne[GGML_MAX_DIMS];
-    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-        if (d == dim) {
-            ne[d] = a->ne[d] + b->ne[d];
-            continue;
+    memcpy(ne, tensors[0]->ne, sizeof(ne));
+
+    for (int i = 1; i < n_tensors; ++i) {
+        GGML_ASSERT(tensors[i]->type == type);
+        GGML_ASSERT(tensors[i]->nb[0] == ggml_type_size(type));
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (d == dim) {
+                ne[d] += tensors[i]->ne[d];
+            } else {
+                GGML_ASSERT(tensors[i]->ne[d] == ne[d]);
+            }
         }
-        GGML_ASSERT(a->ne[d] == b->ne[d]);
-        ne[d] = a->ne[d];
     }
 
-    struct ggml_tensor * result = ggml_new_tensor(ctx, a->type, GGML_MAX_DIMS, ne);
+    struct ggml_tensor * result = ggml_new_tensor(ctx, type, GGML_MAX_DIMS, ne);
 
     ggml_set_op_params_i32(result, 0, dim);
 
-    result->op     = GGML_OP_CONCAT;
-    result->src[0] = a;
-    result->src[1] = b;
-
+    result->op = GGML_OP_CONCAT;
+    for (int i = 0; i < n_tensors; ++i) {
+        result->src[i] = tensors[i];
+    }
     return result;
 }
 
@@ -3784,6 +3807,21 @@ struct ggml_tensor * ggml_view_4d(
 
 // ggml_permute
 
+static void ggml_set_permuted_strides(struct ggml_tensor * a, int axis0, int axis1, int axis2, int axis3) {
+    a->nb[axis0] = ggml_type_size(a->type);
+    a->nb[axis1] = a->nb[axis0] * (a->ne[axis0] / ggml_blck_size(a->type));
+    a->nb[axis2] = a->nb[axis1] * a->ne[axis1];
+    a->nb[axis3] = a->nb[axis2] * a->ne[axis2];
+
+            // // Result will be permuted the same way as input (CWHN order)
+            // const int64_t type_size = ggml_type_size(result->type);
+            // GGML_ASSERT(ggml_blck_size(result->type) == 1);
+            // result->nb[0] = result->ne[2] * type_size;
+            // result->nb[1] = result->ne[0] * result->nb[0];
+            // result->nb[2] = type_size;
+
+}
+
 struct ggml_tensor * ggml_permute(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -4769,18 +4807,41 @@ struct ggml_tensor * ggml_conv_2d(
         int                   p1,
         int                   d0,
         int                   d1) {
-    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, s1, p0, p1, d0, d1, true, a->type); // [N, OH, OW, IC * KH * KW]
 
-    struct ggml_tensor * result =
-        ggml_mul_mat(ctx,
-                ggml_reshape_2d(ctx, im2col, im2col->ne[0],  im2col->ne[3] * im2col->ne[2] * im2col->ne[1]), // [N, OH, OW, IC * KH * KW] => [N*OH*OW, IC * KH * KW]
-                ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1] * a->ne[2]),  a->ne[3]));                       // [OC，IC, KH, KW] => [OC, IC * KH * KW]
+    if (ggml_is_contiguous(b)) {
+        struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, s1, p0, p1, d0, d1, true, a->type); // [N, OH, OW, IC * KH * KW]
 
-    result = ggml_reshape_4d(ctx, result, im2col->ne[1], im2col->ne[2], im2col->ne[3], a->ne[3]); // [OC, N, OH, OW]
-    result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 1, 3, 2)); // [N, OC, OH, OW]
+        struct ggml_tensor * result =
+            ggml_mul_mat(ctx,
+                    ggml_reshape_2d(ctx, im2col, im2col->ne[0],  im2col->ne[3] * im2col->ne[2] * im2col->ne[1]), // [N, OH, OW, IC * KH * KW] => [N*OH*OW, IC * KH * KW]
+                    ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1] * a->ne[2]),  a->ne[3]));                       // [OC，IC, KH, KW] => [OC, IC * KH * KW]
 
+        result = ggml_reshape_4d(ctx, result, im2col->ne[1], im2col->ne[2], im2col->ne[3], a->ne[3]); // [OC, N, OH, OW]
+        result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 1, 3, 2)); // [N, OC, OH, OW]
+        return result;
 
-    return result;
+    } else if (ggml_is_contiguous_channels(b)) {
+        // Memory layout of input b:  [N,  IH, IW, IC], permuted to [N,  IC, IH, IW]
+        // Memory layout of result:   [N,  OH, OW, OC], permuted to [N,  OC, OH, OW]
+        // Memory layout of kernel a: [OC, KH, KW, IC], permuted to [OC, IC, KH, KW]
+        const int64_t ne[4] = {
+            ggml_calc_conv_output_size(b->ne[0], a->ne[0], s0, p0, d0),
+            ggml_calc_conv_output_size(b->ne[1], a->ne[1], s1, p1, d1),
+            a->ne[3],
+            b->ne[3]
+        };
+        struct ggml_tensor * result = ggml_new_tensor(ctx, b->type, 4, ne);
+        ggml_set_permuted_strides(result, 2, 0, 1, 3);
+
+        int32_t params[] = { s0, s1, p0, p1, d0, d1 };
+        ggml_set_op_params(result, params, sizeof(params));
+
+        result->op     = GGML_OP_CONV_2D;
+        result->src[0] = a;
+        result->src[1] = b;
+        return result;
+    }
+    GGML_ABORT("ggml_conv_2d: unsupported memory layout");
 }
 
 // a: [OC*IC, KD, KH, KW]
@@ -4934,12 +4995,7 @@ struct ggml_tensor * ggml_conv_2d_dw_direct(
     struct ggml_tensor * result = ggml_new_tensor(ctx, b->type, 4, ne);
 
     if (ggml_is_contiguous_channels(b)) {
-        // Result will be permuted the same way as input (CWHN order)
-        const int64_t type_size = ggml_type_size(result->type);
-        GGML_ASSERT(ggml_blck_size(result->type) == 1);
-        result->nb[0] = result->ne[2] * type_size;
-        result->nb[1] = result->ne[0] * result->nb[0];
-        result->nb[2] = type_size;
+        ggml_set_permuted_strides(result, 2, 0, 1, 3);
     }
 
     int32_t params[] = { stride0, stride1, pad0, pad1, dilation0, dilation1 };
@@ -4975,6 +5031,12 @@ struct ggml_tensor * ggml_conv_2d_direct(
 
     struct ggml_tensor * result = ggml_new_tensor(ctx, b->type, 4, ne);
 
+    if (!(ggml_is_contiguous(a) && ggml_is_contiguous(b))) {
+        GGML_ASSERT(ggml_is_contiguous_channels(a) && ggml_is_contiguous_channels(b));
+        // inputs and output are CWHN in memory, with strides permuted to WHCN
+        ggml_set_permuted_strides(result, 2, 0, 1, 3);
+    }
+
     ggml_set_op_params_i32(result, 0, s0);
     ggml_set_op_params_i32(result, 1, s1);
     ggml_set_op_params_i32(result, 2, p0);
@@ -4985,7 +5047,57 @@ struct ggml_tensor * ggml_conv_2d_direct(
     result->op = GGML_OP_CONV_2D;
     result->src[0] = a;
     result->src[1] = b;
+    return result;
+}
 
+// ggml_conv_2d_deform
+
+struct ggml_tensor * ggml_conv_2d_deform(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kernel,
+        struct ggml_tensor  * input,
+        struct ggml_tensor  * offset,
+        struct ggml_tensor  * mask,
+        int                   stride0,
+        int                   stride1,
+        int                   pad0,
+        int                   pad1) {
+
+    GGML_ASSERT(kernel->ne[2] == input->ne[2]);
+    GGML_ASSERT(offset->ne[2] == 2 * kernel->ne[0] * kernel->ne[1]);
+    GGML_ASSERT(!mask || mask->ne[2] == kernel->ne[0] * kernel->ne[1]);
+
+    const int64_t ne[4] = {
+        ggml_calc_conv_output_size(input->ne[0], kernel->ne[0], stride0, pad0, 1),
+        ggml_calc_conv_output_size(input->ne[1], kernel->ne[1], stride1, pad1, 1),
+        kernel->ne[3],
+        input->ne[3]
+    };
+
+    GGML_ASSERT(offset->ne[0] == ne[0] && offset->ne[1] == ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, input->type, 4, ne);
+
+    if (!(ggml_is_contiguous(input) && ggml_is_contiguous(kernel))) {
+        GGML_ASSERT(ggml_is_contiguous_channels(input) && ggml_is_contiguous_channels(kernel));
+        // Memory layout of input:  [IC W  H  N ], permuted to [W  H  IC N ]
+        // Memory layout of result: [OC OW OH N ], permuted to [OW OH OC N ]
+        // Memory layout of kernel: [IC KW KH OC], permuted to [KW KH IC OC]
+        // Memory layout of offset: [KH*KW*2 OW OH N], permuted to [OW OH KH*KW*2 N]
+        // Memory layout of mask:   [KH*KW   OW OH N], permuted to [OW OH KH*KW   N]
+        GGML_ASSERT(ggml_is_contiguous_channels(offset));
+        GGML_ASSERT(!mask || ggml_is_contiguous_channels(mask) || mask->ne[2] == 1);
+        ggml_set_permuted_strides(result, 2, 0, 1, 3);
+    }
+
+    int32_t params[] = { stride0, stride1, pad0, pad1, 1, 1 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_CONV_2D_DEFORM;
+    result->src[0] = kernel;
+    result->src[1] = input;
+    result->src[2] = offset;
+    result->src[3] = mask;
     return result;
 }
 
@@ -5059,6 +5171,10 @@ struct ggml_tensor * ggml_conv_transpose_2d_p0(
     };
 
     struct ggml_tensor* result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    if (ggml_is_contiguous_channels(b)) {
+        ggml_set_permuted_strides(result, 2, 0, 1, 3);
+    }
 
     ggml_set_op_params_i32(result, 0, stride);
 

@@ -538,6 +538,7 @@ extern "C" {
         GGML_OP_CONV_2D,
         GGML_OP_CONV_3D,
         GGML_OP_CONV_2D_DW,
+        GGML_OP_CONV_2D_DEFORM,
         GGML_OP_CONV_TRANSPOSE_2D,
         GGML_OP_POOL_1D,
         GGML_OP_POOL_2D,
@@ -1091,6 +1092,12 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             int                   dim);
+
+    GGML_API struct ggml_tensor * ggml_concat_n(
+            struct ggml_context * ctx,
+            struct ggml_tensor ** tensors,   // array of pointers to tensors
+            int                   n_tensors, // number of tensors in the array
+            int                   dim);      // dimension to concatenate along
 
     GGML_API struct ggml_tensor * ggml_abs(
             struct ggml_context * ctx,
@@ -2240,6 +2247,17 @@ extern "C" {
             int                   pad1,
             int                   dilation0,
             int                   dilation1);
+
+    GGML_API struct ggml_tensor * ggml_conv_2d_deform(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kernel,
+            struct ggml_tensor  * input,
+            struct ggml_tensor  * offset,
+            struct ggml_tensor  * mask,
+            int                   stride0,
+            int                   stride1,
+            int                   pad0,
+            int                   pad1);
 
     GGML_API struct ggml_tensor * ggml_conv_transpose_2d_p0(
             struct ggml_context * ctx,
