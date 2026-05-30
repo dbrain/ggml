@@ -3906,19 +3906,26 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             add = cgraph->nodes[node_idx+2];
         }
 
-        GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
-        GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
-
-        //rms norm only supports F32
-        if (mul->src[0]->type != GGML_TYPE_F32 ||
-            mul->src[1]->type != GGML_TYPE_F32 ||
-            mul->type != GGML_TYPE_F32) {
+        // The fused rms_norm kernel is now F16-capable (additive: F32 path byte-identical).
+        // Activations may be F32 or F16, but all activation-side tensors must share that
+        // element type (the fused kernel uses one T for x/dst and the mul/add operands).
+        const ggml_type act_type = rms_norm->src[0]->type;
+        if (act_type != GGML_TYPE_F32 && act_type != GGML_TYPE_F16) {
+            return false;
+        }
+        if (rms_norm->type != act_type) {
             return false;
         }
 
-        if (add && (add->src[0]->type != GGML_TYPE_F32 ||
-            add->src[1]->type != GGML_TYPE_F32 ||
-            add->type != GGML_TYPE_F32) ) {
+        if (mul->src[0]->type != act_type ||
+            mul->src[1]->type != act_type ||
+            mul->type != act_type) {
+            return false;
+        }
+
+        if (add && (add->src[0]->type != act_type ||
+            add->src[1]->type != act_type ||
+            add->type != act_type) ) {
             return false;
         }
 
@@ -4443,10 +4450,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                       i, nm, op_i1, op_i2, op_i3, op_i4,
                       ggml_node_get_use_count(cgraph, i));
     }
-    // The fused norm+mul(+add) kernels are F32-only; for F16 activations fall through to
-    // the regular (now F16-capable) ggml_cuda_op_norm so F16 layernorm doesn't hit the
-    // F32 assert in the fused path.
-    if (node->op == GGML_OP_NORM && node->src[0]->type == GGML_TYPE_F32) {
+    // The fused norm+mul(+add) kernels are now F16-capable (additive: F32 path is
+    // byte-identical). Both F32 and F16 activations take the fused path, provided the
+    // mul/add broadcast operands share the activation element type (matting's F16 swin
+    // casts weight/bias to match x via cast_like). If a mixed-type graph ever appears,
+    // the per-call type-consistency check below falls through to the (F16-capable)
+    // non-fused ggml_cuda_op_norm.
+    if (node->op == GGML_OP_NORM &&
+        (node->src[0]->type == GGML_TYPE_F32 || node->src[0]->type == GGML_TYPE_F16)) {
+        const ggml_type act_type = node->src[0]->type;
         auto is_view_like = [](ggml_op op) {
             return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
                    op == GGML_OP_TRANSPOSE || op == GGML_OP_PERMUTE;
@@ -4489,7 +4501,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         // the next op in the chain via the intermediate views).
                         int uc_norm = ggml_node_get_use_count(cgraph, i);
                         int uc_mul  = ggml_node_get_use_count(cgraph, mul_idx);
-                        if (uc_norm == 1 && uc_mul == 1) {
+                        // All activation-side tensors (norm out, MUL out/operand, ADD out/operand)
+                        // must share the activation element type; the fused kernel uses one T.
+                        const bool types_ok =
+                            node->type == act_type &&
+                            mul_n->type == act_type && norm_chain_src->type == act_type &&
+                            add_n->type == act_type;
+                        if (uc_norm == 1 && uc_mul == 1 && types_ok) {
                             ggml_cuda_op_norm_fused_add(*cuda_ctx, node, mul_n, add_n);
                             // skip ALL nodes between i+1 and add_idx inclusive
                             return add_idx - i;
@@ -4511,8 +4529,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
         // Two-op variant: NORM + (RESHAPE-skipped) + MUL
         if (j == i + 1 && cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
+            ggml_tensor * mul2 = cgraph->nodes[i + 1];
+            // MUL out and its non-NORM operand must share the activation element type.
+            const ggml_tensor * mul2_op =
+                (mul2->src[0] == node) ? mul2->src[1] :
+                (mul2->src[1] == node) ? mul2->src[0] : nullptr;
+            const bool types_ok = node->type == act_type && mul2->type == act_type &&
+                                  mul2_op && mul2_op->type == act_type;
             // pure consecutive — keep the original simple path
-            if (ggml_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL })) {
+            if (types_ok && ggml_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL })) {
                 ggml_cuda_op_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
                 return 1;
             }
