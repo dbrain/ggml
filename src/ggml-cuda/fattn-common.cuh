@@ -1038,7 +1038,10 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    // NOTE: flash_attn_mask_to_KV_max scans only head 0 (it indexes mask by sequence + query-tile, not head)
+    //     and shares the resulting KV_max across all heads. For a per-head mask (mask->ne[2] > 1) that would be
+    //     unsound (head h>0 could have allowed K positions beyond head 0's tail), so disable the scan there.
+    if (mask && mask->ne[2] == 1 && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
         const int s31 = mask->nb[1] / sizeof(half2);
         const int s33 = mask->nb[3] / sizeof(half2);
 

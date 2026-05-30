@@ -485,13 +485,28 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_NONE;
     }
 
-    if (mask && mask->ne[2] != 1) {
-        return BEST_FATTN_KERNEL_NONE;
+    // Per-head additive mask (mask->ne[2] == n_heads, e.g. Swin relative-position bias).
+    // Only the MMA_F16 kernel implements the per-head mask offset, and only when the
+    // per-block GQA packing collapses to a single Q head (ncols2 == 1, i.e. gqa_ratio == 1).
+    // The vec / tile / wmma kernels still assume a head-broadcast mask, so per-head masks
+    // must be steered onto the MMA path (or rejected). The ne[2] == 1 broadcast path is
+    // unchanged for every kernel.
+    const bool per_head_mask = mask && mask->ne[2] != 1;
+    if (per_head_mask) {
+        // Mask head dim must match the Q head count exactly (one mask slice per Q head).
+        if (mask->ne[2] != Q->ne[2]) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        // Per-block GQA head packing (ncols2 > 1) shares one mask tile across ncols2 Q
+        // heads; that is incompatible with a distinct mask slice per head. Require 1:1 Q:KV.
+        if (gqa_ratio != 1) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    const bool can_use_vector_kernel = !per_head_mask && Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
@@ -516,6 +531,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             }
         }
         return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
+    // Beyond this point the remaining branches may select the tile / wmma kernels, none of
+    // which implement the per-head mask offset. Only the Turing-MMA path above is supported
+    // for per-head masks (our cc 8.6 target always takes it), so reject anything else.
+    if (per_head_mask) {
+        return BEST_FATTN_KERNEL_NONE;
     }
 
     const int ncols2_max = Q->ne[0] == 320 ? 32 : ((Q->ne[0] == 576 || Q->ne[0] == 192) ? 16 : 8);
