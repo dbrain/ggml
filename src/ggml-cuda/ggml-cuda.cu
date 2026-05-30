@@ -2683,6 +2683,31 @@ static void ggml_cuda_mul_mat_f16_dst(ggml_backend_cuda_context & ctx, const ggm
     const int64_t nbd2 = ne0*ne1;
     const int64_t nbd3 = ne0*ne1*ne2;
 
+    // FAST PATH: a single 2D weight (ne02==ne03==1) broadcast over the batch (r2>1, r3==1)
+    // is mathematically ONE 2D GEMM with the batch folded into N: W is identical for every
+    // batch, so mul_mat(W, x[k,n,B]) == mul_mat(W, x_2d[k, n*B]). The generic 484-way
+    // batched-pointer path below is ~35x slower at COMPUTE_32F (measured: 130ms vs ~4ms);
+    // collapsing to one cublasGemmEx keeps F32 accumulation AND hits the fast GEMM kernel.
+    // Requires src1/dst contiguous so n*B is one packed N dim (ne13==1 -> no dim-3 batch).
+    {
+        // Collapse is valid when the ne11*ne12 columns are one packed N dim: rows
+        // contiguous (nb10==ts, asserted above) + the batch packs (s12 == ne11*s11).
+        // (Full ggml_is_contiguous is too strict — the full-res src1 is a contiguous-2
+        // view whose batch is still packed.) For F32 src1 the convert temp sets these.
+        const bool src1_packed = (s12 == ne11*s11);
+        if (ne02 == 1 && ne03 == 1 && ne13 == 1 && r2 > 1 && is_src0_cont_2 && src1_packed) {
+            CUBLAS_CHECK(
+            cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                    ne01, ne11*ne12, ne10,
+                    &alpha, src0_ptr, CUDA_R_16F, nb01/nb00,
+                            src1_ptr, CUDA_R_16F, s11,
+                    &beta,  dst_ptr,  CUDA_R_16F, ne0,
+                    cu_compute_type,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            return;
+        }
+    }
+
     if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
         const int64_t sma = ne02 == 1 ? nb03/nb00 : nb02/nb00;
         const int64_t smb = ne12 == 1 ? s13       : s12;
