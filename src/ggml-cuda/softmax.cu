@@ -10,6 +10,7 @@
 #endif // GGML_USE_HIP
 
 #include <cstdint>
+#include <type_traits>
 #include <utility>
 
 template <typename T>
@@ -51,9 +52,12 @@ struct soft_max_params {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template <bool use_shared, int ncols_template, int block_size_template, typename T>
+// Tdata: element type of x/dst in {float, half}. Internal math is always FLOAT
+// (load -> (float) -> softmax -> store as Tdata); the F32 instantiation is
+// byte-identical to the original. T: mask element type ({float, half}), unchanged.
+template <bool use_shared, int ncols_template, int block_size_template, typename T, typename Tdata = float>
 static __global__ void soft_max_f32(
-        const float * x, const T * mask, const float * sinks, float * dst, const soft_max_params p) {
+        const Tdata * x, const T * mask, const float * sinks, Tdata * dst, const soft_max_params p) {
     const int ncols = ncols_template == 0 ? p.ncols : ncols_template;
 
     const int tid  = threadIdx.x;
@@ -79,8 +83,11 @@ static __global__ void soft_max_f32(
 
     extern __shared__ float data_soft_max_f32[];
     float * buf_iw = data_soft_max_f32; // shared memory buffer for inter-warp communication
-    // shared memory buffer to cache values between iterations:
-    float * vals = use_shared ? buf_iw + WARP_SIZE : dst;
+    // shared memory buffer to cache values between iterations. The float cache is
+    // always used for F16 (dst is half and cannot alias the float vals buffer); the
+    // !use_shared aliasing optimization is only valid when Tdata == float.
+    constexpr bool dst_is_float = std::is_same<Tdata, float>::value;
+    float * vals = (use_shared || !dst_is_float) ? buf_iw + WARP_SIZE : (float *) dst;
 
     float max_val = sinks ? sinks[i02] : -INFINITY;
 
@@ -92,7 +99,7 @@ static __global__ void soft_max_f32(
             break;
         }
 
-        const float val = x[col]*p.scale + (mask ? slope*t2f32(mask[col]) : 0.0f);
+        const float val = (float)x[col]*p.scale + (mask ? slope*t2f32(mask[col]) : 0.0f);
 
         vals[col] = val;
         max_val = max(max_val, val);
@@ -133,7 +140,7 @@ static __global__ void soft_max_f32(
             return;
         }
 
-        dst[col] = vals[col] * inv_sum;
+        dst[col] = (Tdata)(vals[col] * inv_sum);
     }
 }
 
@@ -269,8 +276,8 @@ static __global__ void soft_max_back_f32(
     }
 }
 
-template<int... Ns, typename T>
-static void launch_soft_max_kernels(const float * x, const T * mask, const float * sinks, float * dst,
+template<int... Ns, typename T, typename Tdata>
+static void launch_soft_max_kernels(const Tdata * x, const T * mask, const float * sinks, Tdata * dst,
                              const soft_max_params & p, cudaStream_t stream, dim3 block_dims, dim3 block_nums, size_t nbytes_shared)
 {
     const int id       = ggml_cuda_get_device();
@@ -281,8 +288,8 @@ static void launch_soft_max_kernels(const float * x, const T * mask, const float
         constexpr int block = (ncols > 1024 ? 1024 : ncols);
 
         if (p.ncols == ncols) {
-            CUDA_SET_SHARED_MEMORY_LIMIT((soft_max_f32<true, ncols, block, T>), smpbo);
-            soft_max_f32<true, ncols, block><<<block_nums, block_dims, nbytes_shared, stream>>>
+            CUDA_SET_SHARED_MEMORY_LIMIT((soft_max_f32<true, ncols, block, T, Tdata>), smpbo);
+            soft_max_f32<true, ncols, block, T, Tdata><<<block_nums, block_dims, nbytes_shared, stream>>>
                 (x, mask, sinks, dst, p);
             return true;
         }
@@ -295,8 +302,8 @@ static void launch_soft_max_kernels(const float * x, const T * mask, const float
     }
 
     //default case
-    CUDA_SET_SHARED_MEMORY_LIMIT((soft_max_f32<true, 0, 0, T>), smpbo);
-    soft_max_f32<true, 0, 0><<<block_nums, block_dims, nbytes_shared, stream>>>(x, mask, sinks, dst, p);
+    CUDA_SET_SHARED_MEMORY_LIMIT((soft_max_f32<true, 0, 0, T, Tdata>), smpbo);
+    soft_max_f32<true, 0, 0, T, Tdata><<<block_nums, block_dims, nbytes_shared, stream>>>(x, mask, sinks, dst, p);
 }
 
 __launch_bounds__(8*WARP_SIZE, 1) static __global__ void soft_max_f32_parallelize_cols(const float * __restrict__ x,
@@ -316,11 +323,11 @@ __launch_bounds__(8*WARP_SIZE, 1) static __global__ void soft_max_f32_paralleliz
     }
 }
 
-template <typename T>
-static void soft_max_f32_cuda(const float *                                x,
+template <typename T, typename Tdata = float>
+static void soft_max_f32_cuda(const Tdata *                                x,
                               const T *                                    mask,
                               const float *                                sinks,
-                              float *                                      dst,
+                              Tdata *                                      dst,
                               const soft_max_params &                      params,
                               cudaStream_t                                 stream,
                               [[maybe_unused]] ggml_backend_cuda_context & ctx) {
@@ -341,23 +348,35 @@ static void soft_max_f32_cuda(const float *                                x,
     if (nbytes_shared <= smpbo) {
         launch_soft_max_kernels<32, 64, 128, 256, 512, 1024, 2048, 4096>(x, mask, sinks, dst, params, stream, block_dims, block_nums, nbytes_shared);
     } else {
+        // F16 activations only support the shared-memory path: both the cooperative
+        // parallelize_cols kernel and the !use_shared (vals==dst) fallback assume F32
+        // x/dst. The fallback also caches vals in float shared memory sized for the
+        // shared path, so it cannot run when nbytes_shared > smpbo. Swin softmax rows
+        // are tiny (window_size^2) so F16 never reaches this large-ncols regime.
+        GGML_ASSERT((std::is_same<Tdata, float>::value) && "F16 soft_max requires nbytes_shared <= smpbo (small ncols)");
         // Parallelize across SMs for top-p/dist-sampling
         // The heuristic for parallelizing rows across SMs vs parallelizing single row & looping over all rows was done on the basis of a B6000 GPU and
         // Can be adapted further for lower-SM-count GPUs, though keeping data in registers should be implemented first as that is the optimal solution.
-        if (ggml_cuda_info().devices[id].supports_cooperative_launch &&
+        // The cooperative parallelize_cols path is F32-only (sampling); F16 always
+        // falls through to the shared-memory soft_max_f32 kernel below.
+        if (std::is_same<Tdata, float>::value &&
+            ggml_cuda_info().devices[id].supports_cooperative_launch &&
             ncols_x / (params.ne01 * params.ne02 * params.ne03) > 8192 && mask == nullptr && sinks == nullptr &&
             params.scale == 1.0f && params.max_bias == 0.0f) {
             ggml_cuda_pool_alloc<float> tmp_maxs_alloc(ctx.pool(), ggml_cuda_info().devices[id].nsm * sizeof(float));
             ggml_cuda_pool_alloc<float> tmp_sums_alloc(ctx.pool(), ggml_cuda_info().devices[id].nsm * sizeof(float));
 
-            void * kernel_args[] = { (void *) &x, (void *) &dst, (void *) &tmp_maxs_alloc.ptr,
+            // x/dst are F32 here (guarded by is_same<Tdata,float> above); cast via void* keeps the half instantiation compiling.
+            const float * x_f32   = reinterpret_cast<const float *>(x);
+            float *       dst_f32 = reinterpret_cast<float *>(dst);
+            void * kernel_args[] = { (void *) &x_f32, (void *) &dst_f32, (void *) &tmp_maxs_alloc.ptr,
                                      (void *) &tmp_sums_alloc.ptr, (void *) const_cast<soft_max_params *>(&params) };
             CUDA_CHECK(cudaLaunchCooperativeKernel((void *) soft_max_f32_parallelize_cols,
                                                    dim3(ggml_cuda_info().devices[id].nsm, 1, 1),
                                                    dim3(WARP_SIZE * 8, 1, 1), kernel_args, 0, stream));
         } else {
             const size_t nbytes_shared_low = WARP_SIZE * sizeof(float);
-            soft_max_f32<false, 0, 0>
+            soft_max_f32<false, 0, 0, T, Tdata>
                 <<<block_nums, block_dims, nbytes_shared_low, stream>>>(x, mask, sinks, dst, params);
         }
     }
@@ -377,15 +396,18 @@ void ggml_cuda_op_soft_max(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * src2 = dst->src[2];
 
-    const float * src0_d = (const float *) src0->data;
+    const void  * src0_d = (const void *) src0->data;
     const void  * src1_d = src1 ? (const void *) src1->data : nullptr;
     const void  * src2_d = src2 ? (const void *) src2->data : nullptr;
-    float       *  dst_d = (float *) dst->data;
+    void        *  dst_d = (void *) dst->data;
 
     cudaStream_t stream = ctx.stream();
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+    // Additive F16 support: src0/dst may both be F16 (Swin runs F16 activations).
+    // Internal math stays FLOAT (numerically critical). F32->F32 is byte-identical.
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(src0->type == dst->type);
 
     GGML_ASSERT(!src1 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_F32); // src1 contains mask and it is optional
 
@@ -436,10 +458,23 @@ void ggml_cuda_op_soft_max(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     params.m0 = m0;
     params.m1 = m1;
 
-    if (use_f16) {
-        soft_max_f32_cuda(src0_d, (const half *) src1_d, (const float *) src2_d, dst_d, params, stream, ctx);
+    const bool data_f16 = (src0->type == GGML_TYPE_F16);
+
+    if (data_f16) {
+        // F16 activations always take the shared-memory soft_max_f32 kernel (the
+        // cooperative parallelize_cols sampling path is F32-only). Swin softmax rows
+        // are small, so this is never the large-ncols regime.
+        if (use_f16) {
+            soft_max_f32_cuda((const half *) src0_d, (const half *) src1_d, (const float *) src2_d, (half *) dst_d, params, stream, ctx);
+        } else {
+            soft_max_f32_cuda((const half *) src0_d, (const float *) src1_d, (const float *) src2_d, (half *) dst_d, params, stream, ctx);
+        }
     } else {
-        soft_max_f32_cuda(src0_d, (const float *) src1_d, (const float *) src2_d, dst_d, params, stream, ctx);
+        if (use_f16) {
+            soft_max_f32_cuda((const float *) src0_d, (const half *) src1_d, (const float *) src2_d, (float *) dst_d, params, stream, ctx);
+        } else {
+            soft_max_f32_cuda((const float *) src0_d, (const float *) src1_d, (const float *) src2_d, (float *) dst_d, params, stream, ctx);
+        }
     }
 }
 
