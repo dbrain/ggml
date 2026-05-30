@@ -4445,10 +4445,42 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     if (y_root && y_root->type == GGML_TYPE_F32 &&
                         ggml_is_contiguous(y_root) &&
                         ggml_nelements(y_root) == ggml_nelements(mul_n)) {
-                        ggml_cuda_op_mul_add_bcast(*cuda_ctx, mul_n, add_n,
-                                                   x_side, y_view, gate);
-                        // Skip all nodes from i+1 through add_n inclusive.
-                        return j - i;
+                        // flux2 AdaLN: modulate() emits `x + x*scale` (this gate_add,
+                        // gate=scale) immediately followed by a broadcast `+ shift`
+                        // with shift sharing gate's [d0,1,d2,Nb] layout. If add_n is
+                        // consumed only by that trailing ADD, fold the shift into the
+                        // same kernel (dst = x + x*scale + shift) — kills one bcast
+                        // kernel + its intermediate buffer per modulate, bit-exact.
+                        ggml_tensor * shift     = nullptr;
+                        ggml_tensor * final_add = add_n;
+                        int k = j + 1;
+                        while (k < cgraph->n_nodes && is_view_like(cgraph->nodes[k]->op)) {
+                            ++k;
+                        }
+                        if (k < cgraph->n_nodes && cgraph->nodes[k]->op == GGML_OP_ADD &&
+                            ggml_node_get_use_count(cgraph, j) == 1) {
+                            ggml_tensor * sadd   = cgraph->nodes[k];
+                            ggml_tensor * sshift = nullptr;
+                            if (trace_back(sadd->src[0]) == add_n) {
+                                sshift = sadd->src[1];
+                            } else if (trace_back(sadd->src[1]) == add_n) {
+                                sshift = sadd->src[0];
+                            }
+                            if (sshift && sadd->type == GGML_TYPE_F32 &&
+                                sshift->type == GGML_TYPE_F32 &&
+                                ggml_is_contiguous(sadd) &&
+                                ggml_is_contiguous(sshift) &&
+                                sshift->ne[0] == gate->ne[0] && sshift->ne[1] == 1 &&
+                                sshift->ne[2] == gate->ne[2] && sshift->ne[3] == gate->ne[3] &&
+                                ggml_nelements(sadd) == ggml_nelements(add_n)) {
+                                shift     = sshift;
+                                final_add = sadd;
+                            }
+                        }
+                        ggml_cuda_op_mul_add_bcast(*cuda_ctx, mul_n, final_add,
+                                                   x_side, y_view, gate, shift);
+                        // Skip i+1 .. final_add inclusive (k if shift folded, else j).
+                        return (shift ? k : j) - i;
                     }
                 }
             }

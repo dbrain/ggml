@@ -14,6 +14,13 @@ using namespace ggml_cuda_mma;
 #define MMQ_ITER_K_FP4         512
 #define MMQ_NWARPS               8
 
+// flux2 occupancy experiment: min blocks/SM hint for mul_mat_q __launch_bounds__.
+// Default 1 = upstream (lets the compiler use up to 256 regs/thread -> 221 -> 1 block/SM).
+// Set to 2 (with GGML_MMQ_X_CAP=64 so smem fits) to force 2 blocks/SM (caps regs at 128, spills).
+#ifndef MMQ_EXPERIMENT_MIN_BLOCKS
+#define MMQ_EXPERIMENT_MIN_BLOCKS 1
+#endif
+
 typedef void (*load_tiles_mmq_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
 typedef void (*vec_dot_mmq_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
 typedef void (*mmq_write_back_t)(const float * __restrict__ sum, const int32_t * __restrict__ get_rows_to_sorted,
@@ -140,6 +147,9 @@ static constexpr __device__ int get_mmq_x_max_device() {
 }
 
 static int get_mmq_y_host(const int cc) {
+#ifdef MMQ_Y_OVERRIDE
+    return MMQ_Y_OVERRIDE;
+#endif
     return GGML_CUDA_CC_IS_AMD(cc) ? (GGML_CUDA_CC_IS_RDNA1(cc) ? 64 : 128) :
         ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ? 128 : 64);
 }
@@ -154,6 +164,9 @@ if (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_MXFP4) {
 }
 
 static constexpr __device__ int get_mmq_y_device() {
+#ifdef MMQ_Y_OVERRIDE
+    return MMQ_Y_OVERRIDE;
+#else
 #if defined(GGML_USE_HIP)
 #if defined(RDNA1)
     return 64;
@@ -167,6 +180,7 @@ static constexpr __device__ int get_mmq_y_device() {
     return 64;
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
 #endif // defined(GGML_USE_HIP)
+#endif // MMQ_Y_OVERRIDE
 }
 
 // Decouple shared memory tile sizes from WARP_SIZE to allow for different warp sizes.
@@ -3534,7 +3548,7 @@ template <ggml_type type, int mmq_x, bool need_check>
 #endif // defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
 #else
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
-    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 1)
+    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), MMQ_EXPERIMENT_MIN_BLOCKS)
 #else
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
@@ -4060,8 +4074,17 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
     const int nwarps    = mmq_get_nwarps_host(cc, warp_size);
 
-    const int mmq_x_max = get_mmq_x_max_host(cc);
+    int mmq_x_max = get_mmq_x_max_host(cc);
     const int mmq_y = get_mmq_y_host(cc);
+
+    // flux2 occupancy experiment: the default selector greedily maximizes mmq_x
+    // (fewest tiles), which on sm_86 lands on 128 -> 221 regs + 58KB smem -> 1
+    // block/SM -> 16.67% occupancy (latency-bound). Cap mmq_x via env to trade
+    // tile size for occupancy. 0/unset = upstream behaviour.
+    static const int mmq_x_cap = []{ const char* e = getenv("GGML_MMQ_X_CAP"); return e ? atoi(e) : 0; }();
+    if (mmq_x_cap > 0 && mmq_x_cap < mmq_x_max) {
+        mmq_x_max = mmq_x_cap;
+    }
 
     int mmq_x_best  = 0;
     int ntiles_x_best = INT_MAX;

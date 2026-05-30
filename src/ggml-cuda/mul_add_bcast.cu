@@ -13,10 +13,12 @@
 // M=n_token/T, T=frames, Nb=batch), gate shape [d0, 1, T, Nb]. Detection in
 // ggml-cuda.cu ensures we only fire here.
 
+template <bool HAS_SHIFT>
 __global__ void __launch_bounds__(256) mul_add_bcast_dim1_f32_kernel(
     const float * __restrict__ x,
     const float * __restrict__ y,
     const float * __restrict__ gate,
+    const float * __restrict__ shift, // [d0,1,d2,Nb] bcast (same layout as gate); read only if HAS_SHIFT
     float       * __restrict__ dst,
     const int64_t n_elem,
     const int64_t d0,        // innermost dim (== ne00 of MUL)
@@ -54,7 +56,14 @@ __global__ void __launch_bounds__(256) mul_add_bcast_dim1_f32_kernel(
     // __fmul_rn + __fadd_rn → two independent IEEE-roundings, matching the
     // unfused MUL+ADD chain exactly. -use_fast_math compiles `x + y*g` to FMA
     // (one rounding) which would drift by ULP and fail PSNR 99.
-    dst[t] = __fadd_rn(xv, __fmul_rn(yv, gv));
+    float r = __fadd_rn(xv, __fmul_rn(yv, gv));
+    if (HAS_SHIFT) {
+        // flux AdaLN: fold the trailing broadcast `+ shift` (same [d0,1,d2,Nb]
+        // layout as gate). The extra __fadd_rn matches the standalone bcast-ADD
+        // it replaces (single rounding) → bit-exact vs the unfused 3-op chain.
+        r = __fadd_rn(r, shift[g_idx]);
+    }
+    dst[t] = r;
 }
 
 void ggml_cuda_op_mul_add_bcast(ggml_backend_cuda_context & ctx,
@@ -62,7 +71,8 @@ void ggml_cuda_op_mul_add_bcast(ggml_backend_cuda_context & ctx,
                                 ggml_tensor *               add_n,
                                 const ggml_tensor *         x,
                                 const ggml_tensor *         y_view,
-                                const ggml_tensor *         gate) {
+                                const ggml_tensor *         gate,
+                                const ggml_tensor *         shift) {
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(y_view->type == GGML_TYPE_F32);
     GGML_ASSERT(gate->type == GGML_TYPE_F32);
@@ -70,6 +80,10 @@ void ggml_cuda_op_mul_add_bcast(ggml_backend_cuda_context & ctx,
     GGML_ASSERT(ggml_is_contiguous(x));
     GGML_ASSERT(ggml_is_contiguous(gate));
     GGML_ASSERT(ggml_is_contiguous(add_n));
+    if (shift) {
+        GGML_ASSERT(shift->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(shift));
+    }
 
     // 4D shape from the MUL node ([d0, d1, d2, Nb]). gate is [d0, 1, d2, Nb].
     const int64_t d0 = mul_n->ne[0];
@@ -82,6 +96,13 @@ void ggml_cuda_op_mul_add_bcast(ggml_backend_cuda_context & ctx,
     GGML_ASSERT(gate->ne[1] == 1);
     GGML_ASSERT(gate->ne[2] == d2);
     GGML_ASSERT(gate->ne[3] == Nb);
+
+    if (shift) {
+        GGML_ASSERT(shift->ne[0] == d0);
+        GGML_ASSERT(shift->ne[1] == 1);
+        GGML_ASSERT(shift->ne[2] == d2);
+        GGML_ASSERT(shift->ne[3] == Nb);
+    }
 
     // x and ADD's output share total element count with the MUL.
     GGML_ASSERT(ggml_nelements(add_n) == n_elem);
@@ -98,17 +119,20 @@ void ggml_cuda_op_mul_add_bcast(ggml_backend_cuda_context & ctx,
     GGML_ASSERT(ggml_is_contiguous(y_buf));
     GGML_ASSERT(ggml_nelements(y_buf) == n_elem);
 
-    const float * x_d    = (const float *) x->data;
-    const float * y_d    = (const float *) y_buf->data;
-    const float * gate_d = (const float *) gate->data;
-    float       * dst_d  = (float *)       add_n->data;
+    const float * x_d     = (const float *) x->data;
+    const float * y_d     = (const float *) y_buf->data;
+    const float * gate_d  = (const float *) gate->data;
+    const float * shift_d = shift ? (const float *) shift->data : nullptr;
+    float       * dst_d   = (float *)       add_n->data;
 
     const int     block_size = 256;
     const int64_t num_blocks = (n_elem + block_size - 1) / block_size;
     GGML_ASSERT(num_blocks <= (1LL << 31) - 1);
 
-    mul_add_bcast_dim1_f32_kernel<<<(int)num_blocks, block_size, 0, ctx.stream()>>>(
-        x_d, y_d, gate_d, dst_d,
+    auto kern = shift_d ? mul_add_bcast_dim1_f32_kernel<true>
+                        : mul_add_bcast_dim1_f32_kernel<false>;
+    kern<<<(int)num_blocks, block_size, 0, ctx.stream()>>>(
+        x_d, y_d, gate_d, shift_d, dst_d,
         n_elem, d0, d1, d2,
         /*row_stride=*/ d0,
         /*plane_d1  =*/ d0 * d1,
