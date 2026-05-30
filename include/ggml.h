@@ -1431,6 +1431,17 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    // same as ggml_mul_mat, but lets the caller pick the destination (output) type.
+    // only GGML_TYPE_F32 (default, byte-identical to ggml_mul_mat) and GGML_TYPE_F16
+    // are supported; an F16 dst is honoured only on backends that advertise it
+    // (CUDA: F32-accumulation cuBLAS GEMM that stores F16, no F16 accumulation).
+    // lets an encoder keep activations in F16 across matmuls without an F32->F16 cast.
+    GGML_API struct ggml_tensor * ggml_mul_mat_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            enum   ggml_type      dst_type);
+
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
     GGML_API void ggml_mul_mat_set_prec(
