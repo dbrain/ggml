@@ -15,3 +15,14 @@ void ggml_cuda_op_mul_add_bcast(ggml_backend_cuda_context & ctx,
                                 const ggml_tensor *         y_view,  // MUL's main src in y-shape (4D view)
                                 const ggml_tensor *         gate,    // MUL's broadcast src
                                 const ggml_tensor *         shift = nullptr); // flux AdaLN: optional trailing +shift (same bcast layout as gate)
+
+// Same-shape (no-broadcast) fused multiply-add: dst = x + y*g (+ shift). All
+// operands contiguous F32 of identical element count. Covers NAVA's per-token
+// AdaLN modulation (x + x*scale + shift, batch N=1) which the broadcast path
+// above cannot match. Bit-exact (__fmul_rn + __fadd_rn).
+void ggml_cuda_op_fused_madd_same(ggml_backend_cuda_context & ctx,
+                                  ggml_tensor *               add_n,
+                                  const ggml_tensor *         x,
+                                  const ggml_tensor *         y,
+                                  const ggml_tensor *         g,
+                                  const ggml_tensor *         shift = nullptr);

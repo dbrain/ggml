@@ -4683,6 +4683,79 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // NAVA per-token AdaLN: same-shape (no-broadcast) MUL+ADD(+ADD) fusion.
+    // dst = x + y*g (+ shift), all contiguous F32 of equal element count. The
+    // broadcast detector above can't match it (gate is full [d0,L,1], batch
+    // N=1) so x + x*scale + shift ran as 3 full-size kernels — ~17% of the DiT.
+    // Bit-exact (__fmul_rn + __fadd_rn). General + safe: fuses any
+    // ADD(x, MUL(a,b)) chain with single-use intermediates. Env-disable:
+    // GGML_CUDA_NO_MADD_FUSE=1.
+    static const bool madd_fuse_disabled = (getenv("GGML_CUDA_NO_MADD_FUSE") != nullptr);
+    if (!madd_fuse_disabled && node->op == GGML_OP_MUL && node->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(node) && ggml_node_get_use_count(cgraph, i) == 1) {
+        auto is_view_like = [](ggml_op op) {
+            return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
+                   op == GGML_OP_TRANSPOSE || op == GGML_OP_PERMUTE;
+        };
+        auto trace_back = [&](ggml_tensor * t) {
+            while (t && is_view_like(t->op)) {
+                t = t->src[0];
+            }
+            return t;
+        };
+        ggml_tensor * mul_n = node;
+        ggml_tensor * a     = mul_n->src[0];
+        ggml_tensor * b     = mul_n->src[1];
+        const int64_t n_elem = ggml_nelements(mul_n);
+        // Both MUL operands must be same-count contiguous F32 (no broadcast).
+        if (a && b && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+            ggml_nelements(a) == n_elem && ggml_nelements(b) == n_elem &&
+            ggml_is_contiguous(a) && ggml_is_contiguous(b)) {
+            int j = i + 1;
+            while (j < cgraph->n_nodes && is_view_like(cgraph->nodes[j]->op)) {
+                ++j;
+            }
+            if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_ADD) {
+                ggml_tensor * add_n  = cgraph->nodes[j];
+                ggml_tensor * x_side = nullptr;
+                if (trace_back(add_n->src[0]) == mul_n) {
+                    x_side = add_n->src[1];
+                } else if (trace_back(add_n->src[1]) == mul_n) {
+                    x_side = add_n->src[0];
+                }
+                if (x_side && add_n->type == GGML_TYPE_F32 && x_side->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(add_n) && ggml_is_contiguous(x_side) &&
+                    ggml_nelements(add_n) == n_elem && ggml_nelements(x_side) == n_elem) {
+                    // Optional trailing same-shape ADD(_, shift): fold x + y*g + shift.
+                    ggml_tensor * shift     = nullptr;
+                    ggml_tensor * final_add = add_n;
+                    int k = j + 1;
+                    while (k < cgraph->n_nodes && is_view_like(cgraph->nodes[k]->op)) {
+                        ++k;
+                    }
+                    if (k < cgraph->n_nodes && cgraph->nodes[k]->op == GGML_OP_ADD &&
+                        ggml_node_get_use_count(cgraph, j) == 1) {
+                        ggml_tensor * sadd   = cgraph->nodes[k];
+                        ggml_tensor * sshift = nullptr;
+                        if (trace_back(sadd->src[0]) == add_n) {
+                            sshift = sadd->src[1];
+                        } else if (trace_back(sadd->src[1]) == add_n) {
+                            sshift = sadd->src[0];
+                        }
+                        if (sshift && sadd->type == GGML_TYPE_F32 && sshift->type == GGML_TYPE_F32 &&
+                            ggml_is_contiguous(sadd) && ggml_is_contiguous(sshift) &&
+                            ggml_nelements(sadd) == n_elem && ggml_nelements(sshift) == n_elem) {
+                            shift     = sshift;
+                            final_add = sadd;
+                        }
+                    }
+                    ggml_cuda_op_fused_madd_same(*cuda_ctx, final_add, x_side, a, b, shift);
+                    return (shift ? k : j) - i;
+                }
+            }
+        }
+    }
+
     // LongCat lap-28.5: fused SCALE -> CPY(F32->F16). Used by the avatar's flash-attn
     // wrapper for the kv_scale prescale path (and the lap-28.2 cond-cache consume
     // prescale): the existing chain runs SCALE (read F32 / write F32) then CPY (read
