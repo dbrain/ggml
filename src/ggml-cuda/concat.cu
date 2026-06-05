@@ -49,6 +49,53 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_T_cont(c
     }
 }
 
+// Single-launch contiguous concat over the FULL 4D extent. Folds the outer ne3
+// loop into the kernel so one ggml CONCAT op == one kernel launch (was ne3 launches
+// — pathological for high-channel-count VAE/conv graphs: a 1024-channel concat used
+// to fire 1024 tiny kernels). Bit-identical to the per-slice path; only the launch
+// count changes. The non-concat dims of src0/src1 match dst, so each i3 slice is a
+// fixed src0_slice / src1_slice element block.
+template <typename T, int dim>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_T_cont_4d(const T * x,
+                                                                                   const T * y,
+                                                                                   T *       dst,
+                                                                                   int64_t   ne00,
+                                                                                   int64_t   ne01,
+                                                                                   int64_t   ne02,
+                                                                                   int64_t   ne0,
+                                                                                   int64_t   ne1,
+                                                                                   int64_t   ne2,
+                                                                                   int64_t   ne3) {
+    static_assert(dim >= 0 && dim <= 2, "dim must be in [0, 2]");
+
+    const int64_t src0_slice = ne00 * ne01 * ne02;  // src0 elems per i3 (non-dim dims == dst)
+    const int64_t dst_slice  = ne0 * ne1 * ne2;
+    const int64_t src1_slice = dst_slice - src0_slice;
+    const int64_t n          = dst_slice * ne3;
+
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) blockDim.x * gridDim.x) {
+        const int64_t i3 = i / dst_slice;
+        const int64_t j  = i - i3 * dst_slice;
+        const T *     xb = x + i3 * src0_slice;
+        const T *     yb = y + i3 * src1_slice;
+
+        if constexpr (dim == 0) {
+            const int64_t row = j / ne0;
+            const int64_t i0  = j - row * ne0;
+            dst[i] = (i0 < ne00) ? xb[row * ne00 + i0] : yb[row * (ne0 - ne00) + (i0 - ne00)];
+        } else if constexpr (dim == 1) {
+            const int64_t dst_plane  = ne0 * ne1;
+            const int64_t src0_plane = ne0 * ne01;
+            const int64_t src1_plane = dst_plane - src0_plane;
+            const int64_t i2         = j / dst_plane;
+            const int64_t i01        = j - i2 * dst_plane;
+            dst[i] = (i01 < src0_plane) ? xb[i2 * src0_plane + i01] : yb[i2 * src1_plane + (i01 - src0_plane)];
+        } else {
+            dst[i] = (j < src0_slice) ? xb[j] : yb[j - src0_slice];
+        }
+    }
+}
+
 template <typename T>
 static void concat_T_cuda(const T *    x,
                           const T *    y,
@@ -59,22 +106,25 @@ static void concat_T_cuda(const T *    x,
                           int64_t      ne0,
                           int64_t      ne1,
                           int64_t      ne2,
+                          int64_t      ne3,
                           int          dim,
                           cudaStream_t stream) {
-    const int64_t n          = ne0 * ne1 * ne2;
-    const int     num_blocks = (n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
+    const int64_t n          = ne0 * ne1 * ne2 * ne3;
+    const int64_t blk        = (n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
+    const int     num_blocks = (int) std::min<int64_t>(blk, 65535);
 
     if (dim == 0) {
-        concat_T_cont<T, 0>
-            <<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
+        concat_T_cont_4d<T, 0>
+            <<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2, ne3);
         return;
     }
     if (dim == 1) {
-        concat_T_cont<T, 1>
-            <<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
+        concat_T_cont_4d<T, 1>
+            <<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2, ne3);
         return;
     }
-    concat_T_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
+    concat_T_cont_4d<T, 2>
+        <<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2, ne3);
 }
 
 // non-contiguous kernel (slow) — value-copy only, dtype is just a width.
@@ -152,14 +202,11 @@ static void concat_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         T * dst_d = (T *)dst->data;
 
         if (dim != 3) {
-            for (int i3 = 0; i3 < dst->ne[3]; i3++) {
-                concat_T_cuda<T>(
-                        src0_d + i3 * (src0->nb[3] / sizeof(T)),
-                        src1_d + i3 * (src1->nb[3] / sizeof(T)),
-                        dst_d  + i3 * (dst ->nb[3] / sizeof(T)),
-                        src0->ne[0], src0->ne[1], src0->ne[2],
-                        dst->ne[0],  dst->ne[1],  dst->ne[2], dim, stream);
-            }
+            // single launch over the full 4D extent (folds the ne3 loop into the kernel)
+            concat_T_cuda<T>(
+                    src0_d, src1_d, dst_d,
+                    src0->ne[0], src0->ne[1], src0->ne[2],
+                    dst->ne[0],  dst->ne[1],  dst->ne[2], dst->ne[3], dim, stream);
         } else {
             const size_t size0 = ggml_nbytes(src0);
             const size_t size1 = ggml_nbytes(src1);
