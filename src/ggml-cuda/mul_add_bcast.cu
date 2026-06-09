@@ -109,16 +109,17 @@ void ggml_cuda_op_fused_madd_same(ggml_backend_cuda_context & ctx,
         GGML_ASSERT(ggml_nelements(shift) == n_elem);
     }
 
-    auto resolve = [](const ggml_tensor * t) {
-        while (t->view_src != nullptr) {
-            t = t->view_src;
-        }
-        return t;
-    };
-    const float * x_d     = (const float *) resolve(x)->data;
-    const float * y_d     = (const float *) resolve(y)->data;
-    const float * g_d     = (const float *) resolve(g)->data;
-    const float * shift_d = shift ? (const float *) resolve(shift)->data : nullptr;
+    // Use each tensor's own ->data, which already includes any view offset
+    // (ggml-backend sets a view's data = view_src->data + view_offs at alloc).
+    // The previous code resolved to view_src->data, which DROPPED the offset and
+    // read from element 0 of the base buffer — fine when operands are full tensors
+    // (NAVA avatar AdaLN, offset 0) but corrupt when they are offset views into a
+    // larger tensor (LTX-2.3 ltxav modulation slices scale/shift) → fuzzy mush.
+    // dst already used add_n->data directly; match that for the inputs.
+    const float * x_d     = (const float *) x->data;
+    const float * y_d     = (const float *) y->data;
+    const float * g_d     = (const float *) g->data;
+    const float * shift_d = shift ? (const float *) shift->data : nullptr;
     float       * dst_d   = (float *) add_n->data;
 
     const int     block_size = 256;
