@@ -195,12 +195,12 @@ static  __global__ void im2col_3d_kernel(
 // per-warp write transaction 64B→128B, the lever past the ~155 GB/s scalar-store
 // plateau. Falls back (host returns false) on any shape it can't cover.
 // Bit-exact vs the fastdiv kernel (pure data movement, no arithmetic on values).
-template <typename T, int VEC>
+template <typename T, int VEC, bool HAS_PAD>
 static __global__ void im2col_3d_tiled_kernel(
         const float * __restrict__ src, T * __restrict__ dst,
         int IC, int ID, int IH, int IW,
         int KD, int KH, int KW, int OD, int OH, int OW,
-        int CB, int TOH, int TOW,
+        int CB, int TOH, int TOW, int p0, int p1,
         int KH_KW, int KD_KH_KW,
         int64_t IC_KD_KH_KW, int64_t OW_IC_KD_KH_KW, int64_t OH_OW_IC_KD_KH_KW, int64_t OD_OH_OW_IC_KD_KH_KW,
         int num_cblocks, int n_oh_tiles, int n_ow_tiles,
@@ -235,10 +235,24 @@ static __global__ void im2col_3d_tiled_kernel(
         const int sr  = t % SH;  t /= SH;
         const int iid = t % ID;  t /= ID;
         const int icl = t;                       // < CBeff
-        const int iih = oh0 + sr;
-        const int iiw = ow0 + sc;
+        // pad=0 (Wan VAE pre-padded): the staged window starts at the output tile
+        // origin and only the top/right halo can run off the input (zeroed). With
+        // spatial padding (LTX VAE, p0/p1>0) the window starts p1/p0 before the
+        // origin, so the bottom/left halo can also be out of bounds. HAS_PAD keeps
+        // the pad=0 hot path byte-identical (the lower-bound checks compile out).
+        int iih, iiw;
+        bool in_bounds;
+        if constexpr (HAS_PAD) {
+            iih = oh0 + sr - p1;
+            iiw = ow0 + sc - p0;
+            in_bounds = (iih >= 0 && iih < IH && iiw >= 0 && iiw < IW);
+        } else {
+            iih = oh0 + sr;
+            iiw = ow0 + sc;
+            in_bounds = (iih < IH && iiw < IW);
+        }
         float v = 0.0f;
-        if (iih < IH && iiw < IW) {
+        if (in_bounds) {
             v = src[src_chan_base + (int64_t)icl * ID * IH * IW + (int64_t)iid * IH * IW + (int64_t)iih * IW + iiw];
         }
         smem[(int64_t)icl * DHW + ((int64_t)iid * SH + sr) * SW + sc] = v;
@@ -306,11 +320,21 @@ static bool im2col_3d_tiled_try(const float * src, T * dst,
     int64_t N, int64_t IC, int64_t ID, int64_t IH, int64_t IW,
     int64_t KD, int64_t KH, int64_t KW, int64_t OD, int64_t OH, int64_t OW,
     int s0, int s1, int s2, int p0, int p1, int p2, int d0, int d1, int d2, cudaStream_t stream) {
-    // Fast path only: unit stride/dilation, zero pad (input pre-padded by the
-    // CausalConv3d). Then OD=ID-KD+1 etc. ⇒ every tap in-bounds (no clamps).
-    if (!(s0 == 1 && s1 == 1 && s2 == 1 && d0 == 1 && d1 == 1 && d2 == 1 &&
-          p0 == 0 && p1 == 0 && p2 == 0)) {
+    // Fast path: unit stride/dilation, zero DEPTH pad (the temporal/causal pad is
+    // applied externally so OD=ID-KD+1). SPATIAL padding p0/p1 is handled in-kernel
+    // (HAS_PAD): the Wan VAE pre-pads ⇒ p0=p1=0 (byte-identical hot path), the LTX
+    // VAE passes p0=p1=1 ⇒ OH=IH, OW=IW. lap-D: cover that case instead of dumping
+    // every LTX conv (37 s / VAE) onto the ALU-bound fastdiv gather.
+    if (!(s0 == 1 && s1 == 1 && s2 == 1 && d0 == 1 && d1 == 1 && d2 == 1 && p2 == 0)) {
         return false;
+    }
+    const bool has_pad = (p0 != 0 || p1 != 0);
+    // The spatial-pad extension is on by default; opt out (e.g. for an A/B against
+    // the fastdiv fallback) with LONGCAT_IM2COL_TILE_PAD=0. pad=0 callers are never
+    // affected by this gate.
+    if (has_pad) {
+        const char* g = getenv("LONGCAT_IM2COL_TILE_PAD");
+        if (g != nullptr && g[0] == '0') return false;
     }
     if (getenv("LONGCAT_IM2COL_NOTILE")) {
         return false;
@@ -332,6 +356,22 @@ static bool im2col_3d_tiled_try(const float * src, T * dst,
     const int tpx = cols / VEC;                  // blockDim.x
     if (tpx > 1024 || (int64_t) tpx * P > 1024) {
         return false;
+    }
+    // smem stages the full input depth (ID) for a CB-channel x SHxSW spatial window.
+    // The LTX VAE has large ID (e.g. 34) which busts the 48 KB opt-out-free limit at
+    // the default 8x8 spatial tile; shrink the spatial tile (square-ish) until it
+    // fits rather than dumping the conv on the slow fallback. CB/KD_KH_KW are fixed
+    // (they set tpx/VEC), so shrinking TOH/TOW only trims smem + the P output loop.
+    auto smem_for = [&](int toh, int tow) {
+        const int sh = toh + (int) KH - 1, sw = tow + (int) KW - 1;
+        return (size_t) CB * ID * sh * sw * sizeof(float);
+    };
+    // Scoped to the new spatial-pad path so the pad=0 hot path (Wan VAE / avatar)
+    // keeps its exact prior tile + bail behavior.
+    if (has_pad) {
+        while ((TOH > 1 || TOW > 1) && smem_for(TOH, TOW) > 48 * 1024) {
+            if (TOW >= TOH && TOW > 1) TOW--; else if (TOH > 1) TOH--; else break;
+        }
     }
     const int SH = TOH + (int) KH - 1;
     const int SW = TOW + (int) KW - 1;
@@ -363,15 +403,19 @@ static bool im2col_3d_tiled_try(const float * src, T * dst,
 
     dim3 grid(n_ow_tiles, n_oh_tiles, (unsigned) gz);
     dim3 block(tpx, P, 1);
-#define LC_TILED_LAUNCH(VECN) \
-    im2col_3d_tiled_kernel<T, VECN><<<grid, block, smem_bytes, stream>>>( \
+#define LC_TILED_LAUNCH(VECN, HASPAD) \
+    im2col_3d_tiled_kernel<T, VECN, HASPAD><<<grid, block, smem_bytes, stream>>>( \
         src, dst, (int)IC, (int)ID, (int)IH, (int)IW, \
         (int)KD, (int)KH, (int)KW, (int)OD, (int)OH, (int)OW, \
-        CB, TOH, TOW, (int)(KH * KW), KD_KH_KW, \
+        CB, TOH, TOW, p0, p1, (int)(KH * KW), KD_KH_KW, \
         IC_KD_KH_KW, OW_IC_KD_KH_KW, OH_OW_IC_KD_KH_KW, OD_OH_OW_IC_KD_KH_KW, \
         num_cblocks, n_oh_tiles, n_ow_tiles, \
         fd_kdkhkw, fd_khkw, fd_kw, fd_tow, fd_towtoh, fd_ncblocks, fd_nohtiles)
-    if (VEC == 2) { LC_TILED_LAUNCH(2); } else { LC_TILED_LAUNCH(1); }
+    if (has_pad) {
+        if (VEC == 2) { LC_TILED_LAUNCH(2, true); } else { LC_TILED_LAUNCH(1, true); }
+    } else {
+        if (VEC == 2) { LC_TILED_LAUNCH(2, false); } else { LC_TILED_LAUNCH(1, false); }
+    }
 #undef LC_TILED_LAUNCH
     return true;
 }
