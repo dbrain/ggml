@@ -4532,10 +4532,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                             node->type == act_type &&
                             mul_n->type == act_type && norm_chain_src->type == act_type &&
                             add_n->type == act_type;
-                        if (uc_norm == 1 && uc_mul == 1 && types_ok) {
+                        // The fused kernel normalizes over mul_n->ne[0] (norm.cu uses
+                        // mul_tensor's shape, assuming the NORM→MUL reshape preserves
+                        // the normalized dim — true for the avatar's modulate, which
+                        // only splits an OUTER dim). htdemucs GroupNorm(1,C) reshapes
+                        // [L*C,1,B]→NORM(over L*C)→[L,C,B] before the per-channel MUL,
+                        // so NORM.ne0=L*C but MUL.ne0=L; fusing would normalize over L,
+                        // not L*C → garbage. Only fuse when ne0 is preserved.
+                        const bool norm_dim_kept = node->ne[0] == mul_n->ne[0];
+                        if (uc_norm == 1 && uc_mul == 1 && types_ok && norm_dim_kept) {
                             ggml_cuda_op_norm_fused_add(*cuda_ctx, node, mul_n, add_n);
                             // skip ALL nodes between i+1 and add_idx inclusive
                             return add_idx - i;
+                        }
+                        if (lc_dbg_norm_fuse && !norm_dim_kept) {
+                            GGML_LOG_INFO("[NORM-FUSE-DBG]   reject: NORM.ne0=%lld != MUL.ne0=%lld (reshape changed the normalized dim)\n",
+                                          (long long) node->ne[0], (long long) mul_n->ne[0]);
                         }
                         if (lc_dbg_norm_fuse) {
                             GGML_LOG_INFO("[NORM-FUSE-DBG]   reject: use_count NORM=%d MUL=%d (need both ==1)\n", uc_norm, uc_mul);
@@ -4561,8 +4573,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 (mul2->src[1] == node) ? mul2->src[0] : nullptr;
             const bool types_ok = node->type == act_type && mul2->type == act_type &&
                                   mul2_op && mul2_op->type == act_type;
-            // pure consecutive — keep the original simple path
-            if (types_ok && ggml_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL })) {
+            // pure consecutive — keep the original simple path. Same ne0-preserved
+            // guard as the 3-op case (defensive; the no-reshape path preserves it).
+            if (types_ok && node->ne[0] == mul2->ne[0] &&
+                ggml_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL })) {
                 ggml_cuda_op_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
                 return 1;
             }
