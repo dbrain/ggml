@@ -1874,6 +1874,16 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * pe);
 
+    // Non-interleaved (GPT-NeoX) variant of ggml_rope_pe: the rotated pair is
+    // (x[a], x[a+d_head/2]) — the first/second half of head_dim — and the output
+    // is written non-interleaved (out[a], out[a+d_head/2]). Same pe layout as
+    // ggml_rope_pe. Used by the LTX video self-attn (video_pe, per-head folded to
+    // n_head=1, L = video_tokens*num_heads) to skip the cont+permute+repeat chain.
+    GGML_API struct ggml_tensor * ggml_rope_pe_ni(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * pe);
+
     // RoPE operations with extended options
     // a is the input tensor to apply RoPE to, shape [n_embd, n_head, n_token]
     // b is an int32 vector with size n_token

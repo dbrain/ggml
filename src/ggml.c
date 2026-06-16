@@ -4416,13 +4416,19 @@ struct ggml_tensor * ggml_rope_inplace(
     );
 }
 
-// ggml_rope_pe — longcat-avatar fused interleaved RoPE from precomputed pe (cos/sin).
+// ggml_rope_pe — longcat-avatar fused RoPE from precomputed pe (cos/sin).
 // a:  [d_head, n_head, L, N]   pe: [2, 2, d_head/2, L]
-// out:[d_head, L, n_head*N]    (matches Rope::apply_rope rope_interleaved=true)
-struct ggml_tensor * ggml_rope_pe(
+// out:[d_head, L, n_head*N]    (matches Rope::apply_rope)
+// `interleaved` selects the pair layout (and matching output layout):
+//   interleaved=1 (GPT-J): pair = (x[2j], x[2j+1])      — out dims (2j, 2j+1)
+//   interleaved=0 (NeoX) : pair = (x[a], x[a+d_head/2]) — out dims (a, a+d_head/2)
+// Both read the SAME pe layout (cos=pe[0,0,j,t], sin=pe[0,1,j,t]); only the
+// element/output offsets differ. op_params[0] carries the flag for the CUDA op.
+static struct ggml_tensor * ggml_rope_pe_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
-        struct ggml_tensor  * pe) {
+        struct ggml_tensor  * pe,
+        int                   interleaved) {
     GGML_ASSERT(a->type == GGML_TYPE_F32);
     GGML_ASSERT(pe->type == GGML_TYPE_F32);
     const int64_t d_head = a->ne[0];
@@ -4436,11 +4442,27 @@ struct ggml_tensor * ggml_rope_pe(
 
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_head, L, n_head * N);
 
+    ggml_set_op_params_i32(result, 0, interleaved ? 1 : 0);
+
     result->op     = GGML_OP_ROPE_PE;
     result->src[0] = a;
     result->src[1] = pe;
 
     return result;
+}
+
+struct ggml_tensor * ggml_rope_pe(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * pe) {
+    return ggml_rope_pe_impl(ctx, a, pe, 1);
+}
+
+struct ggml_tensor * ggml_rope_pe_ni(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * pe) {
+    return ggml_rope_pe_impl(ctx, a, pe, 0);
 }
 
 struct ggml_tensor * ggml_rope_ext(
