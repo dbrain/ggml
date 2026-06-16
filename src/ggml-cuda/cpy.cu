@@ -318,17 +318,35 @@ static void ggml_cpy_scalar_cuda(
             ne02n = 1;
         }
 
-        int64_t grid_x = (ne01n + CUDA_CPY_TILE_DIM_2D - 1) / CUDA_CPY_TILE_DIM_2D;
-        int64_t grid_y = (ne00n + CUDA_CPY_TILE_DIM_2D - 1) / CUDA_CPY_TILE_DIM_2D;
-        int64_t grid_z = (ne/(ne01n*ne00n) + CUDA_CPY_BLOCK_NM - 1) / CUDA_CPY_BLOCK_NM;
+        const int64_t grid_x  = (ne01n + CUDA_CPY_TILE_DIM_2D - 1) / CUDA_CPY_TILE_DIM_2D;
+        const int64_t grid_y  = (ne00n + CUDA_CPY_TILE_DIM_2D - 1) / CUDA_CPY_TILE_DIM_2D;
+        const int64_t plane_n = ne00n * ne01n;                 // contiguous elements per matrix plane
+        const int64_t nmat    = ne / plane_n;                  // number of planes
+        const int64_t z_total = (nmat + CUDA_CPY_BLOCK_NM - 1) / CUDA_CPY_BLOCK_NM;
         GGML_ASSERT(grid_x < UINT_MAX);
         GGML_ASSERT(grid_y < USHRT_MAX);
-        GGML_ASSERT(grid_z < USHRT_MAX);
-        dim3 dimGrid(grid_x, grid_y, grid_z);
-        dim3 dimBlock(CUDA_CPY_TILE_DIM_2D, CUDA_CPY_BLOCK_ROWS, 1);
-        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dimGrid, dimBlock, 0, stream);
-        ggml_cuda_kernel_launch(cpy_scalar_transpose<dst_t>, launch_params,
-            cx, cdst, ne, ne00n, ne01n, ne02n, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+        // CUDA caps gridDim.z at 65535. For long video the plane count (∝ frames) blows
+        // past it (e.g. the LTX video_pe permute->cont), which used to fire the grid_z
+        // assert and crash — that was the real native-res frame ceiling, NOT VRAM. The
+        // planes are contiguous (stride plane_n) in both src and dst on this transposed
+        // path (the nb strides are unused by the kernel), so launch in z-chunks and
+        // offset the base pointers. Bit-identical to before when z_total <= 65535 (one
+        // launch covering all planes); only long clips take the multi-launch path.
+        const dim3 dimBlock(CUDA_CPY_TILE_DIM_2D, CUDA_CPY_BLOCK_ROWS, 1);
+        const int64_t Z_CHUNK = 65535;
+        for (int64_t z0 = 0; z0 < z_total; z0 += Z_CHUNK) {
+            const int64_t z_blocks    = (z_total - z0 < Z_CHUNK) ? (z_total - z0) : Z_CHUNK;
+            const int64_t plane_start = z0 * CUDA_CPY_BLOCK_NM;
+            const int64_t cap         = z_blocks * CUDA_CPY_BLOCK_NM;
+            const int64_t planes_here = (nmat - plane_start < cap) ? (nmat - plane_start) : cap;
+            const int64_t ne_chunk    = planes_here * plane_n;
+            const char*   cx_chunk    = cx   + (size_t)plane_start * plane_n * sizeof(src_t);
+            char*         cdst_chunk  = cdst + (size_t)plane_start * plane_n * sizeof(dst_t);
+            const dim3 dimGrid(grid_x, grid_y, z_blocks);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dimGrid, dimBlock, 0, stream);
+            ggml_cuda_kernel_launch(cpy_scalar_transpose<dst_t>, launch_params,
+                cx_chunk, cdst_chunk, ne_chunk, ne00n, ne01n, ne02n, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+        }
     } else {
         const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
         GGML_ASSERT(num_blocks < UINT_MAX);
