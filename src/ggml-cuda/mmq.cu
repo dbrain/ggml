@@ -122,7 +122,22 @@ void ggml_cuda_mul_mat_q(
                             || GGML_CUDA_CC_IS_CDNA(cc);
 
     // TODO: tighter pool buffer size vs q8 path
+    // NOTE: on a Blackwell binary the NVFP4 device kernel ALWAYS expects FP4-quantized
+    // activations (tile layout is selected at compile time via BLACKWELL_MMA_AVAILABLE),
+    // so use_native_fp4 cannot be toggled off at runtime — the generic DP4A/q8_1 path is
+    // only reachable on non-Blackwell builds. The only runtime alternative is dequant->cuBLAS.
     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
+
+    // NVFP4_PATH_TRACE: one-shot empirical confirmation of which mul_mat path NVFP4 takes.
+    if ((src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP4) && getenv("GGML_NVFP4_TRACE")) {
+        static bool once_fp4 = false;
+        if (!once_fp4) {
+            once_fp4 = true;
+            fprintf(stderr, "[NVFP4_TRACE] type=%s cc=%d blackwell_mma_available=%d use_native_fp4=%d -> %s\n",
+                    ggml_type_name(src0->type), cc, (int) blackwell_mma_available(cc), (int) use_native_fp4,
+                    use_native_fp4 ? "BLACKWELL_FP4_MMA (fp4xfp4 tensor cores)" : "DP4A/q8_1 fallback");
+        }
+    }
 
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
@@ -301,6 +316,12 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     }
 
     if (!mmq_supported) {
+        return false;
+    }
+
+    // Perf-A/B knob: GGML_NVFP4_NO_MMQ=1 forces NVFP4/MXFP4 off MMQ entirely so it
+    // dequantizes to F32 and runs cuBLAS (FP4 tensor cores idle) — the "old NVFP4" baseline.
+    if ((type == GGML_TYPE_NVFP4 || type == GGML_TYPE_MXFP4) && getenv("GGML_NVFP4_NO_MMQ")) {
         return false;
     }
 
