@@ -299,6 +299,16 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
         if (n_handled++ == 0 || getenv("GGML_NVFP4_CUBLASLT_TRACE"))
             fprintf(stderr, "[NVFP4_CUBLASLT] handled mul_mat #%d  M=%d K=%d N=%d (cuBLASLt FP4 GEMM)\n",
                     n_handled, M, K, N);
+        if (getenv("GGML_NVFP4_NANCHECK")) {
+            float h[8] = {0};
+            cudaMemcpyAsync(h, dst->data, sizeof(h), cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            int bad = 0; float mx = 0.f;
+            for (int i=0;i<8;i++){ if(!isfinite(h[i])) bad=1; mx=fmaxf(mx,fabsf(h[i])); }
+            if (bad || mx > 1e4f)
+                fprintf(stderr, "[NVFP4_NAN] M=%d K=%d N=%d  dst0=%g max8=%g %s\n",
+                        M, K, N, h[0], mx, bad?"NONFINITE":"BIG");
+        }
     }
 
     if (pref) cublasLtMatmulPreferenceDestroy(pref);
