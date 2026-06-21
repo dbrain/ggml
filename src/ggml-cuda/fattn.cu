@@ -11,6 +11,7 @@ __device__ int              g_longcat_fa_bsa_n_qtiles_dev = 0;
 #define LONGCAT_FA_BSA_BITMAP_DEFINING_TU
 
 #include "fattn-common.cuh"
+#include "fattn-cudnn.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
@@ -375,7 +376,15 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_VEC      = 100,
     BEST_FATTN_KERNEL_WMMA_F16 = 300,
     BEST_FATTN_KERNEL_MMA_F16  = 400,
+    BEST_FATTN_KERNEL_CUDNN    = 500,
 };
+
+// cuDNN fused SDPA opt-in: env GGML_CUDNN_ATTN=1 (read once).
+static bool ggml_cuda_cudnn_attn_env() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_CUDNN_ATTN"); v = (e && atoi(e)) ? 1 : 0; }
+    return v == 1;
+}
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
@@ -411,6 +420,21 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     const int cc = ggml_cuda_info().devices[device].cc;
+
+    // cuDNN fused SDPA (Blackwell): env-gated, only for the exact mask-free, no-bias,
+    // gqa_ratio==1, F16 K/V, D in {64,128} self-attention shape (flux2 DiT). When the
+    // env is unset or any condition fails, fall through to the existing logic untouched.
+    if (ggml_cuda_cudnn_attn_env() && ggml_cuda_cudnn_available() &&
+        ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL &&
+        mask == nullptr && max_bias == 0.0f) {
+        float logit_softcap = 0.0f;
+        memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+        if (logit_softcap == 0.0f && gqa_ratio == 1 &&
+            K->ne[0] == V->ne[0] && (K->ne[0] == 64 || K->ne[0] == 128) &&
+            K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
+            return BEST_FATTN_KERNEL_CUDNN;
+        }
+    }
 
     switch (K->ne[0]) {
         case  40:
@@ -615,6 +639,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_CUDNN:
+            ggml_cuda_flash_attn_ext_cudnn(ctx, dst);
             break;
     }
 }

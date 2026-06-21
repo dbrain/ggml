@@ -155,6 +155,21 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_NO_PEER_COPY)
     endif()
 
+    # cuDNN fused SDPA flash-attention variant (env GGML_CUDNN_ATTN=1). Optional dep:
+    # links libcudnn + nvrtc (frontend sm100 engines runtime-compile via nvrtc) and
+    # includes the cudnn-frontend headers. Only fattn-cudnn.cu uses these; when OFF the
+    # TU compiles as a no-op stub.
+    option(GGML_CUDNN "ggml: cuDNN fused SDPA flash-attention (Blackwell)" OFF)
+    if (GGML_CUDNN)
+        message(STATUS "GGML_CUDNN enabled: linking cudnn + nvrtc, cudnn-frontend headers")
+        add_compile_definitions(GGML_CUDNN)
+        if (NOT DEFINED GGML_CUDNN_FRONTEND_INCLUDE)
+            set(GGML_CUDNN_FRONTEND_INCLUDE "/opt/cudnn-frontend/include")
+        endif()
+        target_include_directories(ggml-cuda PRIVATE ${GGML_CUDNN_FRONTEND_INCLUDE})
+        target_link_libraries(ggml-cuda PRIVATE cudnn nvrtc)
+    endif()
+
     if (GGML_STATIC)
         if (WIN32)
             # As of 12.3.1 CUDA Toolkit for Windows does not offer a static cublas library
