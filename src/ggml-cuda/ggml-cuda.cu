@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
+#include "ggml-cuda/nvfp4-cublaslt.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -2220,6 +2221,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    // Phase-1 fast FP4 GEMM: NVFP4 weight matmul -> cuBLASLt blockscaled FP4 (Blackwell
+    // FP4 tensor cores, ~3.3x MMQ). Env-gated (GGML_NVFP4_CUBLASLT=1); falls back cleanly.
+    if (src0->type == GGML_TYPE_NVFP4 && ggml_cuda_nvfp4_cublaslt_enabled()
+            && blackwell_mma_available(ggml_cuda_info().devices[ctx.device].cc)
+            && ggml_cuda_nvfp4_cublaslt_mul_mat(ctx, src0, src1, dst)) {
+        return;
+    }
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.

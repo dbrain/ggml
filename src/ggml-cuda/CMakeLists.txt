@@ -199,7 +199,7 @@ if (CUDAToolkit_FOUND)
             endif()
         endif()
     else()
-        target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas)
+        target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt)
     endif()
 
     if (GGML_CUDA_NO_VMM)
