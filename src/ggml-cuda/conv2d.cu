@@ -1,4 +1,5 @@
 #include "conv2d.cuh"
+#include "conv2d-cudnn.cuh"
 #include "convert.cuh"
 
 struct conv_params {
@@ -120,6 +121,11 @@ static void conv2d_cuda_f32(const float * X_D, const float * K_D, float * Y_D, c
 }
 
 void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // env-gated cuDNN implicit-GEMM path (Blackwell). Returns true if it handled the op.
+    if (ggml_cuda_op_conv2d_cudnn(ctx, dst)) {
+        return;
+    }
+
     const ggml_tensor * kernel = dst->src[0];
     const ggml_tensor * input  = dst->src[1];
     float *             K_D    = (float *) kernel->data;
