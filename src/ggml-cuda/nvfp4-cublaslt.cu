@@ -116,12 +116,22 @@ bool ggml_cuda_nvfp4_cublaslt_enabled() {
 }
 
 struct nvfp4_weight_repacked {
-    uint8_t * data   = nullptr;   // persistent (cudaMalloc), consecutive E2M1
-    uint8_t * scales = nullptr;   // persistent, swizzled UE4M3
+    uint8_t * data   = nullptr;   // consecutive E2M1   (in-place: offset 0 of src0->data)
+    uint8_t * scales = nullptr;   // swizzled UE4M3      (in-place: offset data_bytes)
+    bool      in_place = false;   // true => data/scales alias the ggml-owned src0 buffer
+                                  //         (teardown must NOT cudaFree them)
 };
 
 static std::mutex                                   g_repack_mtx;
 static std::unordered_map<const void*, nvfp4_weight_repacked> g_repack_cache;
+
+// in-place repack default-ON; escape hatch GGML_NVFP4_CUBLASLT_INPLACE=0 forces the
+// old out-of-place (duplicate-buffer) path for debugging / fallback.
+static bool nvfp4_inplace_enabled() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("GGML_NVFP4_CUBLASLT_INPLACE"); v = (e && atoi(e)==0) ? 0 : 1; }
+    return v == 1;
+}
 
 static thread_local cublasLtHandle_t g_lt = nullptr;
 static cublasLtHandle_t get_lt() {
@@ -133,8 +143,11 @@ static cublasLtHandle_t get_lt() {
 static bool get_repacked_weight(const ggml_tensor * src0, int N, int K, cudaStream_t stream,
                                 nvfp4_weight_repacked & out) {
     const void * key = src0->data;
+    // Hold the lock across the whole (one-time, warmup) repack: the in-place path overwrites
+    // src0->data, so two threads repacking the SAME key concurrently would corrupt each other.
+    // Cached entries (the hot per-step path) return early in the caller-visible fast path below.
+    std::lock_guard<std::mutex> lk(g_repack_mtx);
     {
-        std::lock_guard<std::mutex> lk(g_repack_mtx);
         auto it = g_repack_cache.find(key);
         if (it != g_repack_cache.end()) { out = it->second; return true; }
     }
@@ -143,23 +156,55 @@ static bool get_repacked_weight(const ggml_tensor * src0, int N, int K, cudaStre
     const size_t rb_p = ((size_t)(N+127)/128)*128;
     const size_t cb_p = ((size_t)(nsub+3)/4)*4;
     const size_t scale_bytes = rb_p*cb_p;
+    const size_t repack_bytes = data_bytes + scale_bytes;
+
+    // The DiT runs 100% on cuBLASLt (no MMQ fallback), so once a weight is repacked its
+    // original block_nvfp4 layout is never read again -> the repacked bytes can live in the
+    // ggml-owned buffer, eliminating the duplicate. Repack is a re-layout of the SAME values,
+    // so data+scales should fit in ggml_nbytes(src0); VERIFY at runtime per-weight.
+    const size_t orig_bytes = ggml_nbytes(src0);
+    const bool   fits = (repack_bytes <= orig_bytes);
+    const bool   want_inplace = nvfp4_inplace_enabled() && fits;
+
     nvfp4_weight_repacked rp;
-    if (cudaMalloc(&rp.data, data_bytes)   != cudaSuccess) return false;
-    if (cudaMalloc(&rp.scales, scale_bytes)!= cudaSuccess) { cudaFree(rp.data); return false; }
-    cudaMemsetAsync(rp.scales, 0, scale_bytes, stream);
     const int threads = 256;
     const int total   = N*nsub;
-    repack_weight_kernel<<<(total+threads-1)/threads, threads, 0, stream>>>(
-        (const block_nvfp4*)src0->data, rp.data, rp.scales, N, K);
-    if (cudaPeekAtLastError() != cudaSuccess) { cudaFree(rp.data); cudaFree(rp.scales); return false; }
-    cudaStreamSynchronize(stream);
-    {
-        std::lock_guard<std::mutex> lk(g_repack_mtx);
-        // double-checked: another thread may have inserted meanwhile
-        auto it = g_repack_cache.find(key);
-        if (it != g_repack_cache.end()) { cudaFree(rp.data); cudaFree(rp.scales); out = it->second; return true; }
-        g_repack_cache[key] = rp;
+
+    if (want_inplace) {
+        // read-after-write hazard (repack permutes both nibbles & scales) forces a transient
+        // scratch: original -> scratch, then scratch -> src0->data in-place. The scratch is
+        // freed immediately (never accumulates), so net VRAM cost over baseline is ~0.
+        uint8_t * scratch = nullptr;
+        if (cudaMalloc(&scratch, repack_bytes) != cudaSuccess) return false; // OOM: caller falls back
+        uint8_t * s_data   = scratch;
+        uint8_t * s_scales = scratch + data_bytes;
+        cudaMemsetAsync(s_scales, 0, scale_bytes, stream);
+        repack_weight_kernel<<<(total+threads-1)/threads, threads, 0, stream>>>(
+            (const block_nvfp4*)src0->data, s_data, s_scales, N, K);
+        if (cudaPeekAtLastError() != cudaSuccess) { cudaFree(scratch); return false; }
+        // copy repacked bytes back into the ORIGINAL ggml buffer (data@0, scales@data_bytes).
+        cudaMemcpyAsync(src0->data, scratch, repack_bytes, cudaMemcpyDeviceToDevice, stream);
+        cudaStreamSynchronize(stream);   // must finish before scratch is freed
+        cudaFree(scratch);
+        rp.data     = (uint8_t*)src0->data;
+        rp.scales   = (uint8_t*)src0->data + data_bytes;
+        rp.in_place = true;
+    } else {
+        // out-of-place fallback (env-forced, or repack doesn't fit the original buffer):
+        // hold a duplicate persistent buffer for this weight.
+        if (cudaMalloc(&rp.data, data_bytes)   != cudaSuccess) return false;
+        if (cudaMalloc(&rp.scales, scale_bytes)!= cudaSuccess) { cudaFree(rp.data); return false; }
+        cudaMemsetAsync(rp.scales, 0, scale_bytes, stream);
+        repack_weight_kernel<<<(total+threads-1)/threads, threads, 0, stream>>>(
+            (const block_nvfp4*)src0->data, rp.data, rp.scales, N, K);
+        if (cudaPeekAtLastError() != cudaSuccess) { cudaFree(rp.data); cudaFree(rp.scales); return false; }
+        cudaStreamSynchronize(stream);
+        rp.in_place = false;
+        if (getenv("GGML_NVFP4_CUBLASLT_TRACE"))
+            fprintf(stderr, "[NVFP4_CUBLASLT] out-of-place weight N=%d K=%d (repack %zu > orig %zu, "
+                            "or inplace disabled)\n", N, K, repack_bytes, orig_bytes);
     }
+    g_repack_cache[key] = rp;   // lock held for the whole function (see top)
     out = rp;
     return true;
 }
