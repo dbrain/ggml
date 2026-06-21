@@ -67,16 +67,16 @@ struct cudnn_sdpa_plan {
 };
 
 struct sdpa_key {
-    int64_t B, H, L, D;
+    int64_t B, H, Lq, Lkv, D;   // Lq==Lkv for self-attn; Lq!=Lkv for cross-attn (LTX-AV a2v/v2a)
     int     io_half;   // 1 == fp16 io, 0 == bf16 (reserved)
     bool operator==(const sdpa_key & o) const {
-        return B == o.B && H == o.H && L == o.L && D == o.D && io_half == o.io_half;
+        return B == o.B && H == o.H && Lq == o.Lq && Lkv == o.Lkv && D == o.D && io_half == o.io_half;
     }
 };
 struct sdpa_key_hash {
     size_t operator()(const sdpa_key & k) const {
         size_t h = 1469598103934665603ull;
-        for (int64_t v : {k.B, k.H, k.L, k.D, (int64_t)k.io_half}) {
+        for (int64_t v : {k.B, k.H, k.Lq, k.Lkv, k.D, (int64_t)k.io_half}) {
             h ^= (size_t)v; h *= 1099511628211ull;
         }
         return h;
@@ -93,20 +93,21 @@ static cudnn_sdpa_plan & get_or_build_plan(cudnnHandle_t handle, const sdpa_key 
         return it->second;
     }
 
-    const int64_t B = key.B, H = key.H, L = key.L, D = key.D;
+    const int64_t B = key.B, H = key.H, Lq = key.Lq, Lkv = key.Lkv, D = key.D;
 
     auto graph = std::make_shared<fe::graph::Graph>();
     graph->set_io_data_type(fe::DataType_t::HALF)
          .set_intermediate_data_type(fe::DataType_t::FLOAT)
          .set_compute_data_type(fe::DataType_t::FLOAT);
 
-    // Q/K/V: BHSD contiguous strides (N outer, then H, then L, then D innermost).
+    // Q/K/V: BHSD contiguous strides (N outer, then H, then L, then D innermost). Q uses the
+    // query seqlen Lq; K/V use the key/value seqlen Lkv (Lq==Lkv self-attn, Lq!=Lkv cross-attn).
     auto Q = graph->tensor(fe::graph::Tensor_attributes().set_name("Q").set_uid(Q_UID)
-                 .set_dim({B, H, L, D}).set_stride({H * L * D, L * D, D, 1}));
+                 .set_dim({B, H, Lq, D}).set_stride({H * Lq * D, Lq * D, D, 1}));
     auto K = graph->tensor(fe::graph::Tensor_attributes().set_name("K").set_uid(K_UID)
-                 .set_dim({B, H, L, D}).set_stride({H * L * D, L * D, D, 1}));
+                 .set_dim({B, H, Lkv, D}).set_stride({H * Lkv * D, Lkv * D, D, 1}));
     auto V = graph->tensor(fe::graph::Tensor_attributes().set_name("V").set_uid(V_UID)
-                 .set_dim({B, H, L, D}).set_stride({H * L * D, L * D, D, 1}));
+                 .set_dim({B, H, Lkv, D}).set_stride({H * Lkv * D, Lkv * D, D, 1}));
 
     auto sdpa_opts = fe::graph::SDPA_attributes().set_name("flash_attention")
                          .set_generate_stats(false)   // inference: no LSE stats
@@ -119,7 +120,7 @@ static cudnn_sdpa_plan & get_or_build_plan(cudnnHandle_t handle, const sdpa_key 
     // permutes+converts to ggml's BSHD F32 dst. (Non-standard strided FP32 output is
     // not reliably honored by the SDPA engine, so keep the graph output canonical.)
     O->set_output(true).set_data_type(fe::DataType_t::HALF)
-        .set_dim({B, H, L, D}).set_stride({H * L * D, L * D, D, 1}).set_uid(O_UID);
+        .set_dim({B, H, Lq, D}).set_stride({H * Lq * D, Lq * D, D, 1}).set_uid(O_UID);
 
     if (!graph->validate().is_good())                                 { GGML_ABORT("cudnn sdpa validate failed"); }
     if (!graph->build_operation_graph(handle).is_good())              { GGML_ABORT("cudnn sdpa build_operation_graph failed"); }
@@ -143,14 +144,17 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    // ne = [D, L, H, N]
-    const int64_t D = Q->ne[0];
-    const int64_t L = Q->ne[1];
-    const int64_t H = Q->ne[2];
-    const int64_t N = Q->ne[3];
+    // ne = [D, L, H, N]. Q has the query seqlen (Lq); K/V have the key/value seqlen (Lkv).
+    // For LTX-AV self-attn Lq==Lkv; the a2v/v2a cross-attn has Lq!=Lkv (and no mask), which
+    // cuDNN SDPA handles natively (the flux2 borrow only ever saw the self-attn case).
+    const int64_t D   = Q->ne[0];
+    const int64_t Lq  = Q->ne[1];
+    const int64_t H   = Q->ne[2];
+    const int64_t N   = Q->ne[3];
+    const int64_t Lkv = K->ne[1];
 
     GGML_ASSERT(K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
-    GGML_ASSERT(K->ne[0] == D && K->ne[1] == L && V->ne[0] == D && V->ne[1] == L);
+    GGML_ASSERT(K->ne[0] == D && V->ne[0] == D && V->ne[1] == Lkv);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     float scale = 0.0f;
@@ -191,7 +195,7 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         GGML_ASSERT(Q->type == GGML_TYPE_F16);
     }
 
-    sdpa_key key{N, H, L, D, /*io_half=*/1};
+    sdpa_key key{N, H, Lq, Lkv, D, /*io_half=*/1};
     cudnn_sdpa_plan & plan = get_or_build_plan(handle, key, scale);
 
     ggml_cuda_pool_alloc<uint8_t> ws(ctx.pool());
@@ -201,8 +205,8 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         ws_ptr = ws.get();
     }
 
-    // SDPA writes O as BHSD F16 into a scratch buffer.
-    ggml_cuda_pool_alloc<half> o_bhsd(ctx.pool(), (size_t)(N * H * L * D));
+    // SDPA writes O as BHSD F16 into a scratch buffer (O seqlen = Lq).
+    ggml_cuda_pool_alloc<half> o_bhsd(ctx.pool(), (size_t)(N * H * Lq * D));
 
     std::unordered_map<fe::graph::Tensor_attributes::uid_t, void *> vpack = {
         {Q_UID, const_cast<void *>(q_ptr)},
@@ -215,12 +219,12 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         GGML_ABORT("cudnn sdpa execute failed");
     }
 
-    // Permute BHSD F16 -> BSHD F32 directly into ggml's contiguous F32 dst.
-    const long tot = (long)N * H * L * D;
+    // Permute BHSD F16 -> BSHD F32 directly into ggml's contiguous F32 dst (O seqlen = Lq).
+    const long tot = (long)N * H * Lq * D;
     const int  bs  = 256;
     const int  gs  = (int)((tot + bs - 1) / bs);
     cudnn_o_bhsd_half_to_bshd_f32<<<gs, bs, 0, stream>>>(
-        o_bhsd.get(), (float *) dst->data, (int)N, (int)H, (int)L, (int)D);
+        o_bhsd.get(), (float *) dst->data, (int)N, (int)H, (int)Lq, (int)D);
 }
 
 #else  // !GGML_CUDNN
