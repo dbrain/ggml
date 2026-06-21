@@ -17,6 +17,7 @@
 #include "ggml-cuda/conv2d-dw.cuh"
 #include "ggml-cuda/conv2d-deform.cuh"
 #include "ggml-cuda/conv2d-transpose.cuh"
+#include "ggml-cuda/conv3d-cudnn.cuh"
 #include "ggml-cuda/convert.cuh"
 #include "ggml-cuda/count-equal.cuh"
 #include "ggml-cuda/cpy.cuh"
@@ -3287,6 +3288,14 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_CONV_2D:
             ggml_cuda_op_conv2d(ctx, dst);
             break;
+        case GGML_OP_CONV_3D:
+            // env-gated cuDNN implicit-GEMM 3D conv (Blackwell). supports_op only returns
+            // true for this op when cuDNN is compiled + GGML_CUDNN_CONV3D/CONV is set, so a
+            // false here means an out-of-cap / unsupported shape that was nonetheless routed.
+            if (!ggml_cuda_op_conv3d_cudnn(ctx, dst)) {
+                GGML_ABORT("GGML_OP_CONV_3D on CUDA needs cuDNN: shape unsupported or workspace>cap; unset GGML_CUDNN_CONV3D");
+            }
+            break;
         case GGML_OP_CONV_2D_DW:
             ggml_cuda_op_conv2d_dw(ctx, dst);
             break;
@@ -6107,6 +6116,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CONV_TRANSPOSE_2D:
         case GGML_OP_POOL_2D:
             return true;
+        case GGML_OP_CONV_3D:
+            // Only claim CONV_3D on CUDA when the env-gated cuDNN path can take it; otherwise
+            // return false so the scheduler keeps it on the CPU backend. The graph only emits
+            // GGML_OP_CONV_3D (via ggml_conv_3d_direct) when the same env is set, so this stays
+            // consistent and is byte-identical (CPU conv_3d) when cuDNN is off.
+            return ggml_cuda_conv3d_cudnn_available() &&
+                   (getenv("GGML_CUDNN_CONV3D") || getenv("GGML_CUDNN_CONV")) &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
+                   op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_CONV_2D_DEFORM:
             // CUDA kernel implements the whcn path only (src + kernel contiguous);
             // the cwhn path falls back to the CPU backend via the scheduler.
