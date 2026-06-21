@@ -214,6 +214,13 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
                                       const ggml_tensor * src1,
                                       ggml_tensor * dst) {
     // only the simple 2D linear-layer case (NVFP4 weight, f32 act, f32 out)
+    static int dbgn = 0;
+    const bool dbg = getenv("GGML_NVFP4_CUBLASLT_TRACE") && dbgn < 12;
+    if (dbg) { dbgn++;
+        fprintf(stderr,"[cublaslt-try] s0 t=%d ne=[%ld,%ld,%ld,%ld] cont=%d hostbuf=%d | s1 t=%d cont=%d | dst t=%d cont=%d\n",
+          (int)src0->type,(long)src0->ne[0],(long)src0->ne[1],(long)src0->ne[2],(long)src0->ne[3],
+          ggml_is_contiguous(src0), src0->buffer?ggml_backend_buffer_is_host(src0->buffer):-1,
+          (int)src1->type,ggml_is_contiguous(src1),(int)dst->type,ggml_is_contiguous(dst)); }
     if (src0->type != GGML_TYPE_NVFP4 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32)
         return false;
     if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1)
@@ -232,9 +239,26 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     cublasLtHandle_t lt = get_lt();
     if (!lt) return false;
 
-    // 1) repacked weight (cached)
-    nvfp4_weight_repacked W;
-    if (!get_repacked_weight(src0, N, K, stream, W)) return false;
+    // 1) repack weight into TRANSIENT pool buffers, per-call (no cache, no in-place).
+    // The prior cache-by-ptr + in-place path was unsafe: in-place corrupted the weight, and
+    // out-of-place caching leaked one persistent buffer per (changing) offload-stream pointer
+    // -> OOM. Repacking into the pool each call costs a cheap re-layout kernel (the activation
+    // is already quantized per-call the same way) and works identically on resident & offload
+    // weights with zero VRAM doubling.
+    const size_t w_data_bytes  = (size_t)N*(K/2);
+    const size_t w_rb_p = ((size_t)(N+127)/128)*128;
+    const size_t w_cb_p = ((size_t)(K/16+3)/4)*4;
+    const size_t w_scale_bytes = w_rb_p*w_cb_p;
+    ggml_cuda_pool_alloc<uint8_t> w_data(ctx.pool(), w_data_bytes);
+    ggml_cuda_pool_alloc<uint8_t> w_scales(ctx.pool(), w_scale_bytes);
+    cudaMemsetAsync(w_scales.get(), 0, w_scale_bytes, stream);
+    {
+        const int threads = 256;
+        const int total   = N*(K/16);
+        repack_weight_kernel<<<(total+threads-1)/threads, threads, 0, stream>>>(
+            (const block_nvfp4*)src0->data, w_data.get(), w_scales.get(), N, K);
+        if (cudaPeekAtLastError() != cudaSuccess) return false;
+    }
 
     // 2) quantize activation into cuBLASLt layout (pool scratch)
     const int nsub = K/16;
@@ -266,7 +290,7 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     cublasOperation_t T=CUBLAS_OP_T, Nn=CUBLAS_OP_N;
     cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &T, sizeof(T));
     cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &Nn, sizeof(Nn));
-    void* wsp = (void*)W.scales; void* asp = (void*)a_scales.get();
+    void* wsp = (void*)w_scales.get(); void* asp = (void*)a_scales.get();
     cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &wsp, sizeof(wsp));
     cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &asp, sizeof(asp));
     cublasDataType_t st = CUDA_R_32F;
@@ -288,7 +312,7 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
 
     bool ok = (hs == CUBLAS_STATUS_SUCCESS && got > 0);
     if (ok) {
-        cublasStatus_t ms = cublasLtMatmul(lt, op, &alpha_h, W.data, Ad, a_data.get(), Bd,
+        cublasStatus_t ms = cublasLtMatmul(lt, op, &alpha_h, w_data.get(), Ad, a_data.get(), Bd,
                                            &beta_h, dst->data, Cd, dst->data, Dd,
                                            &hr.algo, ws.get(), wsz, stream);
         ok = (ms == CUBLAS_STATUS_SUCCESS);
