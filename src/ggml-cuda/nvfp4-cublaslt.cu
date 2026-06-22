@@ -60,7 +60,17 @@ static __global__ void repack_weight_kernel(const block_nvfp4 * __restrict__ W,
 // search) so the cuBLASLt activation is bit-identical to the MMQ path; only the
 // nibble *packing* differs (consecutive for cuBLASLt vs MMQ tile layout). This
 // keeps cuBLASLt output as close to MMQ as the GEMM kernels themselves allow.
-static __global__ void quant_act_kernel(const float * __restrict__ X,
+//
+// Templated on the activation element type so the DiT residual stream can flow
+// in F16 (LTX_DIT_F16) straight into the FP4 GEMM with NO per-Linear F16->F32
+// cast (stage 1 of the beat-comfy plan). The activation is quantized to E2M1
+// regardless, so the input element precision barely affects quality; the amax /
+// ±scale-refine math runs in float exactly as the F32 path does.
+__device__ __forceinline__ float nvfp4_load_act(const float & v) { return v; }
+__device__ __forceinline__ float nvfp4_load_act(const half  & v) { return __half2float(v); }
+
+template <typename act_t>
+static __global__ void quant_act_kernel(const act_t * __restrict__ X,
                                         uint8_t * __restrict__ out_data,    // M*(K/2)
                                         uint8_t * __restrict__ out_scales,  // swizzled
                                         int M, int K) {
@@ -70,10 +80,10 @@ static __global__ void quant_act_kernel(const float * __restrict__ X,
     if (idx >= M*nsub) return;
     const int r  = idx / nsub;
     const int ss = idx % nsub;
-    const float * x = &X[(size_t)r*K + ss*16];
+    const act_t * x = &X[(size_t)r*K + ss*16];
     float vals[16], amax = 0.f;
     #pragma unroll
-    for (int j=0;j<16;j++) { vals[j]=x[j]; amax = fmaxf(amax, fabsf(x[j])); }
+    for (int j=0;j<16;j++) { vals[j]=nvfp4_load_act(x[j]); amax = fmaxf(amax, fabsf(vals[j])); }
 
     static constexpr int test_offsets[5] = {0,-1,1,-2,2};
     const int first_code = (int) ggml_cuda_fp32_to_ue4m3(amax/6.0f);
@@ -221,7 +231,16 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
           (int)src0->type,(long)src0->ne[0],(long)src0->ne[1],(long)src0->ne[2],(long)src0->ne[3],
           ggml_is_contiguous(src0), src0->buffer?ggml_backend_buffer_is_host(src0->buffer):-1,
           (int)src1->type,ggml_is_contiguous(src1),(int)dst->type,ggml_is_contiguous(dst)); }
-    if (src0->type != GGML_TYPE_NVFP4 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32)
+    // Accept F32 OR F16 activations: the FP4 GEMM quantizes the activation to E2M1
+    // anyway, so feeding the F16 residual stream (LTX_DIT_F16) keeps the matmul on
+    // the fast tensor-core path instead of forcing a per-Linear F16->F32 cast.
+    // Accept F32 OR F16 dst: cuBLASLt accumulates in F32 and can store F16 directly
+    // (stage 2 — F16 Linear output so the residual/glue stays pure-F16 half-width).
+    if (src0->type != GGML_TYPE_NVFP4)
+        return false;
+    if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16)
+        return false;
+    if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16)
         return false;
     if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1)
         return false;
@@ -272,8 +291,13 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     {
         const int threads = 256;
         const int total   = M*nsub;
-        quant_act_kernel<<<(total+threads-1)/threads, threads, 0, stream>>>(
-            (const float*)src1->data, a_data.get(), a_scales.get(), M, K);
+        if (src1->type == GGML_TYPE_F16) {
+            quant_act_kernel<<<(total+threads-1)/threads, threads, 0, stream>>>(
+                (const half*)src1->data, a_data.get(), a_scales.get(), M, K);
+        } else {
+            quant_act_kernel<<<(total+threads-1)/threads, threads, 0, stream>>>(
+                (const float*)src1->data, a_data.get(), a_scales.get(), M, K);
+        }
         if (cudaPeekAtLastError() != cudaSuccess) return false;
     }
 
@@ -296,11 +320,13 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     cublasDataType_t st = CUDA_R_32F;
     cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_SCALE_TYPE, &st, sizeof(st));
 
+    // output store type follows dst (F32 default; F16 for the dit_f16 residual stream)
+    const cublasDataType_t out_dt = (dst->type == GGML_TYPE_F16) ? CUDA_R_16F : CUDA_R_32F;
     cublasLtMatrixLayout_t Ad=nullptr,Bd=nullptr,Cd=nullptr,Dd=nullptr;
     cublasLtMatrixLayoutCreate(&Ad, CUDA_R_4F_E2M1, k, m, k);
     cublasLtMatrixLayoutCreate(&Bd, CUDA_R_4F_E2M1, k, n, k);
-    cublasLtMatrixLayoutCreate(&Cd, CUDA_R_32F, m, n, m);
-    cublasLtMatrixLayoutCreate(&Dd, CUDA_R_32F, m, n, m);
+    cublasLtMatrixLayoutCreate(&Cd, out_dt, m, n, m);
+    cublasLtMatrixLayoutCreate(&Dd, out_dt, m, n, m);
 
     ggml_cuda_pool_alloc<uint8_t> ws(ctx.pool(), 32*1024*1024);
     size_t wsz = 32*1024*1024;
@@ -323,7 +349,7 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
         if (n_handled++ == 0 || getenv("GGML_NVFP4_CUBLASLT_TRACE"))
             fprintf(stderr, "[NVFP4_CUBLASLT] handled mul_mat #%d  M=%d K=%d N=%d (cuBLASLt FP4 GEMM)\n",
                     n_handled, M, K, N);
-        if (getenv("GGML_NVFP4_NANCHECK")) {
+        if (getenv("GGML_NVFP4_NANCHECK") && dst->type == GGML_TYPE_F32) {
             float h[8] = {0};
             cudaMemcpyAsync(h, dst->data, sizeof(h), cudaMemcpyDeviceToHost, stream);
             cudaStreamSynchronize(stream);

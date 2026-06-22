@@ -5853,7 +5853,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     }
                 }
                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
-                    return false;
+                    // NVFP4 weights accept an F16 activation via the cuBLASLt FP4 path
+                    // (quant_act reads half) — keep the DiT F16 residual stream on the
+                    // fast tensor-core GEMM instead of forcing a per-Linear F16->F32
+                    // cast. Gated on the cuBLASLt env so prod (Q4_K, cuBLASLt off) is
+                    // byte-identical.
+                    if (!(a->type == GGML_TYPE_NVFP4 && ggml_cuda_nvfp4_cublaslt_enabled())) {
+                        return false;
+                    }
                 }
                 // ADDITIVE: an F16 destination is only supported via the dedicated
                 // F32-accumulation cuBLAS F16-store path, which handles only
@@ -5862,6 +5869,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (op->type == GGML_TYPE_F16) {
                     if (op->op != GGML_OP_MUL_MAT) {
                         return false; // mul_mat_id F16-dst not implemented
+                    }
+                    // NVFP4 weight with an F16 activation+dst goes through the cuBLASLt
+                    // FP4 path (F32 accum, F16 store) — the dit_f16 residual stream.
+                    if (a->type == GGML_TYPE_NVFP4 && b->type == GGML_TYPE_F16 &&
+                        ggml_cuda_nvfp4_cublaslt_enabled()) {
+                        return true;
                     }
                     if (!((a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_F32) &&
                           (b->type == GGML_TYPE_F16 || b->type == GGML_TYPE_F32))) {
