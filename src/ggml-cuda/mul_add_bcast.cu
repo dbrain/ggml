@@ -93,8 +93,49 @@ __global__ void __launch_bounds__(256) fused_madd_same_f32_kernel(
     dst[t] = r;
 }
 
+// Same-shape fused multiply-add with a STRIDED gate (dst = x + y*g [+ shift]).
+// LTX-2.3 align_token_modulation permutes the gate [d0,1,L] -> [d0,L,1] (moving the
+// size-1 dim) so `g` matches the MUL's [d0,L,1] shape but ggml_is_contiguous(g) is
+// false -> the flat kernel above can't be triggered for it. `g` is read via its own
+// 4D strides (decoded from the contiguous dst/iteration shape ne0..ne2); x/y/dst/shift
+// stay flat-contiguous. For the LTX permute the gate data IS contiguous (the permute
+// only reorders a size-1 dim), so g[g_idx] reads exactly what g[t] would on a
+// contiguous gate -> bit-identical to the flat path. Bit-exact (__fmul_rn + __fadd_rn).
+template <bool HAS_SHIFT>
+__global__ void __launch_bounds__(256) fused_madd_same_strided_g_f32_kernel(
+    const float * __restrict__ x,
+    const float * __restrict__ y,
+    const float * __restrict__ g,      // strided gate (may be non-contiguous)
+    const float * __restrict__ shift,  // flat, same layout as x; read only if HAS_SHIFT
+    float       * __restrict__ dst,
+    const int64_t n_elem,
+    const int64_t ne0,
+    const int64_t ne1,
+    const int64_t ne2,
+    const int64_t gs0,   // g strides in ELEMENTS (g->nb / sizeof(float))
+    const int64_t gs1,
+    const int64_t gs2,
+    const int64_t gs3) {
+    const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_elem) {
+        return;
+    }
+    int64_t       rem = t;
+    const int64_t i0 = rem % ne0; rem /= ne0;
+    const int64_t i1 = rem % ne1; rem /= ne1;
+    const int64_t i2 = rem % ne2; rem /= ne2;
+    const int64_t i3 = rem;
+    const int64_t g_idx = i0 * gs0 + i1 * gs1 + i2 * gs2 + i3 * gs3;
+    float r = __fadd_rn(x[t], __fmul_rn(y[t], g[g_idx]));
+    if (HAS_SHIFT) {
+        r = __fadd_rn(r, shift[t]);
+    }
+    dst[t] = r;
+}
+
 // x = residual side of the ADD; y,g = the two MUL operands (dst = x + y*g).
-// All contiguous F32, ggml_nelements all == add_n's. shift optional (same shape).
+// x/y/dst/shift contiguous F32, ggml_nelements all == add_n's. `g` may be a strided
+// (permuted) view of the same logical shape — read via its strides. shift optional.
 void ggml_cuda_op_fused_madd_same(ggml_backend_cuda_context & ctx,
                                   ggml_tensor *               add_n,
                                   const ggml_tensor *         x,
@@ -126,8 +167,25 @@ void ggml_cuda_op_fused_madd_same(ggml_backend_cuda_context & ctx,
     const int64_t num_blocks = (n_elem + block_size - 1) / block_size;
     GGML_ASSERT(num_blocks <= (1LL << 31) - 1);
 
-    auto kern = shift_d ? fused_madd_same_f32_kernel<true> : fused_madd_same_f32_kernel<false>;
-    kern<<<(int) num_blocks, block_size, 0, ctx.stream()>>>(x_d, y_d, g_d, shift_d, dst_d, n_elem);
+    if (ggml_is_contiguous(g)) {
+        auto kern = shift_d ? fused_madd_same_f32_kernel<true> : fused_madd_same_f32_kernel<false>;
+        kern<<<(int) num_blocks, block_size, 0, ctx.stream()>>>(x_d, y_d, g_d, shift_d, dst_d, n_elem);
+    } else {
+        // Strided gate (LTX align_token_modulation permute). Decode the flat index over
+        // the contiguous iteration shape (== add_n / mul_n shape) and gather g via its
+        // own strides. x/y/dst/shift stay flat-contiguous.
+        GGML_ASSERT(ggml_are_same_shape(g, add_n));
+        const int64_t gs0 = g->nb[0] / sizeof(float);
+        const int64_t gs1 = g->nb[1] / sizeof(float);
+        const int64_t gs2 = g->nb[2] / sizeof(float);
+        const int64_t gs3 = g->nb[3] / sizeof(float);
+        auto kern = shift_d ? fused_madd_same_strided_g_f32_kernel<true>
+                            : fused_madd_same_strided_g_f32_kernel<false>;
+        kern<<<(int) num_blocks, block_size, 0, ctx.stream()>>>(
+            x_d, y_d, g_d, shift_d, dst_d, n_elem,
+            add_n->ne[0], add_n->ne[1], add_n->ne[2],
+            gs0, gs1, gs2, gs3);
+    }
 }
 
 void ggml_cuda_op_mul_add_bcast(ggml_backend_cuda_context & ctx,

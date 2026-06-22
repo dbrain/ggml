@@ -4723,6 +4723,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // ADD(x, MUL(a,b)) chain with single-use intermediates. Env-disable:
     // GGML_CUDA_NO_MADD_FUSE=1.
     static const bool madd_fuse_disabled = (getenv("GGML_CUDA_NO_MADD_FUSE") != nullptr);
+    // The same-shape fusion also accepts a STRIDED gate operand (LTX-2.3
+    // align_token_modulation permutes the gate [d0,1,L]->[d0,L,1] -> non-contiguous,
+    // which the original both-contiguous check rejected). Bit-exact (the kernel reads
+    // the gate via its strides). Set GGML_CUDA_NO_STRIDED_GATE_FUSE to force the old
+    // conservative no-fuse path for that case (clean A/B isolation).
+    static const bool strided_gate_fuse_disabled = (getenv("GGML_CUDA_NO_STRIDED_GATE_FUSE") != nullptr);
     if (!madd_fuse_disabled && node->op == GGML_OP_MUL && node->type == GGML_TYPE_F32 &&
         ggml_is_contiguous(node) && ggml_node_get_use_count(cgraph, i) == 1) {
         auto is_view_like = [](ggml_op op) {
@@ -4739,10 +4745,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_tensor * a     = mul_n->src[0];
         ggml_tensor * b     = mul_n->src[1];
         const int64_t n_elem = ggml_nelements(mul_n);
-        // Both MUL operands must be same-count contiguous F32 (no broadcast).
+        // The `y` operand must be contiguous F32 (flat-read); the `gate` operand may be
+        // a strided/permuted view of the SAME shape (kernel reads it via its strides).
+        // Identify which operand is contiguous (= y); the other is the gate.
+        ggml_tensor * y_op = nullptr;
+        ggml_tensor * g_op = nullptr;
         if (a && b && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
-            ggml_nelements(a) == n_elem && ggml_nelements(b) == n_elem &&
-            ggml_is_contiguous(a) && ggml_is_contiguous(b)) {
+            ggml_nelements(a) == n_elem && ggml_nelements(b) == n_elem) {
+            if (ggml_is_contiguous(a))      { y_op = a; g_op = b; }
+            else if (ggml_is_contiguous(b)) { y_op = b; g_op = a; }
+        }
+        const bool g_strided = g_op && !ggml_is_contiguous(g_op);
+        if (y_op && g_op && ggml_are_same_shape(g_op, mul_n) &&
+            !(g_strided && strided_gate_fuse_disabled)) {
             int j = i + 1;
             while (j < cgraph->n_nodes && is_view_like(cgraph->nodes[j]->op)) {
                 ++j;
@@ -4781,7 +4796,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                             final_add = sadd;
                         }
                     }
-                    ggml_cuda_op_fused_madd_same(*cuda_ctx, final_add, x_side, a, b, shift);
+                    ggml_cuda_op_fused_madd_same(*cuda_ctx, final_add, x_side, y_op, g_op, shift);
                     return (shift ? k : j) - i;
                 }
             }
