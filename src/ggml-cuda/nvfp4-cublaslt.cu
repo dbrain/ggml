@@ -78,11 +78,34 @@ __device__ __forceinline__ float nvfp4_load_act(const half  & v) { return __half
 // and comfy — our quality target — ships the one-shot path, so REFINE=false is both faster
 // (~5x less quant work) and quantization-equivalent to the reference. Gated by
 // GGML_NVFP4_QUANT_NOREFINE; default keeps the refinement so flux2/prod are byte-untouched.
+// Per-tensor activation amax (max|x| over the whole M*K matrix) for comfy/ModelOpt's
+// two-level NVFP4 scale. atomicMax on the IEEE bit pattern is valid because the values
+// are non-negative (positive-float bit patterns are monotonic). Result reported as the
+// raw uint bits of the max float.
+template <typename act_t>
+static __global__ void nvfp4_amax_kernel(const act_t * __restrict__ X,
+                                         unsigned int * __restrict__ out_bits, size_t n) {
+    float local = 0.f;
+    for (size_t i = (size_t)blockIdx.x*blockDim.x + threadIdx.x; i < n;
+         i += (size_t)gridDim.x*blockDim.x) {
+        local = fmaxf(local, fabsf(nvfp4_load_act(X[i])));
+    }
+    __shared__ float s[256];
+    s[threadIdx.x] = local; __syncthreads();
+    for (int st = blockDim.x/2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) s[threadIdx.x] = fmaxf(s[threadIdx.x], s[threadIdx.x+st]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicMax(out_bits, __float_as_uint(s[0]));
+}
+
+// per_tensor > 0 selects comfy/ModelOpt's TWO-LEVEL one-shot quant (see below); per_tensor
+// <= 0 keeps the original single-level path (REFINE search or one-shot).
 template <typename act_t, bool REFINE>
 static __global__ void quant_act_kernel(const act_t * __restrict__ X,
                                         uint8_t * __restrict__ out_data,    // M*(K/2)
                                         uint8_t * __restrict__ out_scales,  // swizzled
-                                        int M, int K) {
+                                        int M, int K, float per_tensor) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
     const int nsub = K/16;
     const int idx = blockIdx.x*blockDim.x + threadIdx.x;
@@ -93,6 +116,31 @@ static __global__ void quant_act_kernel(const act_t * __restrict__ X,
     float vals[16], amax = 0.f;
     #pragma unroll
     for (int j=0;j<16;j++) { vals[j]=nvfp4_load_act(x[j]); amax = fmaxf(amax, fabsf(vals[j])); }
+
+    // comfy/ModelOpt TWO-LEVEL one-shot: the per-block scale (amax/6) is normalized by
+    // the per-tensor global before being quantized to e4m3, so the e4m3 block-scale code
+    // stays in its well-conditioned range (un-normalized amax/6 for low-magnitude blocks
+    // lands in e4m3 subnormals -> coarse rounding -> the artifact the ±2 REFINE search was
+    // papering over). The stored code is the NORMALIZED e4m3; the per_tensor factor is
+    // carried by the cuBLASLt GEMM alpha (our weights already fold their own global into
+    // the block scale, so alpha = A_per_tensor only). At per_tensor==1 this is byte-
+    // identical to the single-level one-shot below.
+    if (per_tensor > 0.f) {
+        int tc = (int) ggml_cuda_fp32_to_ue4m3((amax/6.0f)/per_tensor);
+        tc = tc < 0 ? 0 : (tc > 0x7e ? 0x7e : tc);
+        const uint8_t code = (uint8_t)tc;
+        out_scales[swz_off(r, ss, nsub)] = code;
+        const float total = per_tensor * ggml_cuda_ue4m3_to_fp32(code);
+        const float inv_scale = total > 0.f ? 0.5f/total : 0.f;
+        uint8_t * od = &out_data[(size_t)r*(K/2) + ss*8];
+        #pragma unroll
+        for (int t=0;t<8;t++) {
+            uint8_t n0 = ggml_cuda_float_to_fp4_e2m1(vals[2*t],   inv_scale);
+            uint8_t n1 = ggml_cuda_float_to_fp4_e2m1(vals[2*t+1], inv_scale);
+            od[t] = (n0 & 0xF) | ((n1 & 0xF)<<4);
+        }
+        return;
+    }
 
     const int first_code = (int) ggml_cuda_fp32_to_ue4m3(amax/6.0f);
     uint8_t fp8_code; float subblock_scale;
@@ -304,26 +352,53 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     ggml_cuda_pool_alloc<uint8_t> a_data(ctx.pool(), a_data_bytes);
     ggml_cuda_pool_alloc<uint8_t> a_scales(ctx.pool(), a_scale_bytes);
     cudaMemsetAsync(a_scales.get(), 0, a_scale_bytes, stream);
+    // TWO-LEVEL (comfy-faithful) one-shot: compute the per-tensor activation global
+    // (amax / (6*448)) so block scales normalize into e4m3 range. Carried into the GEMM
+    // alpha below. Gated GGML_NVFP4_QUANT_TWOLEVEL; supersedes NOREFINE when set.
+    float a_per_tensor = 0.f;
+    {
+        static int s_twolevel = -1;
+        if (s_twolevel < 0) { const char* e = getenv("GGML_NVFP4_QUANT_TWOLEVEL"); s_twolevel = (e && atoi(e)) ? 1 : 0; }
+        if (s_twolevel) {
+            ggml_cuda_pool_alloc<unsigned int> amax_d(ctx.pool(), 1);
+            cudaMemsetAsync(amax_d.get(), 0, sizeof(unsigned int), stream);
+            const size_t n = (size_t)M*K;
+            const int thr = 256;
+            const int blk = (int)((n + thr - 1)/thr > 1024 ? 1024 : (n + thr - 1)/thr);
+            if (src1->type == GGML_TYPE_F16) nvfp4_amax_kernel<half><<<blk, thr, 0, stream>>>((const half*)src1->data, amax_d.get(), n);
+            else                             nvfp4_amax_kernel<float><<<blk, thr, 0, stream>>>((const float*)src1->data, amax_d.get(), n);
+            unsigned int bits = 0;
+            cudaMemcpyAsync(&bits, amax_d.get(), sizeof(unsigned int), cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            float amax_t = 0.f; memcpy(&amax_t, &bits, sizeof(float));
+            a_per_tensor = amax_t > 0.f ? amax_t/(6.0f*448.0f) : 0.f;
+        }
+    }
     {
         static int s_norefine = -1;
         if (s_norefine < 0) { const char* e = getenv("GGML_NVFP4_QUANT_NOREFINE"); s_norefine = (e && atoi(e)) ? 1 : 0; }
         const int threads = 256;
         const int total   = M*nsub;
         const int blocks  = (total+threads-1)/threads;
+        const float pt = a_per_tensor;   // >0 => two-level branch in the kernel
         if (src1->type == GGML_TYPE_F16) {
-            if (s_norefine) quant_act_kernel<half,false><<<blocks, threads, 0, stream>>>((const half*)src1->data, a_data.get(), a_scales.get(), M, K);
-            else            quant_act_kernel<half,true ><<<blocks, threads, 0, stream>>>((const half*)src1->data, a_data.get(), a_scales.get(), M, K);
+            if (s_norefine || pt > 0.f) quant_act_kernel<half,false><<<blocks, threads, 0, stream>>>((const half*)src1->data, a_data.get(), a_scales.get(), M, K, pt);
+            else                        quant_act_kernel<half,true ><<<blocks, threads, 0, stream>>>((const half*)src1->data, a_data.get(), a_scales.get(), M, K, pt);
         } else {
-            if (s_norefine) quant_act_kernel<float,false><<<blocks, threads, 0, stream>>>((const float*)src1->data, a_data.get(), a_scales.get(), M, K);
-            else            quant_act_kernel<float,true ><<<blocks, threads, 0, stream>>>((const float*)src1->data, a_data.get(), a_scales.get(), M, K);
+            if (s_norefine || pt > 0.f) quant_act_kernel<float,false><<<blocks, threads, 0, stream>>>((const float*)src1->data, a_data.get(), a_scales.get(), M, K, pt);
+            else                        quant_act_kernel<float,true ><<<blocks, threads, 0, stream>>>((const float*)src1->data, a_data.get(), a_scales.get(), M, K, pt);
         }
         if (cudaPeekAtLastError() != cudaSuccess) return false;
     }
 
-    // 3) cuBLASLt FP4 GEMM: D[M,N] (row-major) = A_w[N,K] @ B_a[M,K]^T, alpha=1
+    // 3) cuBLASLt FP4 GEMM: D[M,N] (row-major) = A_w[N,K] @ B_a[M,K]^T
     // cuBLAS column-major: m=N, n=M, k=K; A=weight (TN), B=activation.
+    // alpha = A_per_tensor for the two-level activation quant (carries the per-tensor
+    // global the kernel factored out of the stored block scales); 1.0 otherwise. Weights
+    // already fold their own global into the block scale, so alpha carries only A's.
     const int m=N, n=M, k=K;
-    static float alpha_h = 1.0f, beta_h = 0.0f;
+    float alpha_h = a_per_tensor > 0.f ? a_per_tensor : 1.0f;
+    static float beta_h = 0.0f;
 
     cublasLtMatmulDesc_t op = nullptr;
     if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS) return false;
