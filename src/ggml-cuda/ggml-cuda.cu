@@ -1726,6 +1726,10 @@ static void ggml_cuda_op_mul_mat_cublas(
         row_diff == src0->ne[1] &&
         dst->op_params[0] == GGML_PREC_DEFAULT;
 
+    // NOTE: routing BF16 connector/projection linears through the F16 sm120 tensor-op GEMM
+    // (GGML_CUDA_BF16_AS_F16) was a WASH on LTX: the per-call bf16->f16 weight conversion
+    // overhead canceled the faster sm120 GEMM (−0.21% = noise) and raised peak VRAM +1.1GB.
+    // Would need a load-time F16 weight cache (more VRAM) to net positive. Not pursued.
     if (supports_bf16 && src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
         ggml_cuda_pool_alloc<nv_bfloat16> src1_as_bf16(ctx.pool(id));
         if (src1->type != GGML_TYPE_BF16) {
@@ -4115,6 +4119,46 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // Fused bias-add + GELU (LTX FFN w1): ggml_ext_linear emits ADD(matmul_out, bias)
+    // immediately followed by ggml_gelu_inplace. The bias-add otherwise runs as a
+    // full-width op_add<half,float,half> over the 4x-wide [inner_dim, tokens] intermediate.
+    // Fold ADD(bias bcast)+GELU into one bit-exact pass. env GGML_CUDA_BIAS_GELU_FUSE (A/B; off by default).
+    {
+        static const bool bias_gelu_fuse = (getenv("GGML_CUDA_BIAS_GELU_FUSE") != nullptr);
+        auto is_view_like = [](ggml_op op) {
+            return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
+                   op == GGML_OP_TRANSPOSE || op == GGML_OP_PERMUTE;
+        };
+        if (bias_gelu_fuse && node->op == GGML_OP_ADD &&
+            (node->type == GGML_TYPE_F16 || node->type == GGML_TYPE_F32) &&
+            ggml_is_contiguous(node) && ggml_node_get_use_count(cgraph, i) == 1) {
+            ggml_tensor * big  = node->src[0];   // matmul output (add_inplace: src0 = x)
+            ggml_tensor * bias = node->src[1];   // 1D bias, broadcast over tokens
+            if (big && bias && big->type == node->type && ggml_is_contiguous(big) &&
+                bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
+                bias->ne[0] == node->ne[0] && bias->ne[1] == 1 && bias->ne[2] == 1 && bias->ne[3] == 1 &&
+                ggml_nelements(big) == ggml_nelements(node) && node->ne[1] > 1) {
+                int j = i + 1;
+                while (j < cgraph->n_nodes && is_view_like(cgraph->nodes[j]->op)) {
+                    ++j;
+                }
+                if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_UNARY &&
+                    ggml_get_unary_op(cgraph->nodes[j]) == GGML_UNARY_OP_GELU) {
+                    ggml_tensor * gelu_n = cgraph->nodes[j];
+                    ggml_tensor * gsrc   = gelu_n->src[0];
+                    while (gsrc && is_view_like(gsrc->op)) {
+                        gsrc = gsrc->src[0];
+                    }
+                    if (gsrc == node && gelu_n->type == node->type &&
+                        ggml_is_contiguous(gelu_n) && ggml_nelements(gelu_n) == ggml_nelements(node)) {
+                        ggml_cuda_op_bias_gelu(*cuda_ctx, gelu_n, big, bias);
+                        return j - i;
+                    }
+                }
+            }
+        }
+    }
+
     //topk-moe
     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
             cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
@@ -4630,14 +4674,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_tensor * s1    = mul_n->src[1];
         // Identify the broadcast operand (gate). For gate_add it's a [d0, 1, d2, Nb]
         // tensor against a [d0, d1, d2, Nb] tensor with d1 > 1.
+        // GGML_CUDA_F16_BCAST_FUSE=1: also fold the broadcast modulate/gate chain when the
+        // residual stream is F16 (LTX_DIT_F16). The big operand (x/y) is then F16 while the
+        // modulation gate/shift stay F32 — these a2v/v2a video modulates otherwise run as
+        // separate k_bin_bcast<op_mul,half,float,half> + <op_add,half,float,half> kernels
+        // (the 6.2%+1.7% profile buckets). Bit-exact via round_big (round-to-half per step).
+        // Default off (F32-only, = prior behaviour); opt-in A/B lever.
+        static const bool f16_bcast_fuse = (getenv("GGML_CUDA_F16_BCAST_FUSE") != nullptr);
         ggml_tensor * y_view = nullptr;
         ggml_tensor * gate   = nullptr;
-        if (s0 && s1 && s0->type == GGML_TYPE_F32 && s1->type == GGML_TYPE_F32) {
+        if (s0 && s1) {
             const bool s0_bcast = (s0->ne[1] == 1 && s1->ne[1] >  1);
             const bool s1_bcast = (s1->ne[1] == 1 && s0->ne[1] >  1);
             if (s0_bcast ^ s1_bcast) {
-                if (s1_bcast) { y_view = s0; gate = s1; }
-                else          { y_view = s1; gate = s0; }
+                ggml_tensor * big = s1_bcast ? s0 : s1;   // non-broadcast operand (x/y)
+                ggml_tensor * bc  = s1_bcast ? s1 : s0;   // broadcast operand (gate)
+                const bool big_ok = big->type == GGML_TYPE_F32 ||
+                                    (big->type == GGML_TYPE_F16 && f16_bcast_fuse);
+                if (big_ok && bc->type == GGML_TYPE_F32 && mul_n->type == big->type) {
+                    y_view = big; gate = bc;
+                }
             }
         }
         // Must match the gate_add 4D broadcast pattern exactly.
@@ -4662,15 +4718,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     x_side = add_n->src[0];
                 }
                 if (x_side &&
-                    add_n->type == GGML_TYPE_F32 &&
-                    x_side->type == GGML_TYPE_F32 &&
+                    add_n->type == mul_n->type &&
+                    x_side->type == mul_n->type &&
                     ggml_is_contiguous(add_n) &&
                     ggml_is_contiguous(x_side) &&
                     ggml_nelements(x_side) == ggml_nelements(mul_n) &&
                     ggml_nelements(add_n)  == ggml_nelements(mul_n)) {
-                    // The y view: must trace to a contiguous F32 tensor.
+                    // The y view: must trace to a contiguous tensor of the BIG (residual) type.
                     ggml_tensor * y_root = trace_back(y_view);
-                    if (y_root && y_root->type == GGML_TYPE_F32 &&
+                    if (y_root && y_root->type == mul_n->type &&
                         ggml_is_contiguous(y_root) &&
                         ggml_nelements(y_root) == ggml_nelements(mul_n)) {
                         // flux2 AdaLN: modulate() emits `x + x*scale` (this gate_add,
@@ -4694,7 +4750,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                             } else if (trace_back(sadd->src[1]) == add_n) {
                                 sshift = sadd->src[0];
                             }
-                            if (sshift && sadd->type == GGML_TYPE_F32 &&
+                            if (sshift && sadd->type == mul_n->type &&
                                 sshift->type == GGML_TYPE_F32 &&
                                 ggml_is_contiguous(sadd) &&
                                 ggml_is_contiguous(sshift) &&

@@ -424,6 +424,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // cuDNN fused SDPA (Blackwell): env-gated, only for the exact mask-free, no-bias,
     // gqa_ratio==1, F16 K/V, D in {64,128} self-attention shape (flux2 DiT). When the
     // env is unset or any condition fails, fall through to the existing logic untouched.
+    // cuDNN handles the D in {64,128} mask-free F16 shapes. NOTE: routing the D==64 LTX-AV
+    // shapes (audio self + a2v/v2a cross) away from cuDNN to native ggml flash is a DEAD END
+    // under LTX_DIT_F16 — native asserts Q->type==F32 (fattn-common.cuh:940) and the dit_f16
+    // stream produces F16 Q, which only cuDNN accepts. cuDNN's sm120 native SDPA is D==128-only
+    // so D==64 stays on the sm80 wmma engine; that 2.2% is irreducible without an F32-Q cast.
     if (ggml_cuda_cudnn_attn_env() && ggml_cuda_cudnn_available() &&
         ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL &&
         mask == nullptr && max_bias == 0.0f) {

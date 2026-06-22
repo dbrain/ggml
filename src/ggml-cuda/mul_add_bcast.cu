@@ -1,4 +1,5 @@
 #include "mul_add_bcast.cuh"
+#include "unary.cuh"   // ggml_cuda_op_gelu_single (bit-exact tanh-GELU)
 
 // Fused: dst = x + y * gate, with gate broadcast across the MUL's bcast dim.
 //
@@ -13,13 +14,24 @@
 // M=n_token/T, T=frames, Nb=batch), gate shape [d0, 1, T, Nb]. Detection in
 // ggml-cuda.cu ensures we only fire here.
 
-template <bool HAS_SHIFT>
-__global__ void __launch_bounds__(256) mul_add_bcast_dim1_f32_kernel(
-    const float * __restrict__ x,
-    const float * __restrict__ y,
-    const float * __restrict__ gate,
-    const float * __restrict__ shift, // [d0,1,d2,Nb] bcast (same layout as gate); read only if HAS_SHIFT
-    float       * __restrict__ dst,
+// load-as-float / store-from-float + per-dst-precision rounding helpers (shared with
+// the same-shape kernel below) so the SAME broadcast kernel serves the F32 prod path
+// AND the F16 dit_f16 residual stream. BIG = x/y/dst element type, MOD = gate/shift type.
+__device__ __forceinline__ float ld_f(float v) { return v; }
+__device__ __forceinline__ float ld_f(__half v) { return __half2float(v); }
+template <typename T> __device__ __forceinline__ float round_big(float v);
+template <> __device__ __forceinline__ float round_big<float>(float v) { return v; }
+template <> __device__ __forceinline__ float round_big<__half>(float v) { return __half2float(__float2half_rn(v)); }
+__device__ __forceinline__ void st_f(float * p, float v) { *p = v; }
+__device__ __forceinline__ void st_f(__half * p, float v) { *p = __float2half_rn(v); }
+
+template <bool HAS_SHIFT, typename BIG, typename MOD>
+__global__ void __launch_bounds__(256) mul_add_bcast_dim1_kernel(
+    const BIG * __restrict__ x,
+    const BIG * __restrict__ y,
+    const MOD * __restrict__ gate,
+    const MOD * __restrict__ shift, // [d0,1,d2,Nb] bcast (same layout as gate); read only if HAS_SHIFT
+    BIG       * __restrict__ dst,
     const int64_t n_elem,
     const int64_t d0,        // innermost dim (== ne00 of MUL)
     const int64_t d1,        // broadcast dim length on y/x (gate has 1 here)
@@ -49,21 +61,21 @@ __global__ void __launch_bounds__(256) mul_add_bcast_dim1_f32_kernel(
     const int64_t g_idx = i_b * gate_d0d2 + i_t * d0 + i_c;
     (void) row_stride; (void) plane_d1; (void) plane_d2;
 
-    const float xv = x[t];
-    const float yv = y[t];
-    const float gv = gate[g_idx];
+    const float xv = ld_f(x[t]);
+    const float yv = ld_f(y[t]);
+    const float gv = ld_f(gate[g_idx]);
 
-    // __fmul_rn + __fadd_rn → two independent IEEE-roundings, matching the
-    // unfused MUL+ADD chain exactly. -use_fast_math compiles `x + y*g` to FMA
-    // (one rounding) which would drift by ULP and fail PSNR 99.
-    float r = __fadd_rn(xv, __fmul_rn(yv, gv));
+    // Round to BIG precision after the mul and each add to reproduce the unfused
+    // MUL+ADD chain's intermediate roundings exactly (F32: __f*_rn only; F16:
+    // round-to-half each step, matching ggml's k_bin_bcast<…,__half>). FMA
+    // (single rounding) would drift by ULP and fail PSNR 99.
+    float r = round_big<BIG>(__fadd_rn(xv, round_big<BIG>(__fmul_rn(yv, gv))));
     if (HAS_SHIFT) {
-        // flux AdaLN: fold the trailing broadcast `+ shift` (same [d0,1,d2,Nb]
-        // layout as gate). The extra __fadd_rn matches the standalone bcast-ADD
-        // it replaces (single rounding) → bit-exact vs the unfused 3-op chain.
-        r = __fadd_rn(r, shift[g_idx]);
+        // flux/LTX AdaLN: fold the trailing broadcast `+ shift` (same [d0,1,d2,Nb]
+        // layout as gate) → bit-exact vs the unfused 3-op chain.
+        r = round_big<BIG>(__fadd_rn(r, ld_f(shift[g_idx])));
     }
-    dst[t] = r;
+    st_f(&dst[t], r);
 }
 
 // ---------------------------------------------------------------------------
@@ -74,20 +86,7 @@ __global__ void __launch_bounds__(256) mul_add_bcast_dim1_f32_kernel(
 // chain ran as 3 separate full-size kernels (~17% of the DiT). This fuses it
 // to one pass. Bit-exact: __fmul_rn + __fadd_rn = the same independent
 // roundings as the unfused MUL/ADD chain (no FMA contraction).
-// load-as-float / store-from-float + per-dst-precision rounding helpers, so the
-// SAME fused kernel serves the F32 prod path AND the F16 dit_f16 residual stream.
-// BIG = x/y/dst element type (F32 or F16 — the residual stream), MOD = g/shift type
-// (F32 — the modulation tables). Rounding to BIG at each step reproduces the unfused
-// chain's intermediate roundings exactly (F32: __f*_rn only; F16: round to half after
-// the mul and each add, matching ggml's k_bin_bcast<…,__half> mul/add) → bit-identical.
-__device__ __forceinline__ float ld_f(float v) { return v; }
-__device__ __forceinline__ float ld_f(__half v) { return __half2float(v); }
-template <typename T> __device__ __forceinline__ float round_big(float v);
-template <> __device__ __forceinline__ float round_big<float>(float v) { return v; }
-template <> __device__ __forceinline__ float round_big<__half>(float v) { return __half2float(__float2half_rn(v)); }
-__device__ __forceinline__ void st_f(float * p, float v) { *p = v; }
-__device__ __forceinline__ void st_f(__half * p, float v) { *p = __float2half_rn(v); }
-
+// (ld_f / round_big / st_f shared helpers are defined above, near mul_add_bcast_dim1_kernel.)
 template <bool HAS_SHIFT, typename BIG, typename MOD>
 __global__ void __launch_bounds__(256) fused_madd_same_kernel(
     const BIG * __restrict__ x,
@@ -220,10 +219,13 @@ void ggml_cuda_op_mul_add_bcast(ggml_backend_cuda_context & ctx,
                                 const ggml_tensor *         y_view,
                                 const ggml_tensor *         gate,
                                 const ggml_tensor *         shift) {
-    GGML_ASSERT(x->type == GGML_TYPE_F32);
-    GGML_ASSERT(y_view->type == GGML_TYPE_F32);
+    // BIG = x/y/dst type (F32 prod path, or F16 dit_f16 residual stream); MOD = gate/shift
+    // type (the modulation tables, always F32). The detector guarantees x/y_view/add share BIG.
+    const bool big_f16 = (add_n->type == GGML_TYPE_F16);
+    GGML_ASSERT(add_n->type == GGML_TYPE_F32 || add_n->type == GGML_TYPE_F16);
+    GGML_ASSERT(x->type == add_n->type);
+    GGML_ASSERT(y_view->type == add_n->type);
     GGML_ASSERT(gate->type == GGML_TYPE_F32);
-    GGML_ASSERT(add_n->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(x));
     GGML_ASSERT(ggml_is_contiguous(gate));
     GGML_ASSERT(ggml_is_contiguous(add_n));
@@ -262,27 +264,76 @@ void ggml_cuda_op_mul_add_bcast(ggml_backend_cuda_context & ctx,
     while (y_buf->view_src != nullptr) {
         y_buf = y_buf->view_src;
     }
-    GGML_ASSERT(y_buf->type == GGML_TYPE_F32);
+    GGML_ASSERT(y_buf->type == add_n->type);
     GGML_ASSERT(ggml_is_contiguous(y_buf));
     GGML_ASSERT(ggml_nelements(y_buf) == n_elem);
 
-    const float * x_d     = (const float *) x->data;
-    const float * y_d     = (const float *) y_buf->data;
-    const float * gate_d  = (const float *) gate->data;
-    const float * shift_d = shift ? (const float *) shift->data : nullptr;
-    float       * dst_d   = (float *)       add_n->data;
-
+    const bool has_shift = (shift != nullptr);
     const int     block_size = 256;
     const int64_t num_blocks = (n_elem + block_size - 1) / block_size;
     GGML_ASSERT(num_blocks <= (1LL << 31) - 1);
 
-    auto kern = shift_d ? mul_add_bcast_dim1_f32_kernel<true>
-                        : mul_add_bcast_dim1_f32_kernel<false>;
-    kern<<<(int)num_blocks, block_size, 0, ctx.stream()>>>(
-        x_d, y_d, gate_d, shift_d, dst_d,
-        n_elem, d0, d1, d2,
-        /*row_stride=*/ d0,
-        /*plane_d1  =*/ d0 * d1,
-        /*plane_d2  =*/ d0 * d2,
-        /*gate_d0d2 =*/ d0 * d2);
+#define MAB_LAUNCH(BIG)                                                                  \
+    do {                                                                                 \
+        const BIG  * x_d     = (const BIG  *) x->data;                                   \
+        const BIG  * y_d     = (const BIG  *) y_buf->data;                               \
+        const float * gate_d  = (const float *) gate->data;                             \
+        const float * shift_d = shift ? (const float *) shift->data : nullptr;          \
+        BIG        * dst_d   = (BIG  *)       add_n->data;                               \
+        auto kern = has_shift ? mul_add_bcast_dim1_kernel<true,  BIG, float>             \
+                              : mul_add_bcast_dim1_kernel<false, BIG, float>;            \
+        kern<<<(int)num_blocks, block_size, 0, ctx.stream()>>>(                          \
+            x_d, y_d, gate_d, shift_d, dst_d,                                            \
+            n_elem, d0, d1, d2,                                                          \
+            /*row_stride=*/ d0, /*plane_d1=*/ d0 * d1,                                   \
+            /*plane_d2 =*/ d0 * d2, /*gate_d0d2=*/ d0 * d2);                             \
+    } while (0)
+
+    if (big_f16) { MAB_LAUNCH(__half); }
+    else         { MAB_LAUNCH(float);  }
+#undef MAB_LAUNCH
+}
+
+// dst = gelu(x + bias), bias broadcast on dims 1..3 ([d0,1,1,1] over [d0, tokens]).
+// Reproduces the unfused ADD(bias)→GELU chain exactly: the add stores BIG (round to
+// half for F16), GELU then reads that BIG value, applies ggml's tanh-approx op_gelu in
+// float, and stores BIG. round_big at each BIG-typed boundary keeps it bit-identical.
+template <typename BIG>
+__global__ void __launch_bounds__(256) bias_gelu_kernel(
+    const BIG * __restrict__ x,
+    const float * __restrict__ bias,
+    BIG       * __restrict__ dst,
+    const int64_t n_elem,
+    const int64_t d0) {
+    const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_elem) {
+        return;
+    }
+    const int64_t g = t % d0;
+    const float biased = round_big<BIG>(__fadd_rn(ld_f(x[t]), bias[g]));  // matches add's BIG store
+    st_f(&dst[t], ggml_cuda_op_gelu_single(biased));                     // gelu then BIG store
+}
+
+void ggml_cuda_op_bias_gelu(ggml_backend_cuda_context & ctx,
+                            ggml_tensor *               gelu_n,
+                            const ggml_tensor *         x,
+                            const ggml_tensor *         bias) {
+    const int64_t n_elem = ggml_nelements(gelu_n);
+    const int64_t d0     = gelu_n->ne[0];
+    GGML_ASSERT(gelu_n->type == GGML_TYPE_F32 || gelu_n->type == GGML_TYPE_F16);
+    GGML_ASSERT(x->type == gelu_n->type);
+    GGML_ASSERT(bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(x) == n_elem);
+    GGML_ASSERT(bias->ne[0] == d0);
+    const int     block_size = 256;
+    const int64_t num_blocks = (n_elem + block_size - 1) / block_size;
+    GGML_ASSERT(num_blocks <= (1LL << 31) - 1);
+    const float * bias_d = (const float *) bias->data;
+    if (gelu_n->type == GGML_TYPE_F16) {
+        bias_gelu_kernel<__half><<<(int)num_blocks, block_size, 0, ctx.stream()>>>(
+            (const __half *) x->data, bias_d, (__half *) gelu_n->data, n_elem, d0);
+    } else {
+        bias_gelu_kernel<float><<<(int)num_blocks, block_size, 0, ctx.stream()>>>(
+            (const float *) x->data, bias_d, (float *) gelu_n->data, n_elem, d0);
+    }
 }

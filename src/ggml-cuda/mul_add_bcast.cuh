@@ -26,3 +26,15 @@ void ggml_cuda_op_fused_madd_same(ggml_backend_cuda_context & ctx,
                                   const ggml_tensor *         y,
                                   const ggml_tensor *         g,
                                   const ggml_tensor *         shift = nullptr);
+
+// Fused bias-add + GELU: dst = gelu(x + bias), bias broadcast on dims 1..3
+// ([d0,1,1,1] over [d0,tokens]). Covers the FFN w1 path (ggml_ext_linear's
+// add_inplace(bias) immediately followed by ggml_gelu_inplace) — the bias-add
+// otherwise runs as a full-width op_add<half,float,half> over the 4x-wide
+// [inner_dim, tokens] intermediate. Bit-exact: rounds to BIG after the add
+// (matching the half store) then GELU (matching ggml's op_gelu single-precision
+// tanh approximation) and rounds to BIG on store.
+void ggml_cuda_op_bias_gelu(ggml_backend_cuda_context & ctx,
+                            ggml_tensor *               gelu_n,  // final dst (output buffer)
+                            const ggml_tensor *         x,       // matmul output (ADD's src0)
+                            const ggml_tensor *         bias);   // 1D bias (ADD's src1, broadcast)
