@@ -19,6 +19,8 @@
 #include <cfloat>
 #include <mutex>
 #include <unordered_map>
+#include <map>
+#include <tuple>
 
 // SWIZZLE_32_4_4 offset over a (rows x col_length) UE4M3 scale grid (comfy float_utils)
 __device__ __forceinline__ size_t swz_off(size_t row, size_t col, uint32_t col_len) {
@@ -69,7 +71,14 @@ static __global__ void repack_weight_kernel(const block_nvfp4 * __restrict__ W,
 __device__ __forceinline__ float nvfp4_load_act(const float & v) { return v; }
 __device__ __forceinline__ float nvfp4_load_act(const half  & v) { return __half2float(v); }
 
-template <typename act_t>
+// REFINE=true runs the ggml-MMQ ±2 scale-refinement search (5 candidate scale codes,
+// each re-quantizing the 16-lane sub-block and keeping the min-reconstruction-error one).
+// REFINE=false is comfy/ModelOpt's native one-shot scaled_mm quantization: scale =
+// ue4m3(amax/6), quantize once, no search. The DiT runs 100% on cuBLASLt (no MMQ to match)
+// and comfy — our quality target — ships the one-shot path, so REFINE=false is both faster
+// (~5x less quant work) and quantization-equivalent to the reference. Gated by
+// GGML_NVFP4_QUANT_NOREFINE; default keeps the refinement so flux2/prod are byte-untouched.
+template <typename act_t, bool REFINE>
 static __global__ void quant_act_kernel(const act_t * __restrict__ X,
                                         uint8_t * __restrict__ out_data,    // M*(K/2)
                                         uint8_t * __restrict__ out_scales,  // swizzled
@@ -85,23 +94,30 @@ static __global__ void quant_act_kernel(const act_t * __restrict__ X,
     #pragma unroll
     for (int j=0;j<16;j++) { vals[j]=nvfp4_load_act(x[j]); amax = fmaxf(amax, fabsf(vals[j])); }
 
-    static constexpr int test_offsets[5] = {0,-1,1,-2,2};
     const int first_code = (int) ggml_cuda_fp32_to_ue4m3(amax/6.0f);
-    float best_err = FLT_MAX; uint8_t fp8_code = 0; float subblock_scale = 0.f;
-    #pragma unroll
-    for (int i=0;i<5;i++) {
-        const int tc = first_code + test_offsets[i];
-        if (tc < 0 || tc > 0x7e) continue;
-        const float ts = ggml_cuda_ue4m3_to_fp32((uint8_t)tc);
-        const float tinv = ts > 0.f ? 0.5f/ts : 0.f;
-        float err = 0.f;
+    uint8_t fp8_code; float subblock_scale;
+    if (REFINE) {
+        static constexpr int test_offsets[5] = {0,-1,1,-2,2};
+        float best_err = FLT_MAX; fp8_code = 0; subblock_scale = 0.f;
         #pragma unroll
-        for (int k=0;k<16;k++) {
-            const uint8_t q = ggml_cuda_float_to_fp4_e2m1(vals[k], tinv);
-            const float ed = fabsf(vals[k]) - fabsf(kvalues_mxfp4[q & 0x7]) * ts;
-            err = fmaf(ed, ed, err);
+        for (int i=0;i<5;i++) {
+            const int tc = first_code + test_offsets[i];
+            if (tc < 0 || tc > 0x7e) continue;
+            const float ts = ggml_cuda_ue4m3_to_fp32((uint8_t)tc);
+            const float tinv = ts > 0.f ? 0.5f/ts : 0.f;
+            float err = 0.f;
+            #pragma unroll
+            for (int k=0;k<16;k++) {
+                const uint8_t q = ggml_cuda_float_to_fp4_e2m1(vals[k], tinv);
+                const float ed = fabsf(vals[k]) - fabsf(kvalues_mxfp4[q & 0x7]) * ts;
+                err = fmaf(ed, ed, err);
+            }
+            if (err < best_err) { best_err = err; fp8_code = (uint8_t)tc; subblock_scale = ts; }
         }
-        if (err < best_err) { best_err = err; fp8_code = (uint8_t)tc; subblock_scale = ts; }
+    } else {
+        const int tc = first_code < 0 ? 0 : (first_code > 0x7e ? 0x7e : first_code);
+        fp8_code = (uint8_t)tc;
+        subblock_scale = ggml_cuda_ue4m3_to_fp32((uint8_t)tc);
     }
     out_scales[swz_off(r, ss, nsub)] = fp8_code;
     const float inv_scale = subblock_scale > 0.f ? 0.5f/subblock_scale : 0.f;
@@ -289,14 +305,17 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     ggml_cuda_pool_alloc<uint8_t> a_scales(ctx.pool(), a_scale_bytes);
     cudaMemsetAsync(a_scales.get(), 0, a_scale_bytes, stream);
     {
+        static int s_norefine = -1;
+        if (s_norefine < 0) { const char* e = getenv("GGML_NVFP4_QUANT_NOREFINE"); s_norefine = (e && atoi(e)) ? 1 : 0; }
         const int threads = 256;
         const int total   = M*nsub;
+        const int blocks  = (total+threads-1)/threads;
         if (src1->type == GGML_TYPE_F16) {
-            quant_act_kernel<<<(total+threads-1)/threads, threads, 0, stream>>>(
-                (const half*)src1->data, a_data.get(), a_scales.get(), M, K);
+            if (s_norefine) quant_act_kernel<half,false><<<blocks, threads, 0, stream>>>((const half*)src1->data, a_data.get(), a_scales.get(), M, K);
+            else            quant_act_kernel<half,true ><<<blocks, threads, 0, stream>>>((const half*)src1->data, a_data.get(), a_scales.get(), M, K);
         } else {
-            quant_act_kernel<<<(total+threads-1)/threads, threads, 0, stream>>>(
-                (const float*)src1->data, a_data.get(), a_scales.get(), M, K);
+            if (s_norefine) quant_act_kernel<float,false><<<blocks, threads, 0, stream>>>((const float*)src1->data, a_data.get(), a_scales.get(), M, K);
+            else            quant_act_kernel<float,true ><<<blocks, threads, 0, stream>>>((const float*)src1->data, a_data.get(), a_scales.get(), M, K);
         }
         if (cudaPeekAtLastError() != cudaSuccess) return false;
     }
@@ -330,24 +349,53 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
 
     ggml_cuda_pool_alloc<uint8_t> ws(ctx.pool(), 32*1024*1024);
     size_t wsz = 32*1024*1024;
-    cublasLtMatmulPreference_t pref=nullptr;
-    cublasLtMatmulPreferenceCreate(&pref);
-    cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsz, sizeof(wsz));
-    cublasLtMatmulHeuristicResult_t hr={}; int got=0;
-    cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(lt, op, Ad, Bd, Cd, Dd, pref, 1, &hr, &got);
 
-    bool ok = (hs == CUBLAS_STATUS_SUCCESS && got > 0);
+    // Per-shape ALGO cache (thread_local; g_lt is thread_local and the offload path runs
+    // the GEMM on worker threads, so a per-thread cache needs no lock). The cuBLASLt
+    // heuristic query is the expensive, host-serializing part of each call AND the source
+    // of run-to-run non-determinism (it can return a different algo per call → two
+    // identical configs diverge). The selected algo is a pure function of the problem
+    // (m,n,k,out_dt) + layouts, so caching it and reusing with freshly-created (but
+    // identical) descriptors/layouts — the standard cuBLASLt reuse idiom — removes the
+    // query and pins one algo for determinism. Descriptors stay per-call (cheap; reusing
+    // the desc objects + re-setting scale pointers tripped an illegal access). Escape
+    // hatch GGML_NVFP4_CUBLASLT_NOCACHE forces a fresh heuristic every call.
+    static int s_nocache = -1;
+    if (s_nocache < 0) { const char* e = getenv("GGML_NVFP4_CUBLASLT_NOCACHE"); s_nocache = (e && atoi(e)) ? 1 : 0; }
+    static thread_local std::map<std::tuple<int,int,int,int>, cublasLtMatmulAlgo_t> g_algo_cache;
+    const auto key = std::make_tuple(m, n, k, (int)out_dt);
+
+    cublasLtMatmulAlgo_t algo;
+    bool have_algo = false;
+    if (!s_nocache) {
+        auto it = g_algo_cache.find(key);
+        if (it != g_algo_cache.end()) { algo = it->second; have_algo = true; }
+    }
+    if (!have_algo) {
+        cublasLtMatmulPreference_t pref=nullptr;
+        cublasLtMatmulPreferenceCreate(&pref);
+        cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsz, sizeof(wsz));
+        cublasLtMatmulHeuristicResult_t hr={}; int got=0;
+        cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(lt, op, Ad, Bd, Cd, Dd, pref, 1, &hr, &got);
+        if (pref) cublasLtMatmulPreferenceDestroy(pref);
+        if (hs == CUBLAS_STATUS_SUCCESS && got > 0) {
+            algo = hr.algo; have_algo = true;
+            if (!s_nocache) g_algo_cache[key] = algo;
+        }
+    }
+
+    bool ok = have_algo;
     if (ok) {
         cublasStatus_t ms = cublasLtMatmul(lt, op, &alpha_h, w_data.get(), Ad, a_data.get(), Bd,
                                            &beta_h, dst->data, Cd, dst->data, Dd,
-                                           &hr.algo, ws.get(), wsz, stream);
+                                           &algo, ws.get(), wsz, stream);
         ok = (ms == CUBLAS_STATUS_SUCCESS);
     }
 
     if (ok) {
         static int n_handled = 0;
         if (n_handled++ == 0 || getenv("GGML_NVFP4_CUBLASLT_TRACE"))
-            fprintf(stderr, "[NVFP4_CUBLASLT] handled mul_mat #%d  M=%d K=%d N=%d (cuBLASLt FP4 GEMM)\n",
+            fprintf(stderr, "[NVFP4_CUBLASLT] handled mul_mat #%d  M=%d K=%d N=%d (cuBLASLt FP4 GEMM, algo-cached)\n",
                     n_handled, M, K, N);
         if (getenv("GGML_NVFP4_NANCHECK") && dst->type == GGML_TYPE_F32) {
             float h[8] = {0};
@@ -361,7 +409,6 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
         }
     }
 
-    if (pref) cublasLtMatmulPreferenceDestroy(pref);
     if (Ad) cublasLtMatrixLayoutDestroy(Ad);
     if (Bd) cublasLtMatrixLayoutDestroy(Bd);
     if (Cd) cublasLtMatrixLayoutDestroy(Cd);
