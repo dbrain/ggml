@@ -74,23 +74,38 @@ __global__ void __launch_bounds__(256) mul_add_bcast_dim1_f32_kernel(
 // chain ran as 3 separate full-size kernels (~17% of the DiT). This fuses it
 // to one pass. Bit-exact: __fmul_rn + __fadd_rn = the same independent
 // roundings as the unfused MUL/ADD chain (no FMA contraction).
-template <bool HAS_SHIFT>
-__global__ void __launch_bounds__(256) fused_madd_same_f32_kernel(
-    const float * __restrict__ x,
-    const float * __restrict__ y,
-    const float * __restrict__ g,
-    const float * __restrict__ shift,  // same layout as x; read only if HAS_SHIFT
-    float       * __restrict__ dst,
+// load-as-float / store-from-float + per-dst-precision rounding helpers, so the
+// SAME fused kernel serves the F32 prod path AND the F16 dit_f16 residual stream.
+// BIG = x/y/dst element type (F32 or F16 — the residual stream), MOD = g/shift type
+// (F32 — the modulation tables). Rounding to BIG at each step reproduces the unfused
+// chain's intermediate roundings exactly (F32: __f*_rn only; F16: round to half after
+// the mul and each add, matching ggml's k_bin_bcast<…,__half> mul/add) → bit-identical.
+__device__ __forceinline__ float ld_f(float v) { return v; }
+__device__ __forceinline__ float ld_f(__half v) { return __half2float(v); }
+template <typename T> __device__ __forceinline__ float round_big(float v);
+template <> __device__ __forceinline__ float round_big<float>(float v) { return v; }
+template <> __device__ __forceinline__ float round_big<__half>(float v) { return __half2float(__float2half_rn(v)); }
+__device__ __forceinline__ void st_f(float * p, float v) { *p = v; }
+__device__ __forceinline__ void st_f(__half * p, float v) { *p = __float2half_rn(v); }
+
+template <bool HAS_SHIFT, typename BIG, typename MOD>
+__global__ void __launch_bounds__(256) fused_madd_same_kernel(
+    const BIG * __restrict__ x,
+    const BIG * __restrict__ y,
+    const MOD * __restrict__ g,
+    const MOD * __restrict__ shift,  // same layout as x; read only if HAS_SHIFT
+    BIG       * __restrict__ dst,
     const int64_t n_elem) {
     const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_elem) {
         return;
     }
-    float r = __fadd_rn(x[t], __fmul_rn(y[t], g[t]));
+    float m = round_big<BIG>(__fmul_rn(ld_f(y[t]), ld_f(g[t])));
+    float r = round_big<BIG>(__fadd_rn(ld_f(x[t]), m));
     if (HAS_SHIFT) {
-        r = __fadd_rn(r, shift[t]);
+        r = round_big<BIG>(__fadd_rn(r, ld_f(shift[t])));
     }
-    dst[t] = r;
+    st_f(&dst[t], r);
 }
 
 // Same-shape fused multiply-add with a STRIDED gate (dst = x + y*g [+ shift]).
@@ -101,18 +116,18 @@ __global__ void __launch_bounds__(256) fused_madd_same_f32_kernel(
 // stay flat-contiguous. For the LTX permute the gate data IS contiguous (the permute
 // only reorders a size-1 dim), so g[g_idx] reads exactly what g[t] would on a
 // contiguous gate -> bit-identical to the flat path. Bit-exact (__fmul_rn + __fadd_rn).
-template <bool HAS_SHIFT>
-__global__ void __launch_bounds__(256) fused_madd_same_strided_g_f32_kernel(
-    const float * __restrict__ x,
-    const float * __restrict__ y,
-    const float * __restrict__ g,      // strided gate (may be non-contiguous)
-    const float * __restrict__ shift,  // flat, same layout as x; read only if HAS_SHIFT
-    float       * __restrict__ dst,
+template <bool HAS_SHIFT, typename BIG, typename MOD>
+__global__ void __launch_bounds__(256) fused_madd_same_strided_g_kernel(
+    const BIG * __restrict__ x,
+    const BIG * __restrict__ y,
+    const MOD * __restrict__ g,      // strided gate (may be non-contiguous)
+    const MOD * __restrict__ shift,  // flat, same layout as x; read only if HAS_SHIFT
+    BIG       * __restrict__ dst,
     const int64_t n_elem,
     const int64_t ne0,
     const int64_t ne1,
     const int64_t ne2,
-    const int64_t gs0,   // g strides in ELEMENTS (g->nb / sizeof(float))
+    const int64_t gs0,   // g strides in ELEMENTS (g->nb / sizeof(MOD))
     const int64_t gs1,
     const int64_t gs2,
     const int64_t gs3) {
@@ -126,11 +141,12 @@ __global__ void __launch_bounds__(256) fused_madd_same_strided_g_f32_kernel(
     const int64_t i2 = rem % ne2; rem /= ne2;
     const int64_t i3 = rem;
     const int64_t g_idx = i0 * gs0 + i1 * gs1 + i2 * gs2 + i3 * gs3;
-    float r = __fadd_rn(x[t], __fmul_rn(y[t], g[g_idx]));
+    float m = round_big<BIG>(__fmul_rn(ld_f(y[t]), ld_f(g[g_idx])));
+    float r = round_big<BIG>(__fadd_rn(ld_f(x[t]), m));
     if (HAS_SHIFT) {
-        r = __fadd_rn(r, shift[t]);
+        r = round_big<BIG>(__fadd_rn(r, ld_f(shift[t])));
     }
-    dst[t] = r;
+    st_f(&dst[t], r);
 }
 
 // x = residual side of the ADD; y,g = the two MUL operands (dst = x + y*g).
@@ -150,42 +166,51 @@ void ggml_cuda_op_fused_madd_same(ggml_backend_cuda_context & ctx,
         GGML_ASSERT(ggml_nelements(shift) == n_elem);
     }
 
-    // Use each tensor's own ->data, which already includes any view offset
-    // (ggml-backend sets a view's data = view_src->data + view_offs at alloc).
-    // The previous code resolved to view_src->data, which DROPPED the offset and
-    // read from element 0 of the base buffer — fine when operands are full tensors
-    // (NAVA avatar AdaLN, offset 0) but corrupt when they are offset views into a
-    // larger tensor (LTX-2.3 ltxav modulation slices scale/shift) → fuzzy mush.
-    // dst already used add_n->data directly; match that for the inputs.
-    const float * x_d     = (const float *) x->data;
-    const float * y_d     = (const float *) y->data;
-    const float * g_d     = (const float *) g->data;
-    const float * shift_d = shift ? (const float *) shift->data : nullptr;
-    float       * dst_d   = (float *) add_n->data;
-
+    // BIG = x/y/dst type (F32 prod, or F16 dit_f16 residual stream); MOD = g/shift type
+    // (the modulation tables, always F32). The detector guarantees x/y/dst share BIG and
+    // g/shift share MOD. Use each tensor's own ->data (already includes any view offset:
+    // ggml-backend sets a view's data = view_src->data + view_offs; resolving to
+    // view_src->data would DROP the offset and read element 0 — corrupts LTX modulation
+    // slices). dst used add_n->data directly; match that for the inputs.
+    const bool big_f16 = (add_n->type == GGML_TYPE_F16);
+    const bool mod_f16 = (g->type == GGML_TYPE_F16);
     const int     block_size = 256;
     const int64_t num_blocks = (n_elem + block_size - 1) / block_size;
     GGML_ASSERT(num_blocks <= (1LL << 31) - 1);
 
-    if (ggml_is_contiguous(g)) {
-        auto kern = shift_d ? fused_madd_same_f32_kernel<true> : fused_madd_same_f32_kernel<false>;
-        kern<<<(int) num_blocks, block_size, 0, ctx.stream()>>>(x_d, y_d, g_d, shift_d, dst_d, n_elem);
+    // dispatch on (BIG, MOD) — only the two real combos are instantiated:
+    // (F32,F32) prod path, (F16,F32) the dit_f16 residual stream. The strided-g
+    // variant handles the LTX align_token_modulation permute (non-contiguous gate).
+#define FMS_LAUNCH(BIG, MOD)                                                                                    \
+    do {                                                                                                       \
+        const BIG * x_d = (const BIG *) x->data;                                                               \
+        const BIG * y_d = (const BIG *) y->data;                                                               \
+        const MOD * g_d = (const MOD *) g->data;                                                               \
+        const MOD * shift_d = shift ? (const MOD *) shift->data : nullptr;                                     \
+        BIG       * dst_d = (BIG *) add_n->data;                                                               \
+        if (ggml_is_contiguous(g)) {                                                                           \
+            auto kern = shift_d ? fused_madd_same_kernel<true, BIG, MOD> : fused_madd_same_kernel<false, BIG, MOD>; \
+            kern<<<(int) num_blocks, block_size, 0, ctx.stream()>>>(x_d, y_d, g_d, shift_d, dst_d, n_elem);    \
+        } else {                                                                                               \
+            GGML_ASSERT(ggml_are_same_shape(g, add_n));                                                        \
+            const int64_t gs0 = g->nb[0] / sizeof(MOD), gs1 = g->nb[1] / sizeof(MOD);                          \
+            const int64_t gs2 = g->nb[2] / sizeof(MOD), gs3 = g->nb[3] / sizeof(MOD);                          \
+            auto kern = shift_d ? fused_madd_same_strided_g_kernel<true, BIG, MOD>                             \
+                                : fused_madd_same_strided_g_kernel<false, BIG, MOD>;                           \
+            kern<<<(int) num_blocks, block_size, 0, ctx.stream()>>>(                                          \
+                x_d, y_d, g_d, shift_d, dst_d, n_elem,                                                         \
+                add_n->ne[0], add_n->ne[1], add_n->ne[2], gs0, gs1, gs2, gs3);                                 \
+        }                                                                                                      \
+    } while (0)
+
+    if (!big_f16 && !mod_f16) {
+        FMS_LAUNCH(float, float);
+    } else if (big_f16 && !mod_f16) {
+        FMS_LAUNCH(__half, float);
     } else {
-        // Strided gate (LTX align_token_modulation permute). Decode the flat index over
-        // the contiguous iteration shape (== add_n / mul_n shape) and gather g via its
-        // own strides. x/y/dst/shift stay flat-contiguous.
-        GGML_ASSERT(ggml_are_same_shape(g, add_n));
-        const int64_t gs0 = g->nb[0] / sizeof(float);
-        const int64_t gs1 = g->nb[1] / sizeof(float);
-        const int64_t gs2 = g->nb[2] / sizeof(float);
-        const int64_t gs3 = g->nb[3] / sizeof(float);
-        auto kern = shift_d ? fused_madd_same_strided_g_f32_kernel<true>
-                            : fused_madd_same_strided_g_f32_kernel<false>;
-        kern<<<(int) num_blocks, block_size, 0, ctx.stream()>>>(
-            x_d, y_d, g_d, shift_d, dst_d, n_elem,
-            add_n->ne[0], add_n->ne[1], add_n->ne[2],
-            gs0, gs1, gs2, gs3);
+        GGML_ABORT("fused_madd_same: unsupported type combo (BIG f16=%d, MOD f16=%d)", big_f16, mod_f16);
     }
+#undef FMS_LAUNCH
 }
 
 void ggml_cuda_op_mul_add_bcast(ggml_backend_cuda_context & ctx,

@@ -4729,7 +4729,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // the gate via its strides). Set GGML_CUDA_NO_STRIDED_GATE_FUSE to force the old
     // conservative no-fuse path for that case (clean A/B isolation).
     static const bool strided_gate_fuse_disabled = (getenv("GGML_CUDA_NO_STRIDED_GATE_FUSE") != nullptr);
-    if (!madd_fuse_disabled && node->op == GGML_OP_MUL && node->type == GGML_TYPE_F32 &&
+    if (!madd_fuse_disabled && node->op == GGML_OP_MUL &&
+        (node->type == GGML_TYPE_F32 || node->type == GGML_TYPE_F16) &&
         ggml_is_contiguous(node) && ggml_node_get_use_count(cgraph, i) == 1) {
         auto is_view_like = [](ggml_op op) {
             return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
@@ -4748,13 +4749,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         // The `y` operand must be contiguous F32 (flat-read); the `gate` operand may be
         // a strided/permuted view of the SAME shape (kernel reads it via its strides).
         // Identify which operand is contiguous (= y); the other is the gate.
+        // y = the "big" operand (same type as the MUL output — F32 prod, or F16 for the
+        // dit_f16 residual stream) and contiguous; g = the modulation operand (F32, may
+        // be a strided/permuted view). The fused kernel reads each at its own type and
+        // rounds to the BIG precision per step → bit-identical to the unfused chain.
         ggml_tensor * y_op = nullptr;
         ggml_tensor * g_op = nullptr;
-        if (a && b && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
-            ggml_nelements(a) == n_elem && ggml_nelements(b) == n_elem) {
-            if (ggml_is_contiguous(a))      { y_op = a; g_op = b; }
-            else if (ggml_is_contiguous(b)) { y_op = b; g_op = a; }
+        if (a && b && ggml_nelements(a) == n_elem && ggml_nelements(b) == n_elem) {
+            if (a->type == node->type && ggml_is_contiguous(a))      { y_op = a; g_op = b; }
+            else if (b->type == node->type && ggml_is_contiguous(b)) { y_op = b; g_op = a; }
         }
+        // only the (BIG,MOD) combos the kernel instantiates: MOD (gate/shift) must be F32.
+        if (g_op && g_op->type != GGML_TYPE_F32) { y_op = nullptr; g_op = nullptr; }
         const bool g_strided = g_op && !ggml_is_contiguous(g_op);
         if (y_op && g_op && ggml_are_same_shape(g_op, mul_n) &&
             !(g_strided && strided_gate_fuse_disabled)) {
@@ -4770,7 +4776,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 } else if (trace_back(add_n->src[1]) == mul_n) {
                     x_side = add_n->src[0];
                 }
-                if (x_side && add_n->type == GGML_TYPE_F32 && x_side->type == GGML_TYPE_F32 &&
+                if (x_side && add_n->type == node->type && x_side->type == node->type &&
                     ggml_is_contiguous(add_n) && ggml_is_contiguous(x_side) &&
                     ggml_nelements(add_n) == n_elem && ggml_nelements(x_side) == n_elem) {
                     // Optional trailing same-shape ADD(_, shift): fold x + y*g + shift.
@@ -4789,7 +4795,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         } else if (trace_back(sadd->src[1]) == add_n) {
                             sshift = sadd->src[0];
                         }
-                        if (sshift && sadd->type == GGML_TYPE_F32 && sshift->type == GGML_TYPE_F32 &&
+                        if (sshift && sadd->type == node->type && sshift->type == GGML_TYPE_F32 &&
                             ggml_is_contiguous(sadd) && ggml_is_contiguous(sshift) &&
                             ggml_nelements(sadd) == n_elem && ggml_nelements(sshift) == n_elem) {
                             shift     = sshift;
