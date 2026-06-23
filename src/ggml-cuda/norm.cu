@@ -144,8 +144,13 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
 // (T_bias = F32) is full-width over the ne0 axis, indexed by `col` only and broadcast over
 // all rows/channels/samples (the bias is [ne0,1,1,1]). Default do_prebias=false leaves the
 // existing instantiations byte-identical.
+// T_mul: element type of the mul/add (modulation) broadcast operands. Defaults to T, so all
+// existing instantiations are unchanged. The fused AdaLN op (ggml_rms_modulate) sets T_mul
+// independently of T (e.g. x=half, scale/shift=float) and reads them in their own type — no
+// cast tensors. add_one: when true, the loaded mul value gets +1.0f (the intrinsic (1+scale)
+// of AdaLN); default false keeps the plain rms_norm*mul+add behaviour byte-identical.
 template <int block_size, bool do_multiply = false, bool do_add = false, typename T = float,
-          bool do_prebias = false, typename T_bias = float>
+          bool do_prebias = false, typename T_bias = float, typename T_mul = T, bool add_one = false>
 static __global__ void rms_norm_f32(const T *     x,
                                     T *           dst,
                                     const int     ncols,
@@ -153,7 +158,7 @@ static __global__ void rms_norm_f32(const T *     x,
                                     const int64_t stride_channel,
                                     const int64_t stride_sample,
                                     const float   eps,
-                                    const T *     mul                  = nullptr,
+                                    const T_mul * mul                  = nullptr,
                                     const int64_t mul_stride_row       = 0,
                                     const int64_t mul_stride_channel   = 0,
                                     const int64_t mul_stride_sample    = 0,
@@ -161,7 +166,7 @@ static __global__ void rms_norm_f32(const T *     x,
                                     const uint3   mul_nrows_packed     = make_uint3(0, 0, 0),
                                     const uint3   mul_nchannels_packed = make_uint3(0, 0, 0),
                                     const uint3   mul_nsamples_packed  = make_uint3(0, 0, 0),
-                                    const T *     add                  = nullptr,
+                                    const T_mul * add                  = nullptr,
                                     const int64_t add_stride_row       = 0,
                                     const int64_t add_stride_channel   = 0,
                                     const int64_t add_stride_sample    = 0,
@@ -230,7 +235,8 @@ static __global__ void rms_norm_f32(const T *     x,
         if constexpr (do_multiply && do_add) {
             const int mul_col = fastmodulo(col, mul_ncols_packed);
             const int add_col = fastmodulo(col, add_ncols_packed);
-            dst[col]          = (T)(scale * xb * (float) mul[mul_col] + (float) add[add_col]);
+            const float m     = (float) mul[mul_col] + (add_one ? 1.0f : 0.0f);
+            dst[col]          = (T)(scale * xb * m + (float) add[add_col]);
         } else if constexpr (do_multiply) {
             const int mul_col = fastmodulo(col, mul_ncols_packed);
             dst[col]          = (T)(scale * xb * (float) mul[mul_col]);
@@ -1159,6 +1165,152 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                               /*add_s00*/ add_s01, add_s02, add_s03,
                               add_ncols, add_nrows, add_nchannels, add_nsamples,
                               eps, stream);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ggml_rms_modulate — fused AdaLN: out = rms_norm(x)*(1+scale)+shift.
+// Mixed-type launcher: x/dst element type = T_x (half|float); scale/shift element
+// type = T_mod (half|float), read WITHOUT cast. Always mul+add with add_one (the +1
+// of (1+scale) lives in the kernel). Mirrors rms_norm_mul_f32_cuda's stride/fastdiv
+// setup but specialises T_mul=T_mod and add_one=true. Math/reduction stay FLOAT.
+template <typename T_x, typename T_mod>
+static void rms_modulate_cuda(const T_x *    x,
+                              const T_mod *  scale,
+                              const T_mod *  shift,
+                              T_x *          dst,
+                              const int      ncols,
+                              const int      nrows,
+                              const int      nchannels,
+                              const int      nsamples,
+                              const int64_t  stride_row,
+                              const int64_t  stride_channel,
+                              const int64_t  stride_sample,
+                              const int64_t  mul_stride_row,
+                              const int64_t  mul_stride_channel,
+                              const int64_t  mul_stride_sample,
+                              const uint32_t mul_ncols,
+                              const uint32_t mul_nrows,
+                              const uint32_t mul_nchannels,
+                              const uint32_t mul_nsamples,
+                              const int64_t  add_stride_row,
+                              const int64_t  add_stride_channel,
+                              const int64_t  add_stride_sample,
+                              const uint32_t add_ncols,
+                              const uint32_t add_nrows,
+                              const uint32_t add_nchannels,
+                              const uint32_t add_nsamples,
+                              const float    eps,
+                              cudaStream_t   stream) {
+    const dim3 blocks_num(nrows, nchannels, nsamples);
+
+    const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
+    const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
+    const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
+    const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
+
+    const uint3 add_ncols_packed     = init_fastdiv_values(add_ncols);
+    const uint3 add_nrows_packed     = init_fastdiv_values(add_nrows);
+    const uint3 add_nchannels_packed = init_fastdiv_values(add_nchannels);
+    const uint3 add_nsamples_packed  = init_fastdiv_values(add_nsamples);
+
+    if (ncols < 1024) {
+        const dim3 block_dims(256, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+        ggml_cuda_kernel_launch((rms_norm_f32<256, true, true, T_x, false, float, T_mod, true>), launch_params,
+            x, dst, ncols, stride_row, stride_channel, stride_sample, eps, scale, mul_stride_row, mul_stride_channel,
+            mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, shift,
+            add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
+            add_nchannels_packed, add_nsamples_packed,
+            (const float *) nullptr);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+        ggml_cuda_kernel_launch((rms_norm_f32<1024, true, true, T_x, false, float, T_mod, true>), launch_params,
+            x, dst, ncols, stride_row, stride_channel, stride_sample, eps, scale, mul_stride_row, mul_stride_channel,
+            mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, shift,
+            add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
+            add_nchannels_packed, add_nsamples_packed,
+            (const float *) nullptr);
+    }
+}
+
+void ggml_cuda_op_rms_modulate(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x     = dst->src[0]; // activation (pre-rms), F16 or F32
+    const ggml_tensor * scale = dst->src[1]; // modulation scale (mul), F16 or F32
+    const ggml_tensor * shift = dst->src[2]; // modulation shift (add), same type as scale
+
+    float eps = 0.0f;
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+    const void * x_d     = x->data;
+    const void * scale_d = scale->data;
+    const void * shift_d = shift->data;
+    void *       dst_d   = dst->data;
+    cudaStream_t stream  = ctx.stream();
+
+    // x/dst share type; scale/shift share type (MAY differ from x — the whole point: NO cast).
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16);
+    GGML_ASSERT(dst->type == x->type);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32 || scale->type == GGML_TYPE_F16);
+    GGML_ASSERT(shift->type == scale->type);
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int64_t ne00 = x->ne[0];
+    const int64_t ne01 = x->ne[1];
+    const int64_t ne02 = x->ne[2];
+    const int64_t ne03 = x->ne[3];
+
+    const size_t ts0 = ggml_type_size(x->type);
+    GGML_ASSERT(x->nb[0] == ts0);
+    const int64_t s01 = x->nb[1] / ts0;
+    const int64_t s02 = x->nb[2] / ts0;
+    const int64_t s03 = x->nb[3] / ts0;
+
+    const size_t ts_mul = ggml_type_size(scale->type);
+    GGML_ASSERT(scale->nb[0] == ts_mul);
+    const int64_t mul_s01 = scale->nb[1] / ts_mul;
+    const int64_t mul_s02 = scale->nb[2] / ts_mul;
+    const int64_t mul_s03 = scale->nb[3] / ts_mul;
+
+    const int mul_ncols     = scale->ne[0];
+    const int mul_nrows     = scale->ne[1];
+    const int mul_nchannels = scale->ne[2];
+    const int mul_nsamples  = scale->ne[3];
+
+    const size_t ts_add = ggml_type_size(shift->type);
+    GGML_ASSERT(shift->nb[0] == ts_add);
+    const int64_t add_s01 = shift->nb[1] / ts_add;
+    const int64_t add_s02 = shift->nb[2] / ts_add;
+    const int64_t add_s03 = shift->nb[3] / ts_add;
+
+    const int add_ncols     = shift->ne[0];
+    const int add_nrows     = shift->ne[1];
+    const int add_nchannels = shift->ne[2];
+    const int add_nsamples  = shift->ne[3];
+
+    // Dispatch the (x-type, mod-type) combos that actually occur: (half,float),(half,half),(float,float).
+    if (x->type == GGML_TYPE_F16 && scale->type == GGML_TYPE_F32) {
+        rms_modulate_cuda<half, float>((const half *) x_d, (const float *) scale_d, (const float *) shift_d, (half *) dst_d,
+                                       ne00, ne01, ne02, ne03, s01, s02, s03,
+                                       mul_s01, mul_s02, mul_s03, mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                                       add_s01, add_s02, add_s03, add_ncols, add_nrows, add_nchannels, add_nsamples,
+                                       eps, stream);
+    } else if (x->type == GGML_TYPE_F16 && scale->type == GGML_TYPE_F16) {
+        rms_modulate_cuda<half, half>((const half *) x_d, (const half *) scale_d, (const half *) shift_d, (half *) dst_d,
+                                      ne00, ne01, ne02, ne03, s01, s02, s03,
+                                      mul_s01, mul_s02, mul_s03, mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                                      add_s01, add_s02, add_s03, add_ncols, add_nrows, add_nchannels, add_nsamples,
+                                      eps, stream);
+    } else if (x->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32) {
+        rms_modulate_cuda<float, float>((const float *) x_d, (const float *) scale_d, (const float *) shift_d, (float *) dst_d,
+                                        ne00, ne01, ne02, ne03, s01, s02, s03,
+                                        mul_s01, mul_s02, mul_s03, mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                                        add_s01, add_s02, add_s03, add_ncols, add_nrows, add_nchannels, add_nsamples,
+                                        eps, stream);
+    } else {
+        // (x=F32, mod=F16) does not occur in the LTX modulation path; add a combo above if needed.
+        GGML_ABORT("ggml_rms_modulate: unsupported (x,scale) type combo");
     }
 }
 

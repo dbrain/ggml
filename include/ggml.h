@@ -504,6 +504,7 @@ extern "C" {
         GGML_OP_SILU_BACK,
         GGML_OP_NORM, // normalize
         GGML_OP_RMS_NORM,
+        GGML_OP_RMS_MODULATE,  // longcat-avatar: fused AdaLN rms_norm(x)*(1+scale)+shift, mixed-type, CUDA-only
         GGML_OP_RMS_NORM_BACK,
         GGML_OP_GROUP_NORM,
         GGML_OP_L2_NORM,
@@ -1883,6 +1884,21 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * pe);
+
+    // longcat-avatar: fused AdaLN (comfy adaln.cu equivalent). Computes, in ONE CUDA op:
+    //     out = rms_norm(x) * (1 + scale) + shift
+    // where rms_norm normalizes over x->ne[0] (the channel/hidden dim) with the given eps.
+    // x:     activation, F16 OR F32 (output type = x type).
+    // scale: modulation, broadcast over x exactly like ggml_rms_norm fused mul/add (per-axis
+    //        strides). MAY be F32 even when x is F16 — read as its own type, NO cast.
+    // shift: same type as scale, same broadcast.
+    // The (1 + scale) is intrinsic to the kernel: pass RAW scale (NOT scale+1). CUDA-only.
+    GGML_API struct ggml_tensor * ggml_rms_modulate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * shift,
+            float                 eps);
 
     // RoPE operations with extended options
     // a is the input tensor to apply RoPE to, shape [n_embd, n_head, n_token]

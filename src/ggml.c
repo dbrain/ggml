@@ -1003,6 +1003,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SILU_BACK",
     "NORM",
     "RMS_NORM",
+    "RMS_MODULATE",
     "RMS_NORM_BACK",
     "GROUP_NORM",
     "L2_NORM",
@@ -1089,7 +1090,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "COL2IM_1D",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1119,6 +1120,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "silu_back(x)",
     "norm(x)",
     "rms_norm(x)",
+    "rms_modulate(x)",
     "rms_norm_back(x)",
     "group_norm(x)",
     "l2_norm(x)",
@@ -1205,7 +1207,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "col2im_1d(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4463,6 +4465,28 @@ struct ggml_tensor * ggml_rope_pe_ni(
         struct ggml_tensor  * a,
         struct ggml_tensor  * pe) {
     return ggml_rope_pe_impl(ctx, a, pe, 0);
+}
+
+// ggml_rms_modulate — longcat-avatar fused AdaLN (comfy adaln.cu equivalent).
+// out = rms_norm(x) * (1 + scale) + shift, normalized over x->ne[0]. CUDA-only.
+// x is F16 or F32; scale/shift broadcast over x and MAY be a different type than x
+// (read as their own type, no cast). Output shape+type == x.
+struct ggml_tensor * ggml_rms_modulate(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * shift,
+        float                 eps) {
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, x);   // same shape+type as x
+
+    ggml_set_op_params(result, &eps, sizeof(eps));
+
+    result->op     = GGML_OP_RMS_MODULATE;
+    result->src[0] = x;
+    result->src[1] = scale;
+    result->src[2] = shift;
+
+    return result;
 }
 
 struct ggml_tensor * ggml_rope_ext(

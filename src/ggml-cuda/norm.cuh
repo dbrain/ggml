@@ -29,6 +29,11 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                                      ggml_tensor *               mul_tensor,
                                      ggml_tensor *               add_tensor);
 
+// Fused AdaLN (comfy adaln.cu equivalent): out = rms_norm(x)*(1+scale)+shift as ONE op.
+// dst->src[0]=x (F16|F32), dst->src[1]=scale, dst->src[2]=shift (scale/shift may be a
+// different type than x — read with no cast; the +1 is intrinsic to the kernel).
+void ggml_cuda_op_rms_modulate(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
