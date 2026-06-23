@@ -50,6 +50,24 @@ static __global__ void cudnn_o_bhsd_half_to_bshd_f32(
     out[o] = __half2float(in[idx]);
 }
 
+// F16-dst variant: keep the cuDNN output F16 (permute only, NO upcast) so the LTX_DIT_F16
+// residual stream stays F16 across the attn->proj boundary (drops the bhsd->F32 cast and
+// keeps to_out on the F16 activation-quant path). Used when the flash node's dst is F16.
+static __global__ void cudnn_o_bhsd_half_to_bshd_f16(
+        const half * __restrict__ in, half * __restrict__ out,
+        int N, int H, int L, int D) {
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long tot = (long)N * H * L * D;
+    if (idx >= tot) return;
+    int d = idx % D;
+    long t = idx / D;
+    int l = t % L; t /= L;
+    int h = t % H; t /= H;
+    int n = t;
+    long o = (((long)n * L + l) * H + h) * D + d;
+    out[o] = in[idx];
+}
+
 // One cuDNN handle per thread (the backend runs the graph on a single worker thread).
 static thread_local cudnnHandle_t g_cudnn_handle = nullptr;
 static cudnnHandle_t get_cudnn_handle() {
@@ -155,7 +173,7 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
 
     GGML_ASSERT(K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
     GGML_ASSERT(K->ne[0] == D && V->ne[0] == D && V->ne[1] == Lkv);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
 
     float scale = 0.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
@@ -219,12 +237,18 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         GGML_ABORT("cudnn sdpa execute failed");
     }
 
-    // Permute BHSD F16 -> BSHD F32 directly into ggml's contiguous F32 dst (O seqlen = Lq).
+    // Permute BHSD F16 -> BSHD dst (O seqlen = Lq). F32 dst = upcast (prod default);
+    // F16 dst = permute only, keeping the LTX_DIT_F16 stream F16 through attn->proj.
     const long tot = (long)N * H * Lq * D;
     const int  bs  = 256;
     const int  gs  = (int)((tot + bs - 1) / bs);
-    cudnn_o_bhsd_half_to_bshd_f32<<<gs, bs, 0, stream>>>(
-        o_bhsd.get(), (float *) dst->data, (int)N, (int)H, (int)Lq, (int)D);
+    if (dst->type == GGML_TYPE_F16) {
+        cudnn_o_bhsd_half_to_bshd_f16<<<gs, bs, 0, stream>>>(
+            o_bhsd.get(), (half *) dst->data, (int)N, (int)H, (int)Lq, (int)D);
+    } else {
+        cudnn_o_bhsd_half_to_bshd_f32<<<gs, bs, 0, stream>>>(
+            o_bhsd.get(), (float *) dst->data, (int)N, (int)H, (int)Lq, (int)D);
+    }
 }
 
 #else  // !GGML_CUDNN
