@@ -134,7 +134,18 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
-template <int block_size, bool do_multiply = false, bool do_add = false, typename T = float>
+// Optional pre-norm bias fold (do_prebias): adds a 1D F32 bias[col] to x BEFORE the
+// sum-of-squares reduction, folding the Linear's bias-add that immediately precedes the
+// RMSNorm (LTX DiT q_norm/k_norm). To stay BIT-EXACT with the unfused {ADD, RMS_NORM}
+// chain — where the separate ADD stores (x+bias) as T (F16 under LTX_DIT_F16) and the
+// RMS_NORM re-reads it as T — we round (x+bias) to T via `(float)(T)xb` (round_to_T,
+// no-op for float; round-to-nearest-half precedent = mul_add_bcast's round_big) and use
+// the SAME rounded value for both the variance accumulation and the final store. prebias
+// (T_bias = F32) is full-width over the ne0 axis, indexed by `col` only and broadcast over
+// all rows/channels/samples (the bias is [ne0,1,1,1]). Default do_prebias=false leaves the
+// existing instantiations byte-identical.
+template <int block_size, bool do_multiply = false, bool do_add = false, typename T = float,
+          bool do_prebias = false, typename T_bias = float>
 static __global__ void rms_norm_f32(const T *     x,
                                     T *           dst,
                                     const int     ncols,
@@ -157,7 +168,8 @@ static __global__ void rms_norm_f32(const T *     x,
                                     const uint3   add_ncols_packed     = make_uint3(0, 0, 0),
                                     const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
                                     const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
-                                    const uint3   add_nsamples_packed  = make_uint3(0, 0, 0)) {
+                                    const uint3   add_nsamples_packed  = make_uint3(0, 0, 0),
+                                    const T_bias * prebias             = nullptr) {
     ggml_cuda_pdl_lc();
     const int nrows     = gridDim.x;
     const int nchannels = gridDim.y;
@@ -186,11 +198,23 @@ static __global__ void rms_norm_f32(const T *     x,
         add += add_sample * add_stride_sample + add_channel * add_stride_channel + add_row * add_stride_row;
     }
 
+    // Reads x[col] (+ rounded prebias[col] when do_prebias) as the value used by BOTH the
+    // reduction and the normalize loop, so the two passes see identical bytes — exactly
+    // what the unfused chain does (separate ADD writes T to memory, RMS_NORM reads it back).
+    auto load_xb = [&](int col) -> float {
+        if constexpr (do_prebias) {
+            const float xb = (float) x[col] + (float) prebias[col];
+            return (float) (T) xb;  // round to T (no-op for float; round-to-half for half)
+        } else {
+            return (float) x[col];
+        }
+    };
+
     float tmp = 0.0f; // partial sum for thread in warp
 
     ggml_cuda_pdl_sync();
     for (int col = tid; col < ncols; col += block_size) {
-        const float xi = (float) x[col];
+        const float xi = load_xb(col);
         tmp += xi * xi;
     }
 
@@ -202,15 +226,16 @@ static __global__ void rms_norm_f32(const T *     x,
     const float scale = rsqrtf(mean + eps);
 
     for (int col = tid; col < ncols; col += block_size) {
+        const float xb = load_xb(col);
         if constexpr (do_multiply && do_add) {
             const int mul_col = fastmodulo(col, mul_ncols_packed);
             const int add_col = fastmodulo(col, add_ncols_packed);
-            dst[col]          = (T)(scale * (float) x[col] * (float) mul[mul_col] + (float) add[add_col]);
+            dst[col]          = (T)(scale * xb * (float) mul[mul_col] + (float) add[add_col]);
         } else if constexpr (do_multiply) {
             const int mul_col = fastmodulo(col, mul_ncols_packed);
-            dst[col]          = (T)(scale * (float) x[col] * (float) mul[mul_col]);
+            dst[col]          = (T)(scale * xb * (float) mul[mul_col]);
         } else {
-            dst[col] = (T)(scale * (float) x[col]);
+            dst[col] = (T)(scale * xb);
         }
     }
 }
@@ -456,14 +481,47 @@ static void rms_norm_f32_cuda(
             x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
         // underlying cudaLaunchKernelEx does not support default params
         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
-        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+        (const float *) nullptr);
     } else {
         const dim3 block_dims(1024, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
         ggml_cuda_kernel_launch(rms_norm_f32<1024, false, false, T>, launch_params, x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
         // underlying cudaLaunchKernelEx does not support default params
         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
-        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+        (const float *) nullptr);
+    }
+}
+
+// Pre-norm bias fold: RMS_NORM(x + prebias) with NO trailing mul/add. prebias is a 1D
+// F32 bias[ncols] broadcast over rows/channels/samples (passed full-width over ne0,
+// indexed by col). do_multiply/do_add stay false → identical reduction/normalize math
+// to rms_norm_f32_cuda, only the per-element x is replaced by round_to_T(x + prebias).
+template <typename T = float>
+static void rms_norm_prebias_f32_cuda(
+        const T * x, const float * prebias, T * dst, const int ncols, const int nrows, const int nchannels,
+        const int nsamples, const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const float eps, cudaStream_t stream) {
+    const dim3 blocks_num(nrows, nchannels, nsamples);
+    if (ncols < 1024) {
+        const dim3 block_dims(256, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+        ggml_cuda_kernel_launch((rms_norm_f32<256, false, false, T, true, float>), launch_params,
+            x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
+        // underlying cudaLaunchKernelEx does not support default params
+        (const T *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+        (const T *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+        prebias);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+        ggml_cuda_kernel_launch((rms_norm_f32<1024, false, false, T, true, float>), launch_params,
+            x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
+        // underlying cudaLaunchKernelEx does not support default params
+        (const T *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+        (const T *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+        prebias);
     }
 }
 
@@ -512,7 +570,8 @@ static void rms_norm_mul_f32_cuda(const T *      x,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 // underlying cudaLaunchKernelEx does not support default params
-            (const T *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+            (const T *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+            (const float *) nullptr);
         } else {
             const dim3 block_dims(1024, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
@@ -520,7 +579,8 @@ static void rms_norm_mul_f32_cuda(const T *      x,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 // underlying cudaLaunchKernelEx does not support default params
-            (const T *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+            (const T *) nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+            (const float *) nullptr);
         }
     } else {
         const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
@@ -539,7 +599,8 @@ static void rms_norm_mul_f32_cuda(const T *      x,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
-                add_nchannels_packed, add_nsamples_packed);
+                add_nchannels_packed, add_nsamples_packed,
+                (const float *) nullptr);
         } else {
             const dim3 block_dims(1024, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
@@ -547,7 +608,8 @@ static void rms_norm_mul_f32_cuda(const T *      x,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
-                add_nchannels_packed, add_nsamples_packed);
+                add_nchannels_packed, add_nsamples_packed,
+                (const float *) nullptr);
         }
     }
 }
@@ -859,6 +921,67 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         rms_norm_f32_cuda((const half *) src0->data, (half *) dst->data, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
     } else {
         rms_norm_f32_cuda((const float *) src0->data, (float *) dst->data, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+    }
+}
+
+// Fused (pre-norm bias) + RMS_NORM. Folds a Linear's bias-add that immediately precedes
+// the RMSNorm: the graph is ADD(matmul_out[ne0,tok], bias[ne0]) -> RMS_NORM(over ne0).
+// `dst` is the RMS_NORM node; `add_node` is the preceding ADD. `x` is the matmul output
+// (the ADD operand that traces to a compute node) and `prebias` is the 1D F32 bias (the
+// other ADD operand). The trailing RMSNorm MUL (weight) is NOT folded here — under
+// LTX_DIT_F16 x is F16 while the RMSNorm weight is F32, so it runs as a separate MUL
+// (the launcher templates one element type T for x/dst). We only need the bias-add gone.
+//
+// Bit-exactness: the unfused chain is ADD: dst_add = (T)((float)x + bias) stored to
+// memory, then RMS_NORM re-reads dst_add as T. The kernel reproduces that exactly by
+// computing xb = (float)(T)((float)x + bias) (the do_prebias path's round_to_T) and using
+// that SAME rounded xb for both the variance sum and the normalized store. F32 (T=float):
+// (float)(float)(...) is a no-op, so this is byte-identical to feeding RMS_NORM the
+// separately-added F32 buffer.
+void ggml_cuda_op_rms_norm_fused_prebias(ggml_backend_cuda_context & ctx,
+                                         ggml_tensor *               dst,
+                                         ggml_tensor *               add_node,
+                                         ggml_tensor *               x,
+                                         ggml_tensor *               prebias) {
+    float eps = 0.0f;
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+    const void * src0_d   = x->data;
+    const float * prebias_d = (const float *) prebias->data;
+    void *       dst_d    = dst->data;
+    cudaStream_t stream   = ctx.stream();
+
+    // x/dst share element type (F32 byte-identical path, or F16 under LTX_DIT_F16). The
+    // RMS_NORM dst type equals x's type (the ADD that produced x writes the same type the
+    // RMS_NORM re-reads). prebias is the bias element type = F32.
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16);
+    GGML_ASSERT(dst->type == x->type);
+    GGML_ASSERT(prebias->type == GGML_TYPE_F32);
+    GGML_ASSERT(eps >= 0.0f);
+
+    GGML_UNUSED(add_node);
+
+    const int64_t ne00 = x->ne[0];
+    const int64_t ne01 = x->ne[1];
+    const int64_t ne02 = x->ne[2];
+    const int64_t ne03 = x->ne[3];
+
+    const size_t ts0 = ggml_type_size(x->type);
+    GGML_ASSERT(x->nb[0] == ts0);
+    const int64_t s01 = x->nb[1] / ts0;
+    const int64_t s02 = x->nb[2] / ts0;
+    const int64_t s03 = x->nb[3] / ts0;
+
+    // prebias is 1D [ne0,1,1,1], contiguous F32, full-width over ne0 (indexed by col).
+    GGML_ASSERT(prebias->ne[0] == ne00);
+    GGML_ASSERT(ggml_is_contiguous(prebias));
+
+    if (x->type == GGML_TYPE_F16) {
+        rms_norm_prebias_f32_cuda((const half *) src0_d, prebias_d, (half *) dst_d,
+                                  ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+    } else {
+        rms_norm_prebias_f32_cuda((const float *) src0_d, prebias_d, (float *) dst_d,
+                                  ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
     }
 }
 

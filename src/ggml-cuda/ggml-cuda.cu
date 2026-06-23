@@ -4159,6 +4159,77 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Fused (pre-norm) bias-add + RMS_NORM (LTX DiT q_norm/k_norm): ggml_ext_linear emits
+    // ADD(matmul_out, bias) and the result goes straight into RMSNorm::forward =
+    // rms_norm(x) then mul(weight). Under LTX_DIT_F16 the matmul dst is F16 and the bias is
+    // F32, so the ADD lowers to k_bin_bcast<op_add,__half,float,__half> (the bias-add
+    // bucket). The bias spans the SAME ne0 axis the RMS_NORM reduces over and is indexed by
+    // ne0 only (broadcast over rows/channels/samples) with NO reshape between ADD and
+    // RMS_NORM — so it folds cleanly as a pre-norm bias. We fold ADD+RMS_NORM (NOT the
+    // trailing weight MUL: under F16 x is F16 while the RMSNorm weight is F32, a type the
+    // single-T launcher can't take; the MUL runs unchanged on the fused output). Bit-exact:
+    // the kernel rounds (x+bias) to the dst type before the reduction/store, matching the
+    // separate ADD's T store that RMS_NORM re-reads. env GGML_CUDA_BIAS_RMS_FUSE (off by
+    // default → byte-identical to current; F32 path is byte-identical regardless).
+    {
+        static const bool bias_rms_fuse = (getenv("GGML_CUDA_BIAS_RMS_FUSE") != nullptr);
+        auto is_view_like = [](ggml_op op) {
+            return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
+                   op == GGML_OP_TRANSPOSE || op == GGML_OP_PERMUTE;
+        };
+        auto trace_back = [&](ggml_tensor * t) {
+            while (t && is_view_like(t->op)) {
+                t = t->src[0];
+            }
+            return t;
+        };
+        if (bias_rms_fuse && node->op == GGML_OP_ADD &&
+            (node->type == GGML_TYPE_F16 || node->type == GGML_TYPE_F32) &&
+            ggml_is_contiguous(node) && ggml_node_get_use_count(cgraph, i) == 1) {
+            // Identify x (matmul/compute side, same shape as the ADD output) and the 1D
+            // F32 bias broadcast over ne0. ADD operand order is arbitrary.
+            ggml_tensor * s0   = node->src[0];
+            ggml_tensor * s1   = node->src[1];
+            ggml_tensor * x    = nullptr;
+            ggml_tensor * bias = nullptr;
+            auto is_bias = [&](ggml_tensor * b) {
+                return b && b->type == GGML_TYPE_F32 && ggml_is_contiguous(b) &&
+                       b->ne[0] == node->ne[0] && b->ne[1] == 1 && b->ne[2] == 1 && b->ne[3] == 1;
+            };
+            auto is_x = [&](ggml_tensor * t) {
+                return t && t->type == node->type && ggml_is_contiguous(t) &&
+                       ggml_nelements(t) == ggml_nelements(node);
+            };
+            if (is_x(s0) && is_bias(s1)) { x = s0; bias = s1; }
+            else if (is_x(s1) && is_bias(s0)) { x = s1; bias = s0; }
+            // x must trace through view-likes to a real compute node (the matmul), not be
+            // a leaf/param — mirrors the bias+GELU detector's "big = matmul output".
+            if (x && bias) {
+                ggml_tensor * x_root = trace_back(x);
+                const bool x_is_compute = x_root && x_root->op != GGML_OP_NONE &&
+                                          !is_view_like(x_root->op);
+                if (x_is_compute) {
+                    // next non-view node after the ADD must be RMS_NORM whose src[0]
+                    // traces back to the ADD.
+                    int j = i + 1;
+                    while (j < cgraph->n_nodes && is_view_like(cgraph->nodes[j]->op)) {
+                        ++j;
+                    }
+                    if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_RMS_NORM) {
+                        ggml_tensor * rms_n = cgraph->nodes[j];
+                        if (trace_back(rms_n->src[0]) == node &&
+                            rms_n->type == node->type &&
+                            rms_n->ne[0] == node->ne[0] &&
+                            ggml_node_get_use_count(cgraph, j) >= 1) {
+                            ggml_cuda_op_rms_norm_fused_prebias(*cuda_ctx, rms_n, node, x, bias);
+                            return j - i;  // skip the ADD..RMS_NORM span (inclusive of RMS_NORM)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     //topk-moe
     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
             cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
