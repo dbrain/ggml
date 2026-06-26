@@ -74,6 +74,27 @@ GGML_BACKEND_API void ggml_backend_cuda_get_graph_cache_stats(
     int    * out_graph_count,
     size_t * out_total_node_count);
 
+// Return the backend's committed CUDA memory-pool high-water back to the OS.
+// The VMM pool (ggml_cuda_pool_vmm) only ever grows its physical commitment
+// (set by the largest single transient ever seen) and unmaps solely in its
+// destructor — so across a multi-segment video chain the pool's high-water
+// stays reserved and shows up as cross-segment VRAM growth even though
+// pool_used is 0 between segments. This destroys+lazily-rebuilds every
+// device/stream pool on the backend, unmapping the committed blocks
+// (cuMemUnmap + cuMemAddressFree). MUST be called only when no pool block is
+// live (pool_used==0) and no kernel is in flight — it issues a device sync.
+// Safe to call on non-CUDA backends (no-op). Cost: a one-shot re-commit on the
+// next segment's first large alloc; never touches params/weights buffers.
+GGML_BACKEND_API void ggml_backend_cuda_trim_pools(ggml_backend_t backend);
+
+// Register a per-tensor NVFP4 weight global scale (ModelOpt weight_scale_2), keyed by
+// tensor name. The FP4 cuBLASLt GEMM folds it into the matmul alpha so the stored
+// per-block ue4m3 scales can keep their well-conditioned range (UNFOLDED import)
+// instead of underflowing into e4m3 subnormals. Names not registered default to a
+// multiplier of 1.0 (legacy FOLDED gguf path stays byte-identical). No-op on
+// non-CUDA / non-FP4 builds.
+GGML_BACKEND_API void ggml_cuda_nvfp4_register_weight_global(const char * name, float g);
+
 // LongCat lap-31.2: CPU-precomputed per-(Q-tile, K-tile) all-deny bitmap for the
 // avatar's BSA self-attn. Set the device pointer + dimensions before issuing FA
 // calls that should consult it; pass nullptr to disable. The FA dispatcher only

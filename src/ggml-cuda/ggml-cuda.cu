@@ -2766,6 +2766,17 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    // FP8 (e4m3) FFN path: route the FFN Linears (name filter, default "ff.net") through an
+    // 8-bit-activation cuBLASLt FP8xFP8 GEMM to kill the FP4-activation worm. Checked BEFORE
+    // the FP4 path so a matched FFN weight takes FP8; everything else falls through to FP4.
+    // Env-gated (GGML_FP8_FFN=1) => prod byte-identical when off.
+    if (src0->type == GGML_TYPE_NVFP4 && ggml_cuda_fp8_ffn_enabled()
+            && ggml_cuda_fp8_ffn_name_match(src0->name)
+            && blackwell_mma_available(ggml_cuda_info().devices[ctx.device].cc)
+            && ggml_cuda_fp8_cublaslt_mul_mat(ctx, src0, src1, dst)) {
+        return;
+    }
+
     // Phase-1 fast FP4 GEMM: NVFP4 weight matmul -> cuBLASLt blockscaled FP4 (Blackwell
     // FP4 tensor cores, ~3.3x MMQ). Env-gated (GGML_NVFP4_CUBLASLT=1); falls back cleanly.
     if (src0->type == GGML_TYPE_NVFP4 && ggml_cuda_nvfp4_cublaslt_enabled()
@@ -5674,6 +5685,30 @@ void ggml_backend_cuda_get_graph_cache_stats(ggml_backend_t backend,
 #endif
     if (out_graph_count)      *out_graph_count      = n_graphs;
     if (out_total_node_count) *out_total_node_count = n_nodes;
+}
+
+void ggml_backend_cuda_trim_pools(ggml_backend_t backend) {
+    if (!backend || !ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (!cuda_ctx) {
+        return;
+    }
+    ggml_cuda_set_device(cuda_ctx->device);
+    // Pool unmap is destructive — kernels still reading the pages would fault.
+    // At a chain-segment boundary nothing is in flight, but sync to be safe.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    // Destroy every device/stream pool object; ~ggml_cuda_pool_vmm unmaps the
+    // committed high-water (cuMemUnmap + cuMemAddressFree) and ~ggml_cuda_pool_leg
+    // cudaFree's its cached buffers. pool() rebuilds lazily on next use. Iterate
+    // all streams because offload/prefetch may have created pools beyond
+    // curr_stream_no. unique_ptr::reset() on a null slot is a no-op.
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+            cuda_ctx->pools[d][s].reset();
+        }
+    }
 }
 
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {

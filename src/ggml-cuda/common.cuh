@@ -886,6 +886,37 @@ __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e)
     return static_cast<uint8_t>(best_i | sign_bit);
 }
 
+// Deterministic per-element hash -> uniform float in [0,1). Mixes a positional key
+// (a) with the value's raw bits (b) so the dither decorrelates across diffusion
+// steps/frames (activations drift => bits change) yet is reproducible for a fixed
+// activation. PCG-style integer scramble.
+__device__ __forceinline__ float ggml_cuda_srand01(unsigned int a, unsigned int b) {
+    unsigned int h = a * 747796405u + 2891336453u;
+    h ^= b + 0x9e3779b9u + (h << 6) + (h >> 2);
+    h = (h ^ (h >> 15)) * 2246822519u;
+    h ^= (h >> 13); h *= 3266489917u; h ^= (h >> 16);
+    return (h >> 8) * (1.0f / 16777216.0f);   // 24-bit mantissa -> [0,1)
+}
+
+// Stochastic-rounding twin of ggml_cuda_float_to_fp4_e2m1: rounds between the two
+// bracketing E2M1 levels with probability proportional to position (unbiased), so the
+// systematic round-to-nearest bias that bands smooth/flat activation regions becomes
+// zero-mean dither. rnd must be in [0,1). Saturates >=6 to the top code (matches RTN).
+__device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1_stoch(float x, float e, float rnd) {
+    const uint8_t sign_bit = (x < 0.0f) << 3;
+    const float   ax       = fabsf(x) * e;
+    static constexpr float pos_lut[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    if (ax >= pos_lut[7]) return static_cast<uint8_t>(7 | sign_bit);
+    int lo = 0;
+#pragma unroll
+    for (int i = 1; i < 8; ++i) { if (pos_lut[i] <= ax) lo = i; }
+    const int   hi   = lo + 1;                       // lo in [0,6], hi in [1,7]
+    const float span = pos_lut[hi] - pos_lut[lo];
+    const float p    = span > 0.0f ? (ax - pos_lut[lo]) / span : 0.0f;
+    const int   pick = (rnd < p) ? hi : lo;
+    return static_cast<uint8_t>(pick | sign_bit);
+}
+
 // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
 // Precompute mp (m' in the paper) and L such that division
 // can be computed using a multiply (high 32b of 64b result)
