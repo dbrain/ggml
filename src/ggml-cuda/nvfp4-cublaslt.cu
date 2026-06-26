@@ -133,6 +133,32 @@ static bool nvfp4_inplace_enabled() {
     return v == 1;
 }
 
+// TASK F: clear the pointer-keyed repack cache (see header). In-place entries
+// (rp.in_place == true) aliased the repacked bytes into the ggml-owned src0 buffer, so
+// there is nothing to cudaFree — that buffer is freed by its owner (free_params_buffer).
+// Out-of-place fallback entries cudaMalloc'd duplicate data + scales buffers; free both
+// so we don't leak across reloads. Hold the same mutex get_repacked_weight() uses.
+void ggml_cuda_nvfp4_cublaslt_clear_repack_cache() {
+    std::lock_guard<std::mutex> lk(g_repack_mtx);
+    for (auto & kv : g_repack_cache) {
+        nvfp4_weight_repacked & rp = kv.second;
+        if (!rp.in_place) {
+            // out-of-place fallback: data and scales are two separate cudaMalloc'd
+            // buffers (see get_repacked_weight). Free both. In-place entries alias the
+            // ggml-owned src0 buffer (freed by its owner) -> never cudaFree them.
+            if (rp.data   != nullptr) cudaFree(rp.data);
+            if (rp.scales != nullptr) cudaFree(rp.scales);
+        }
+    }
+    g_repack_cache.clear();
+}
+
+// C-callable wrapper exported via ggml-cuda.h so host code (no CUDA headers) can clear
+// the cache when it frees NVFP4 weight buffers.
+extern "C" void ggml_cuda_nvfp4_clear_repack_cache(void) {
+    ggml_cuda_nvfp4_cublaslt_clear_repack_cache();
+}
+
 static thread_local cublasLtHandle_t g_lt = nullptr;
 static cublasLtHandle_t get_lt() {
     if (!g_lt) { if (cublasLtCreate(&g_lt) != CUBLAS_STATUS_SUCCESS) return nullptr; }

@@ -59,6 +59,14 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
+// TASK F: clear the NVFP4 cuBLASLt weight-repack cache. The repack overwrites the weight
+// buffer in place and caches by raw pointer; if an NVFP4 weight buffer is freed and a
+// later allocation reuses the same address, a stale "already repacked" entry would corrupt
+// the new weight. Host code MUST call this whenever it frees NVFP4 DiT weight buffers that
+// may be reallocated (e.g. the flux2 warm worker's per-request DiT free + reload). No-op
+// if cuBLASLt is disabled / the cache is empty. Thread-safe.
+GGML_BACKEND_API void ggml_cuda_nvfp4_clear_repack_cache(void);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
 // VRAM-probe helper. Reports how many cudaGraph_t/cudaGraphExec_t entries
