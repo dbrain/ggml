@@ -1,4 +1,5 @@
 // Phase-1 fast FP4 GEMM via cuBLASLt — see nvfp4-cublaslt.cuh.
+#include <vector>
 //
 // Convention (proven in flux2.cpp/spike_cutlass_fp4/nvfp4_repack_golden.cu, cosine=1.0):
 //   ggml block_nvfp4 decodes E2M1 nibbles via kvalues_mxfp4={0,1,2,3,4,6,8,12} (2x std
@@ -712,6 +713,33 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
             if (bad || mx > 1e4f)
                 fprintf(stderr, "[NVFP4_NAN] M=%d K=%d N=%d  dst0=%g max8=%g %s\n",
                         M, K, N, h[0], mx, bad?"NONFINITE":"BIG");
+        }
+        // GGML_NVFP4_DBG: full-tensor scan to pin the FIRST GEMM that emits a non-finite or
+        // blown-up output (the two-level-quant NaN origin). Reports the weight name + the
+        // per-tensor activation global (amax = a_per_tensor*2688) so an outlier-driven
+        // underflow shows up directly. Debug-only (copies all M*N); prints once then quiets.
+        if (getenv("GGML_NVFP4_DBG")) {
+            static int s_found = 0;
+            if (!s_found) {
+                const size_t ne = (size_t)M * (size_t)N;
+                size_t nnan=0, ninf=0; float mx=0.f; size_t first=(size_t)-1;
+                if (dst->type == GGML_TYPE_F32) {
+                    std::vector<float> hb(ne);
+                    cudaMemcpyAsync(hb.data(), dst->data, ne*sizeof(float), cudaMemcpyDeviceToHost, stream);
+                    cudaStreamSynchronize(stream);
+                    for (size_t i=0;i<ne;i++){ float v=hb[i]; if(isnan(v)){nnan++; if(first==(size_t)-1)first=i;} else if(isinf(v)){ninf++; if(first==(size_t)-1)first=i;} mx=fmaxf(mx,fabsf(isfinite(v)?v:0.f)); }
+                } else if (dst->type == GGML_TYPE_F16) {
+                    std::vector<uint16_t> hb(ne);
+                    cudaMemcpyAsync(hb.data(), dst->data, ne*sizeof(uint16_t), cudaMemcpyDeviceToHost, stream);
+                    cudaStreamSynchronize(stream);
+                    for (size_t i=0;i<ne;i++){ uint16_t h=hb[i]; if((h&0x7C00)==0x7C00){ if(h&0x3FF) nnan++; else ninf++; if(first==(size_t)-1)first=i; } }
+                }
+                if (nnan||ninf||mx>1e4f) {
+                    s_found = 1;
+                    fprintf(stderr, "[NVFP4_DBG] FIRST-BAD name=%s dst=%s M=%d K=%d N=%d  a_per_tensor=%g (amax_act~%g) w_global=%g alpha=%g  nnan=%zu ninf=%zu max=%g firstbad@%zu\n",
+                            src0->name?src0->name:"?", dst->type==GGML_TYPE_F16?"F16":"F32", M, K, N, a_per_tensor, a_per_tensor*2688.f, w_global, alpha_h, nnan, ninf, mx, first);
+                }
+            }
         }
     }
 
