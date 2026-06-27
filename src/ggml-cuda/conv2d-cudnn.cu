@@ -220,7 +220,12 @@ static half * get_or_build_weight(const ggml_tensor * kernel, cudaStream_t strea
 }
 
 bool ggml_cuda_op_conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    if (!getenv("GGML_CUDNN_CONV")) return false;
+    // Honor GGML_CUDNN_CONV3D as well as GGML_CUDNN_CONV: both envs route VAE convs through
+    // GGML_OP_CONV_2D (set_conv2d_direct_enabled), and the 3D dispatch (conv3d-cudnn.cu) +
+    // supports_op already gate on the pair. Without CONV3D here, a GGML_OP_CONV_2D emitted
+    // under GGML_CUDNN_CONV3D (e.g. explicit vae_conv_direct) fell through to the naive
+    // conv2d_kernel instead of this validated cuDNN implicit-GEMM path.
+    if (!getenv("GGML_CUDNN_CONV") && !getenv("GGML_CUDNN_CONV3D")) return false;
 
     const ggml_tensor * kernel = dst->src[0];
     const ggml_tensor * input  = dst->src[1];

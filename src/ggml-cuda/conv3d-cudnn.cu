@@ -34,7 +34,18 @@ namespace fe = cudnn_frontend;
 // Bound the per-call cuDNN workspace so a pathological shape cannot blow the VRAM budget.
 // The LTX decoder ladder measured <=103 MB at high temporal-context (conv3d_golden.cu); a
 // 1 GB cap leaves ~10x headroom while still rejecting anything absurd (-> caller falls back).
-static const int64_t CONV3D_WS_CAP = (int64_t)1 << 30;
+// Wan2.2's VAE convs are far larger (1280x704 full-frame, more channels): the heuristic's
+// FAST plan needs >1 GB workspace, so a 1 GB cap REJECTS it -> slow fallback (measured 14 vs
+// 5 s/tile). Env-tunable via GGML_CUDNN_CONV3D_WS_MB so the cap can admit the fast plan when
+// VRAM headroom allows (the cuDNN-conv buffer is already ~7x lighter than im2col).
+static int64_t conv3d_ws_cap() {
+    static int64_t c = -1;
+    if (c < 0) {
+        const char * e = getenv("GGML_CUDNN_CONV3D_WS_MB");
+        c = (e && atoll(e) > 0) ? ((int64_t)atoll(e) << 20) : ((int64_t)1 << 30);
+    }
+    return c;
+}
 
 bool ggml_cuda_conv3d_cudnn_available() { return true; }
 
@@ -193,17 +204,26 @@ static conv3d_plan & get_or_build_conv3d_plan(cudnnHandle_t handle, const conv3d
      .set_uid(Y_UID);
 
     // Anything cuDNN can't do for this shape/arch -> mark unsupported, caller falls back.
-    if (graph->validate().is_good()
-        && graph->build_operation_graph(handle).is_good()
-        && graph->create_execution_plans({fe::HeurMode_t::A}).is_good()
-        && graph->check_support(handle).is_good()
-        && graph->build_plans(handle).is_good()) {
-        int64_t ws = 0;
-        if (graph->get_workspace_size(ws).is_good() && ws <= CONV3D_WS_CAP) {
-            plan.graph     = graph;
-            plan.workspace = ws;
-            plan.supported = true;
-        }
+    // Per-step results captured so GGML_CUDNN_TRACE/GGML_CONV3D_DBG can report exactly
+    // why a shape ran cuDNN vs fell back (don't infer the path from s/it timing).
+    const bool v_ok  = graph->validate().is_good();
+    const bool b_ok  = v_ok && graph->build_operation_graph(handle).is_good();
+    const bool p_ok  = b_ok && graph->create_execution_plans({fe::HeurMode_t::A}).is_good();
+    const bool s_ok  = p_ok && graph->check_support(handle).is_good();
+    const bool bp_ok = s_ok && graph->build_plans(handle).is_good();
+    int64_t ws = -1;
+    if (bp_ok && graph->get_workspace_size(ws).is_good() && ws <= conv3d_ws_cap()) {
+        plan.graph     = graph;
+        plan.workspace = ws;
+        plan.supported = true;
+    }
+    if (getenv("GGML_CUDNN_TRACE") || getenv("GGML_CONV3D_DBG")) {
+        fprintf(stderr, "[cudnn-conv3d] plan N=%lld C=%lld %lldx%lldx%lld->OC=%lld k=%lldx%lldx%lld s=%lld,%lld,%lld : "
+                "validate=%d opgraph=%d plans=%d support=%d build=%d ws=%lldMB(cap=%lldMB) -> %s\n",
+                (long long)k.N,(long long)k.C,(long long)k.D,(long long)k.H,(long long)k.W,(long long)k.Cout,
+                (long long)k.KD,(long long)k.KH,(long long)k.KW,(long long)k.SD,(long long)k.SH,(long long)k.SW,
+                v_ok,b_ok,p_ok,s_ok,bp_ok,(long long)(ws>>20),(long long)(conv3d_ws_cap()>>20),
+                plan.supported ? "CUDNN" : "FALLBACK(im2col)");
     }
 
     auto [ins, ok] = g_conv3d_cache.emplace(k, std::move(plan));
@@ -241,9 +261,18 @@ bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int SW=p[0], SH=p[1], SD=p[2], PW=p[3], PH=p[4], PD=p[5], DW=p[6], DH=p[7], DD=p[8];
     const int c=p[9], n=p[10], oc=p[11];
 
-    if (!ggml_is_contiguous(kernel) || !ggml_is_contiguous(input)) return false;
-    if (kernel->type != GGML_TYPE_F16 && kernel->type != GGML_TYPE_F32) return false;
-    if (input->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    const bool conv3d_dbg = getenv("GGML_CUDNN_TRACE") || getenv("GGML_CONV3D_DBG");
+    #define CONV3D_REJECT(why) do { \
+        if (conv3d_dbg) fprintf(stderr, "[cudnn-conv3d] REJECT(%s) C=%d->OC=%d %dx%dx%d k=%dx%dx%d " \
+            "in.type=%d dst.type=%d w.type=%d contig(k=%d,in=%d) -> FALLBACK(slow conv2d_kernel)\n", \
+            why, c, oc, (int)input->ne[2],(int)input->ne[1],(int)input->ne[0], \
+            (int)kernel->ne[2],(int)kernel->ne[1],(int)kernel->ne[0], \
+            input->type, dst->type, kernel->type, \
+            ggml_is_contiguous(kernel), ggml_is_contiguous(input)); \
+        return false; } while (0)
+    if (!ggml_is_contiguous(kernel) || !ggml_is_contiguous(input)) CONV3D_REJECT("noncontig");
+    if (kernel->type != GGML_TYPE_F16 && kernel->type != GGML_TYPE_F32) CONV3D_REJECT("wtype");
+    if (input->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) CONV3D_REJECT("not-f32");
 
     const int KW = kernel->ne[0], KH = kernel->ne[1], KD = kernel->ne[2];
     const int W  = input->ne[0],  H  = input->ne[1],  D  = input->ne[2];
