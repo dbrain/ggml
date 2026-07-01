@@ -123,7 +123,12 @@ static __global__ void soft_max_f32(
         vals[col] = val;
     }
 
-    // find the sum of exps in the block
+    // find the sum of exps in the block.
+    // buf_iw is reused from the MAX reduce above; on Blackwell (sm120+) the
+    // warp no longer reconverges implicitly, so without this barrier the SUM
+    // reduce can overwrite buf_iw while lanes still read the MAX result =>
+    // nondeterministic softmax (races the F16-KV attention into garbled runs).
+    __syncthreads();
     tmp = block_reduce<block_reduce_method::SUM, block_size_template>(tmp, buf_iw);
 
     if (sinks) {

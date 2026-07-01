@@ -629,6 +629,13 @@ static __device__ T block_reduce(T val, T * shared_vals) {
         if (lane_id < (static_cast<int>(block_size) / WARP_SIZE)) {
             val = shared_vals[lane_id];
         }
+        // Trailing barrier: callers reuse the same shared_vals buffer across
+        // successive block_reduce calls (e.g. softmax MAX then SUM). Without
+        // it, the next call's shared_vals write races this call's read — on
+        // Blackwell (sm120+) the warp no longer reconverges implicitly, so
+        // that race is live and makes the reduction (and thus F16-KV softmax /
+        // mmf epilogue) nondeterministic.
+        __syncthreads();
         return block_reduce_policy<reduce_method_t, T>::reduce(val);
     }
 

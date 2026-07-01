@@ -99,12 +99,15 @@ void ggml_cuda_mul_mat_q(
     float       *  dst_d = (float       *)  dst->data;
 
     // If src0 is a temporary compute buffer, clear any potential padding.
-    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+    // GGML_MMQ_ZERO_PAD=1 also clears padding of persistent (weight) buffers —
+    // the MMQ tile kernel reads past the tensor rows into alloc padding, which
+    // is uninitialized for weight buffers (UB; nondeterministic garbage on
+    // sm120 that derails talker sampling under F16 KV). Diagnostic gate.
+    static const bool g_mmq_zero_pad = getenv("GGML_MMQ_ZERO_PAD") != nullptr;
+    if (g_mmq_zero_pad || ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         const size_t size_data  = ggml_nbytes(src0);
         const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
-        if (size_alloc > size_data) {
-            GGML_ASSERT(ggml_is_contiguously_allocated(src0));
-            GGML_ASSERT(!src0->view_src);
+        if (size_alloc > size_data && ggml_is_contiguously_allocated(src0) && !src0->view_src) {
             CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
         }
     }
@@ -143,6 +146,10 @@ void ggml_cuda_mul_mat_q(
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
             get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        // Pool scratch is reused across calls; its tail (the get_mmq_x_max
+        // block padding the quantize kernel doesn't write) holds leftover data
+        // that varies request-to-request. MMQ tiles read it → nondeterminism.
+        if (g_mmq_zero_pad) CUDA_CHECK(cudaMemsetAsync(src1_q8_1.get(), 0, nbytes_src1_q8_1, stream));
 
         {
             const int64_t s11 = src1->nb[1] / ts_src1;

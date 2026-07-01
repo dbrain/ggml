@@ -175,10 +175,17 @@ static __global__ void mul_mat_f(
             for (int i = 0; i < tile_A::I; ++i) {
                 tile_xy[i*tile_k_padded + threadIdx.x] = x[(itA*tile_A::I + i)*stride_row  + col];
             }
+            // Blackwell (sm120+) no longer reconverges the warp implicitly
+            // between these shared-memory stores and the collective ldmatrix
+            // read, nor before tile_xy is reused for the next tile. Without
+            // these __syncwarp()s ldmatrix reads stale/partly-written data =>
+            // nondeterministic mul_mat_f output (F16 KV attention garble).
+            __syncwarp();
 #pragma unroll
             for (int k0 = 0; k0 < warp_size; k0 += tile_A::J) {
                 load_ldmatrix(A[itA][k0/tile_A::J], tile_xy + k0, tile_k_padded);
             }
+            __syncwarp();
         }
 
 #pragma unroll
@@ -212,6 +219,10 @@ static __global__ void mul_mat_f(
             } else {
                 static_assert(std::is_same_v<T, void>, "unsupported type");
             }
+            // Same Blackwell warp-reconvergence hazard as the A tile above:
+            // sync after the tile_xy stores (before the collective ldmatrix)
+            // and after the reads (before the next itB / next-col store reuse).
+            __syncwarp();
 #pragma unroll
             for (int k0 = 0; k0 < warp_size; k0 += tile_B::J) {
                 tile_B B;
@@ -221,6 +232,7 @@ static __global__ void mul_mat_f(
                     mma(C[itA][itB], A[itA][k0/tile_B::J], B);
                 }
             }
+            __syncwarp();
         }
     }
 
@@ -386,10 +398,17 @@ static __global__ void mul_mat_f_ids(
             for (int i = 0; i < tile_A::I; ++i) {
                 tile_xy[i*tile_k_padded + threadIdx.x] = x[(itA*tile_A::I + i)*stride_row  + col];
             }
+            // Blackwell (sm120+) no longer reconverges the warp implicitly
+            // between these shared-memory stores and the collective ldmatrix
+            // read, nor before tile_xy is reused for the next tile. Without
+            // these __syncwarp()s ldmatrix reads stale/partly-written data =>
+            // nondeterministic mul_mat_f output (F16 KV attention garble).
+            __syncwarp();
 #pragma unroll
             for (int k0 = 0; k0 < warp_size; k0 += tile_A::J) {
                 load_ldmatrix(A[itA][k0/tile_A::J], tile_xy + k0, tile_k_padded);
             }
+            __syncwarp();
         }
 
         if constexpr (std::is_same_v<T, float>) {
