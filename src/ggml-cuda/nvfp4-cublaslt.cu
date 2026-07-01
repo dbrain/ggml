@@ -21,9 +21,11 @@
 #include <mutex>
 #include <unordered_map>
 #include <map>
+#include <set>
 #include <tuple>
 #include <string>
 #include <cstring>
+#include <atomic>
 
 // SWIZZLE_32_4_4 offset over a (rows x col_length) UE4M3 scale grid (comfy float_utils)
 __device__ __forceinline__ size_t swz_off(size_t row, size_t col, uint32_t col_len) {
@@ -876,10 +878,152 @@ bool ggml_cuda_fp8_ffn_name_match(const char * name) {
     return strstr(name, filt.c_str()) != nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// FP8 activation-quant reuse cache (fix #2: kill the redundant per-Linear
+// activation requant). Self-attn q/k/v and cross-attn k/v feed the SAME src1
+// activation to consecutive FP8 GEMMs, so the e4m3 quant of that activation is
+// recomputed identically 2-3x per block. Quantize once, reuse the e4m3 buffer +
+// its scalar scale for any later GEMM in the SAME compute whose src1 is the
+// byte-for-byte same tensor.
+//
+// Stale-safety (must stay bit-identical AND never reuse stale data):
+//  - A GLOBAL atomic generation is bumped once per graph compute
+//    (ggml_cuda_fp8_act_cache_new_generation(), called from execute_graph). A
+//    hit requires the cache's stored generation to equal the current one, so a
+//    new compute can NEVER reuse a prior compute's buffer even if gallocr
+//    recycles a node/data address.
+//  - Within a single compute every ggml graph node has a unique, stable
+//    address, so keying on the src1 NODE pointer (with data ptr / ne0 / ne1 /
+//    nb1 / type as belt-and-suspenders) means two DIFFERENT logical
+//    activations can never collide, even when their ->data aliases across
+//    non-overlapping lifetimes.
+//  - The e4m3 buffer is OWNED (cudaMalloc, grow-only) so neither gallocr nor
+//    the stream pool can recycle it out from under a pending reuse.
+//  - On ANY uncertainty (alloc failure, device/shape change) we MISS and
+//    requant. The quant is deterministic (atomicMax amax -> scalar scale ->
+//    per-elem e4m3 round), so a reused buffer is byte-identical to requanting.
+// Off-switch: GGML_FP8_ACT_QUANT_CACHE=0 (default ON). Scope: FP8 activation
+// quant only — weight requant and the FP4 path are untouched.
+struct fp8_act_quant_cache {
+    uint64_t           gen     = (uint64_t)-1;  // generation filled at; -1 == empty
+    const ggml_tensor* node    = nullptr;       // src1 node identity (unique per graph)
+    const void *       data    = nullptr;
+    int64_t            ne0     = 0;
+    int64_t            ne1     = 0;
+    size_t             nb1     = 0;
+    int                type    = -1;
+    int                device  = -1;
+    uint8_t *          d_fp8   = nullptr;        // owned persistent e4m3 buffer
+    size_t             cap     = 0;              // capacity (bytes) of d_fp8
+    float *            d_scale = nullptr;        // owned persistent scalar scale (1 float)
+};
+static thread_local fp8_act_quant_cache g_fp8_act_cache;
+static std::atomic<uint64_t>             g_fp8_act_cache_gen{0};
+
+static int ggml_cuda_fp8_act_cache_enabled() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_FP8_ACT_QUANT_CACHE"); v = (e && atoi(e) == 0) ? 0 : 1; }
+    return v;
+}
+
+// Bump once per graph compute (host side, from execute_graph) so cross-compute
+// reuse can never happen. Cheap relaxed atomic; safe to call on any backend.
+extern "C" void ggml_cuda_fp8_act_cache_new_generation(void) {
+    g_fp8_act_cache_gen.fetch_add(1, std::memory_order_relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// FP8 GEMM bias epilogue (fix #3): fold the Linear bias-add into the cuBLASLt
+// epilogue (CUBLASLT_EPILOGUE_BIAS) instead of a separate op_add kernel. Only
+// the BIAS is fused — Wan's FFN uses tanh-approx GELU while cuBLASLt's GELU
+// epilogue is the erf gelu, so fusing GELU would silently change results; ffn.0's
+// gelu stays a separate kernel. Env GGML_FP8_GEMM_EPILOGUE (default OFF). FP8 path
+// only (the FP4 GEMM has no bias-epilogue algo). The bias is added in F32 compute
+// before the store (cuBLASLt epilogue order) — same order as ggml's post-matmul
+// ggml_add(bias), and for F16 output slightly MORE accurate (one fewer round).
+static int ggml_cuda_fp8_gemm_epilogue_enabled() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_FP8_GEMM_EPILOGUE"); v = (e && atoi(e)) ? 1 : 0; }
+    return v;
+}
+
+// (m,n,k,out_dt) shapes whose bias epilogue cuBLASLt couldn't serve — so later
+// calls fail fast (no quant) and the caller falls back to a separate bias kernel.
+static thread_local std::set<std::tuple<int,int,int,int>> g_fp8_epi_unsupported;
+
+// F32 -> F16 bias downcast (tiny [N]; per-call, offload-safe, no ptr caching).
+static __global__ void fp8_bias_f32_to_f16(const float * __restrict__ in, half * __restrict__ out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2half_rn(in[i]);
+}
+
+// ---------------------------------------------------------------------------
+// FP8 e4m3 WEIGHT cache (fix #1): the NVFP4 weight is re-quantized to e4m3 on
+// every GEMM call, but weights are CONSTANT for the whole render. Cache the e4m3
+// weight + its scalar scale, keyed by the weight's unique tensor NAME.
+//
+// Why NAME (not data ptr): the high/low-noise experts are SEPARATE runners with
+// distinct name prefixes and every weight name is globally unique, so a name maps
+// to ONE constant weight value for the whole render. Keying on the name (validated
+// by N/K/nb1/type/device) makes false hits impossible even when the offload path
+// recycles a buffer ADDRESS for a different weight — a different weight has a
+// different name => a different entry. An offloaded weight re-homed to a new
+// address still HITS by name and the cached e4m3 is correct (it is a deterministic
+// function of the constant weight values, not the address), so resident AND
+// offloaded weights both benefit. No generation invalidation: weights never change.
+//
+// Cross-stream safety: the GEMM can run on offload worker threads/streams, so each
+// entry records a CUDA event after its quant and a consumer on another stream waits
+// on it before reading the buffer (a near-no-op on the common single-stream path).
+// The whole miss path is held under one mutex, so concurrent misses of the same
+// weight serialize and the event is recorded before the entry is observable.
+//
+// VRAM budget GGML_FP8_WEIGHT_CACHE_MB (default 4096): cache until the budget is
+// hit, then fall back to per-call pool requant (no eviction — weights are equally
+// hot). Owned cudaMalloc buffers; leaked until process exit (first-experiment
+// simplicity) — ggml_cuda_fp8_weight_cache_clear() frees them on demand.
+// Env-gate GGML_FP8_WEIGHT_QUANT_CACHE (default OFF). Independent of #2/#3/#4.
+struct fp8_weight_cache_entry {
+    int         N = 0, K = 0;
+    size_t      nb1 = 0;
+    int         type = -1;
+    int         device = -1;
+    uint8_t *   d_fp8 = nullptr;
+    float *     d_scale = nullptr;
+    size_t      bytes = 0;
+    cudaEvent_t ready = nullptr;
+};
+static std::mutex                                              g_fp8_wcache_mtx;
+static std::unordered_map<std::string, fp8_weight_cache_entry> g_fp8_wcache;
+static size_t                                                  g_fp8_wcache_bytes = 0;
+
+static int ggml_cuda_fp8_weight_cache_enabled() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_FP8_WEIGHT_QUANT_CACHE"); v = (e && atoi(e)) ? 1 : 0; }
+    return v;
+}
+static size_t ggml_cuda_fp8_weight_cache_budget_bytes() {
+    static size_t b = 0; static int init = 0;
+    if (!init) { const char * e = getenv("GGML_FP8_WEIGHT_CACHE_MB"); long mb = (e && atol(e) > 0) ? atol(e) : 4096; b = (size_t)mb * 1024 * 1024; init = 1; }
+    return b;
+}
+
+extern "C" void ggml_cuda_fp8_weight_cache_clear(void) {
+    std::lock_guard<std::mutex> lk(g_fp8_wcache_mtx);
+    for (auto & kv : g_fp8_wcache) {
+        if (kv.second.d_fp8)   cudaFree(kv.second.d_fp8);
+        if (kv.second.d_scale) cudaFree(kv.second.d_scale);
+        if (kv.second.ready)   cudaEventDestroy(kv.second.ready);
+    }
+    g_fp8_wcache.clear();
+    g_fp8_wcache_bytes = 0;
+}
+
 bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
                                     const ggml_tensor * src0,
                                     const ggml_tensor * src1,
-                                    ggml_tensor * dst) {
+                                    ggml_tensor * dst,
+                                    const ggml_tensor * bias) {
     if (src0->type != GGML_TYPE_NVFP4) return false;   // weight source = the stored FP4 FFN weight
     if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) return false;
     if (dst->type  != GGML_TYPE_F32 && dst->type  != GGML_TYPE_F16) return false;
@@ -893,46 +1037,169 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     if (K % 64 != 0)      return false;
     if (dst->ne[0] != N || dst->ne[1] != M) return false;
 
+    // fix #3: optional bias fused into the cuBLASLt epilogue. When a bias is supplied
+    // (from the FP8 mul_mat+bias graph matcher) we MUST apply it via the epilogue or
+    // return false so the caller falls back to a separate bias add — never silently
+    // drop it. cuBLASLt CUBLASLT_EPILOGUE_BIAS adds one value per output ROW (m = N
+    // out-features) broadcast over tokens == the Linear bias [N]. (Default null bias =
+    // the normal dispatch path, byte-identical to before.)
+    const bool want_epi = (bias != nullptr) &&
+                          ggml_cuda_fp8_gemm_epilogue_enabled() &&
+                          bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
+                          bias->ne[0] == N && bias->ne[1] == 1 && bias->ne[2] == 1 && bias->ne[3] == 1;
+    if (bias != nullptr && !want_epi) return false;   // can't honor the requested bias here
+    const cublasDataType_t epi_out_dt = (dst->type == GGML_TYPE_F16) ? CUDA_R_16F : CUDA_R_32F;
+    const auto epi_key = std::make_tuple(N, M, K, (int)epi_out_dt);
+    if (want_epi && g_fp8_epi_unsupported.count(epi_key)) return false;  // fail fast -> caller falls back
+
     cudaStream_t stream = ctx.stream();
     cublasLtHandle_t lt = get_lt();
     if (!lt) return false;
 
     const float w_global = nvfp4_weight_global_for(src0->name);
 
-    // 1) weight -> e4m3 [N,K] (pool scratch, per-call: handles resident & offload weights)
-    ggml_cuda_pool_alloc<uint8_t>      w_fp8(ctx.pool(), (size_t)N*K);
-    ggml_cuda_pool_alloc<unsigned int> w_amax(ctx.pool(), 1);
-    ggml_cuda_pool_alloc<float>        w_scale(ctx.pool(), 1);
-    cudaMemsetAsync(w_amax.get(), 0, sizeof(unsigned int), stream);
-    {
+    // 1) weight -> e4m3 [N,K]. Name-keyed persistent cache (fix #1) when enabled; else
+    //    pool scratch per-call (byte-identical, handles resident & offload weights).
+    uint8_t * w_fp8_ptr   = nullptr;
+    float   * w_scale_ptr = nullptr;
+    ggml_cuda_pool_alloc<uint8_t>      w_fp8(ctx.pool());      // pool fallback
+    ggml_cuda_pool_alloc<float>        w_scale(ctx.pool());    // pool fallback
+    ggml_cuda_pool_alloc<unsigned int> w_amax(ctx.pool());    // amax scratch (quant only)
+
+    // requant the NVFP4 weight -> e4m3 into (wdst, sdst). Deterministic => byte-identical
+    // to a cached buffer, so a cache hit is bit-identical to requanting.
+    auto run_weight_quant = [&](uint8_t * wdst, float * sdst) -> bool {
+        w_amax.alloc(1);
+        cudaMemsetAsync(w_amax.get(), 0, sizeof(unsigned int), stream);
         const int threads = 256;
         const long total  = (long)N*(K/16);
         unsigned int grid = (unsigned int)((total + threads - 1)/threads);
         if (grid > 65535u) grid = 65535u; if (grid == 0) grid = 1;
         fp8_w_amax_kernel<<<grid, threads, 0, stream>>>((const block_nvfp4*)src0->data, w_amax.get(), N, K, w_global);
-        fp8_scale_from_amax<<<1, 1, 0, stream>>>(w_amax.get(), w_scale.get());
+        fp8_scale_from_amax<<<1, 1, 0, stream>>>(w_amax.get(), sdst);
         const unsigned int qgrid = (unsigned int)((total + threads - 1)/threads);
-        fp8_w_quant_kernel<<<qgrid ? qgrid : 1, threads, 0, stream>>>((const block_nvfp4*)src0->data, w_fp8.get(), N, K, w_global, w_scale.get());
-        if (cudaPeekAtLastError() != cudaSuccess) return false;
+        fp8_w_quant_kernel<<<qgrid ? qgrid : 1, threads, 0, stream>>>((const block_nvfp4*)src0->data, wdst, N, K, w_global, sdst);
+        return cudaPeekAtLastError() == cudaSuccess;
+    };
+
+    const char * w_name   = src0->name;
+    const bool w_cache_on = ggml_cuda_fp8_weight_cache_enabled() && w_name && w_name[0] != '\0';
+    if (w_cache_on) {
+        std::lock_guard<std::mutex> lk(g_fp8_wcache_mtx);   // held across the (rare) miss requant
+        auto it = g_fp8_wcache.find(w_name);
+        const bool hit = it != g_fp8_wcache.end() && it->second.d_fp8 && it->second.d_scale &&
+                         it->second.N == N && it->second.K == K && it->second.nb1 == src0->nb[1] &&
+                         it->second.type == (int)src0->type && it->second.device == ctx.device;
+        if (hit) {
+            w_fp8_ptr   = it->second.d_fp8;
+            w_scale_ptr = it->second.d_scale;
+            if (it->second.ready) cudaStreamWaitEvent(stream, it->second.ready, 0);  // cross-stream safe
+        } else {
+            if (it != g_fp8_wcache.end()) {   // stale shape/device at this name (shouldn't happen) -> drop
+                if (it->second.d_fp8)   cudaFree(it->second.d_fp8);
+                if (it->second.d_scale) cudaFree(it->second.d_scale);
+                if (it->second.ready)   cudaEventDestroy(it->second.ready);
+                g_fp8_wcache_bytes -= it->second.bytes;
+                g_fp8_wcache.erase(it);
+            }
+            const size_t need = (size_t)N*K + sizeof(float);
+            if (g_fp8_wcache_bytes + need <= ggml_cuda_fp8_weight_cache_budget_bytes()) {
+                fp8_weight_cache_entry e;
+                e.N = N; e.K = K; e.nb1 = src0->nb[1]; e.type = (int)src0->type; e.device = ctx.device; e.bytes = need;
+                if (cudaMalloc((void**)&e.d_fp8, (size_t)N*K) == cudaSuccess &&
+                    cudaMalloc((void**)&e.d_scale, sizeof(float)) == cudaSuccess &&
+                    cudaEventCreateWithFlags(&e.ready, cudaEventDisableTiming) == cudaSuccess) {
+                    if (run_weight_quant(e.d_fp8, e.d_scale)) {
+                        cudaEventRecord(e.ready, stream);       // record BEFORE the entry is observable
+                        g_fp8_wcache_bytes += need;
+                        g_fp8_wcache.emplace(std::string(w_name), e);
+                        w_fp8_ptr = e.d_fp8; w_scale_ptr = e.d_scale;   // quant already done
+                    } else {
+                        cudaFree(e.d_fp8); cudaFree(e.d_scale); cudaEventDestroy(e.ready);
+                        return false;
+                    }
+                } else {
+                    if (e.d_fp8)   cudaFree(e.d_fp8);
+                    if (e.d_scale) cudaFree(e.d_scale);
+                    if (e.ready)   cudaEventDestroy(e.ready);
+                    // alloc failed -> fall through to pool below
+                }
+            }
+            // (budget full or alloc failed -> w_fp8_ptr stays null -> pool fallback)
+        }
+    }
+    if (w_fp8_ptr == nullptr) {   // cache off / miss-not-cached / budget full
+        w_fp8_ptr   = w_fp8.alloc((size_t)N*K);
+        w_scale_ptr = w_scale.alloc(1);
+        if (!run_weight_quant(w_fp8_ptr, w_scale_ptr)) return false;
     }
 
-    // 2) activation -> e4m3 [M,K] (flat; src1 [K,M] contiguous == row-major [M,K])
-    ggml_cuda_pool_alloc<uint8_t>      a_fp8(ctx.pool(), (size_t)M*K);
-    ggml_cuda_pool_alloc<unsigned int> a_amax(ctx.pool(), 1);
-    ggml_cuda_pool_alloc<float>        a_scale(ctx.pool(), 1);
-    cudaMemsetAsync(a_amax.get(), 0, sizeof(unsigned int), stream);
-    {
-        const long n = (long)M*K;
+    // 2) activation -> e4m3 [M,K] (flat; src1 [K,M] contiguous == row-major [M,K]).
+    //    Reuse-cache (fix #2): q/k/v (and cross k/v) share src1 -> quantize once,
+    //    reuse the e4m3 buffer + scale. Stale-safe via per-compute generation +
+    //    src1 node identity; falls back to a fresh requant on any miss.
+    const long n_act = (long)M*K;
+    uint8_t * a_fp8_ptr   = nullptr;
+    float   * a_scale_ptr = nullptr;
+    ggml_cuda_pool_alloc<uint8_t>      a_fp8_pool(ctx.pool());    // fallback (cache off / alloc fail)
+    ggml_cuda_pool_alloc<float>        a_scale_pool(ctx.pool());
+    ggml_cuda_pool_alloc<unsigned int> a_amax(ctx.pool());       // transient amax scratch (miss only)
+    bool act_reused = false;
+
+    if (ggml_cuda_fp8_act_cache_enabled()) {
+        fp8_act_quant_cache & C = g_fp8_act_cache;
+        const uint64_t cur = g_fp8_act_cache_gen.load(std::memory_order_relaxed);
+        const bool hit = C.gen == cur && C.node == src1 && C.data == src1->data &&
+                         C.ne0 == src1->ne[0] && C.ne1 == src1->ne[1] &&
+                         C.nb1 == src1->nb[1] && C.type == (int)src1->type &&
+                         C.device == ctx.device && C.d_fp8 != nullptr &&
+                         C.d_scale != nullptr && C.cap >= (size_t)n_act;
+        if (hit) {
+            a_fp8_ptr   = C.d_fp8;
+            a_scale_ptr = C.d_scale;
+            act_reused  = true;
+        } else {
+            // MISS: (re)quantize into the OWNED persistent buffer (grow-only).
+            if (C.device != ctx.device && C.d_fp8 != nullptr) {
+                cudaFree(C.d_fp8);   C.d_fp8   = nullptr; C.cap = 0;
+                cudaFree(C.d_scale); C.d_scale = nullptr;
+            }
+            if (C.cap < (size_t)n_act) {
+                if (C.d_fp8 != nullptr) cudaFree(C.d_fp8);
+                if (cudaMalloc((void**)&C.d_fp8, (size_t)n_act) != cudaSuccess) { C.d_fp8 = nullptr; C.cap = 0; }
+                else                                                             C.cap   = (size_t)n_act;
+            }
+            if (C.d_scale == nullptr) {
+                if (cudaMalloc((void**)&C.d_scale, sizeof(float)) != cudaSuccess) C.d_scale = nullptr;
+            }
+            if (C.d_fp8 != nullptr && C.d_scale != nullptr) {
+                a_fp8_ptr   = C.d_fp8;
+                a_scale_ptr = C.d_scale;
+                C.gen  = cur;          C.node = src1;             C.data = src1->data;
+                C.ne0  = src1->ne[0];  C.ne1  = src1->ne[1];      C.nb1  = src1->nb[1];
+                C.type = (int)src1->type; C.device = ctx.device;
+            } else {
+                C.gen = (uint64_t)-1; C.node = nullptr;   // alloc failed -> invalidate, use pool
+            }
+        }
+    }
+    if (a_fp8_ptr == nullptr) {            // cache off, or owned-buffer alloc failed
+        a_fp8_ptr   = a_fp8_pool.alloc((size_t)M*K);
+        a_scale_ptr = a_scale_pool.alloc(1);
+    }
+    if (!act_reused) {
+        a_amax.alloc(1);
+        cudaMemsetAsync(a_amax.get(), 0, sizeof(unsigned int), stream);
         const int  threads = 256;
-        unsigned int grid = (unsigned int)((n + threads - 1)/threads);
+        unsigned int grid = (unsigned int)((n_act + threads - 1)/threads);
         if (grid > 1024u) grid = 1024u; if (grid == 0) grid = 1;
-        if (src1->type == GGML_TYPE_F16) fp8_a_amax_kernel<half ><<<grid, threads, 0, stream>>>((const half*)src1->data,  a_amax.get(), n);
-        else                             fp8_a_amax_kernel<float><<<grid, threads, 0, stream>>>((const float*)src1->data, a_amax.get(), n);
-        fp8_scale_from_amax<<<1, 1, 0, stream>>>(a_amax.get(), a_scale.get());
-        unsigned int qgrid = (unsigned int)((n + threads - 1)/threads);
+        if (src1->type == GGML_TYPE_F16) fp8_a_amax_kernel<half ><<<grid, threads, 0, stream>>>((const half*)src1->data,  a_amax.get(), n_act);
+        else                             fp8_a_amax_kernel<float><<<grid, threads, 0, stream>>>((const float*)src1->data, a_amax.get(), n_act);
+        fp8_scale_from_amax<<<1, 1, 0, stream>>>(a_amax.get(), a_scale_ptr);
+        unsigned int qgrid = (unsigned int)((n_act + threads - 1)/threads);
         if (qgrid > 65535u) qgrid = 65535u; if (qgrid == 0) qgrid = 1;
-        if (src1->type == GGML_TYPE_F16) fp8_a_quant_kernel<half ><<<qgrid, threads, 0, stream>>>((const half*)src1->data,  a_fp8.get(), n, a_scale.get());
-        else                             fp8_a_quant_kernel<float><<<qgrid, threads, 0, stream>>>((const float*)src1->data, a_fp8.get(), n, a_scale.get());
+        if (src1->type == GGML_TYPE_F16) fp8_a_quant_kernel<half ><<<qgrid, threads, 0, stream>>>((const half*)src1->data,  a_fp8_ptr, n_act, a_scale_ptr);
+        else                             fp8_a_quant_kernel<float><<<qgrid, threads, 0, stream>>>((const float*)src1->data, a_fp8_ptr, n_act, a_scale_ptr);
         if (cudaPeekAtLastError() != cudaSuccess) return false;
     }
 
@@ -949,7 +1216,7 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     cublasOperation_t T=CUBLAS_OP_T, Nn=CUBLAS_OP_N;
     cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &T, sizeof(T));
     cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &Nn, sizeof(Nn));
-    void* wsp = (void*)w_scale.get(); void* asp = (void*)a_scale.get();
+    void* wsp = (void*)w_scale_ptr; void* asp = (void*)a_scale_ptr;
     cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &wsp, sizeof(wsp));
     cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &asp, sizeof(asp));
     cublasDataType_t st = CUDA_R_32F;
@@ -962,13 +1229,42 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     cublasLtMatrixLayoutCreate(&Cd, out_dt, m, n, m);
     cublasLtMatrixLayoutCreate(&Dd, out_dt, m, n, m);
 
+    // fix #3: bias epilogue. bias dtype == output dtype (the canonical cuBLASLt case):
+    // F32 bias passes straight through for F32 output; for F16 (dit_f16) output the F32
+    // bias is downcast to F16 once into pool scratch. The bias is added in F32 compute
+    // before the store, matching ggml's post-matmul bias order.
+    ggml_cuda_pool_alloc<half> bias_f16(ctx.pool());
+    if (want_epi) {
+        void * bias_ptr = nullptr;
+        if (dst->type == GGML_TYPE_F16) {
+            half * b16 = bias_f16.alloc((size_t)N);
+            fp8_bias_f32_to_f16<<<(unsigned)((N + 255)/256), 256, 0, stream>>>((const float*)bias->data, b16, N);
+            if (cudaPeekAtLastError() != cudaSuccess) {
+                if (Ad) cublasLtMatrixLayoutDestroy(Ad);
+                if (Bd) cublasLtMatrixLayoutDestroy(Bd);
+                if (Cd) cublasLtMatrixLayoutDestroy(Cd);
+                if (Dd) cublasLtMatrixLayoutDestroy(Dd);
+                if (op) cublasLtMatmulDescDestroy(op);
+                return false;
+            }
+            bias_ptr = (void*)b16;
+        } else {
+            bias_ptr = (void*)bias->data;   // F32 bias + F32 output
+        }
+        cublasLtEpilogue_t epi = CUBLASLT_EPILOGUE_BIAS;
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof(epi));
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_ptr, sizeof(bias_ptr));
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &epi_out_dt, sizeof(epi_out_dt));
+    }
+
     ggml_cuda_pool_alloc<uint8_t> ws(ctx.pool(), 32*1024*1024);
     size_t wsz = 32*1024*1024;
 
     static int s_nocache = -1;
     if (s_nocache < 0) { const char* e = getenv("GGML_NVFP4_CUBLASLT_NOCACHE"); s_nocache = (e && atoi(e)) ? 1 : 0; }
-    static thread_local std::map<std::tuple<int,int,int,int>, cublasLtMatmulAlgo_t> g_fp8_algo_cache;
-    const auto key = std::make_tuple(m, n, k, (int)out_dt);
+    // key includes the epilogue flag: a bias GEMM may select a different algo.
+    static thread_local std::map<std::tuple<int,int,int,int,int>, cublasLtMatmulAlgo_t> g_fp8_algo_cache;
+    const auto key = std::make_tuple(m, n, k, (int)out_dt, want_epi ? 1 : 0);
 
     cublasLtMatmulAlgo_t algo; bool have_algo = false;
     if (!s_nocache) { auto it = g_fp8_algo_cache.find(key); if (it != g_fp8_algo_cache.end()) { algo = it->second; have_algo = true; } }
@@ -982,9 +1278,22 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
         if (hs == CUBLAS_STATUS_SUCCESS && got > 0) { algo = hr.algo; have_algo = true; if (!s_nocache) g_fp8_algo_cache[key] = algo; }
     }
 
+    // fix #3: if the bias epilogue has no algo for this shape, record it (fail fast next
+    // time) and return false WITHOUT touching dst — the caller runs the plain GEMM + a
+    // separate bias add. (Plain GEMMs keep their existing fall-through behaviour below.)
+    if (want_epi && !have_algo) {
+        g_fp8_epi_unsupported.insert(epi_key);
+        if (Ad) cublasLtMatrixLayoutDestroy(Ad);
+        if (Bd) cublasLtMatrixLayoutDestroy(Bd);
+        if (Cd) cublasLtMatrixLayoutDestroy(Cd);
+        if (Dd) cublasLtMatrixLayoutDestroy(Dd);
+        if (op) cublasLtMatmulDescDestroy(op);
+        return false;
+    }
+
     bool ok = have_algo;
     if (ok) {
-        cublasStatus_t ms = cublasLtMatmul(lt, op, &alpha_h, w_fp8.get(), Ad, a_fp8.get(), Bd,
+        cublasStatus_t ms = cublasLtMatmul(lt, op, &alpha_h, w_fp8_ptr, Ad, a_fp8_ptr, Bd,
                                            &beta_h, dst->data, Cd, dst->data, Dd,
                                            &algo, ws.get(), wsz, stream);
         ok = (ms == CUBLAS_STATUS_SUCCESS);

@@ -4133,6 +4133,57 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // FP8 GEMM bias epilogue (fix #3): a MUL_MAT routed to the FP8 cuBLASLt path
+    // (NVFP4 weight + GGML_FP8_FFN + name filter) immediately followed by its 1D
+    // broadcast bias ADD -> fold the bias into the cuBLASLt epilogue
+    // (CUBLASLT_EPILOGUE_BIAS) instead of a separate op_add kernel. The fused GEMM
+    // writes the post-bias result straight to the ADD's dst and we skip the ADD.
+    // GELU is NOT fused (Wan uses tanh-gelu; cuBLASLt's gelu epilogue is erf), so
+    // ffn.0's gelu stays a separate kernel. FP8 path only; env GGML_FP8_GEMM_EPILOGUE
+    // (off by default). On any non-exact follow-on (extra consumers of the pre-bias
+    // matmul output, missing/odd bias) OR an unsupported epilogue, the FP8 call returns
+    // false (dst untouched) and we fall through to the normal separate-kernel path.
+    {
+        static const bool fp8_epi = [](){ const char * e = getenv("GGML_FP8_GEMM_EPILOGUE"); return e && atoi(e); }();
+        if (fp8_epi && node->op == GGML_OP_MUL_MAT) {
+            ggml_tensor * w   = node->src[0];   // weight (NVFP4)
+            ggml_tensor * act = node->src[1];   // activation
+            const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+            if (w && act && w->type == GGML_TYPE_NVFP4 &&
+                ggml_cuda_fp8_ffn_enabled() && ggml_cuda_fp8_ffn_name_match(w->name) &&
+                blackwell_mma_available(cc) &&
+                (node->type == GGML_TYPE_F16 || node->type == GGML_TYPE_F32) &&
+                ggml_is_contiguous(node) &&
+                ggml_node_get_use_count(cgraph, i) == 1) {   // matmul output consumed ONLY by the bias add
+                auto is_view_like = [](ggml_op op) {
+                    return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
+                           op == GGML_OP_TRANSPOSE || op == GGML_OP_PERMUTE;
+                };
+                auto trace_back = [&](ggml_tensor * t) {
+                    while (t && is_view_like(t->op)) t = t->src[0];
+                    return t;
+                };
+                int j = i + 1;
+                while (j < cgraph->n_nodes && is_view_like(cgraph->nodes[j]->op)) ++j;
+                if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_ADD) {
+                    ggml_tensor * add_n = cgraph->nodes[j];
+                    auto is_bias = [&](ggml_tensor * b) {
+                        return b && b->type == GGML_TYPE_F32 && ggml_is_contiguous(b) &&
+                               b->ne[0] == node->ne[0] && b->ne[1] == 1 && b->ne[2] == 1 && b->ne[3] == 1;
+                    };
+                    ggml_tensor * bias = nullptr;
+                    if (trace_back(add_n->src[0]) == node && is_bias(add_n->src[1]))      bias = add_n->src[1];
+                    else if (trace_back(add_n->src[1]) == node && is_bias(add_n->src[0])) bias = add_n->src[0];
+                    if (bias && add_n->type == node->type && ggml_is_contiguous(add_n) &&
+                        ggml_nelements(add_n) == ggml_nelements(node) && node->ne[1] > 1 &&
+                        ggml_cuda_fp8_cublaslt_mul_mat(*cuda_ctx, w, act, add_n, bias)) {
+                        return j - i;   // consumed MUL_MAT .. ADD; gelu (if any) runs separately
+                    }
+                }
+            }
+        }
+    }
+
     // Fused bias-add + GELU (LTX FFN w1): ggml_ext_linear emits ADD(matmul_out, bias)
     // immediately followed by ggml_gelu_inplace. The bias-add otherwise runs as a
     // full-width op_add<half,float,half> over the 4x-wide [inner_dim, tokens] intermediate.
@@ -4776,7 +4827,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_tensor * bc  = s1_bcast ? s1 : s0;   // broadcast operand (gate)
                 const bool big_ok = big->type == GGML_TYPE_F32 ||
                                     (big->type == GGML_TYPE_F16 && f16_bcast_fuse);
-                if (big_ok && bc->type == GGML_TYPE_F32 && mul_n->type == big->type) {
+                // gate is normally F32 (the modulation tables). Under WAN_DIT_F16_MOD the
+                // gates are F16 too — accept an F16 gate ONLY when the big operand is also
+                // F16 (the dit_f16 mod stream) and the F16 fuse is enabled; the fused kernel
+                // reads either MOD type. Default (F32 gate) path is byte-identical.
+                const bool bc_ok = bc->type == GGML_TYPE_F32 ||
+                                   (bc->type == GGML_TYPE_F16 && big->type == GGML_TYPE_F16 && f16_bcast_fuse);
+                if (big_ok && bc_ok && mul_n->type == big->type) {
                     y_view = big; gate = bc;
                 }
             }
@@ -4835,8 +4892,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                             } else if (trace_back(sadd->src[1]) == add_n) {
                                 sshift = sadd->src[0];
                             }
+                            // shift must share the gate's dtype (the fused kernel reads gate
+                            // and shift as one MOD type). Default gate is F32 -> shift F32 =
+                            // the original check; under WAN_DIT_F16_MOD both are F16.
                             if (sshift && sadd->type == mul_n->type &&
-                                sshift->type == GGML_TYPE_F32 &&
+                                sshift->type == gate->type &&
                                 ggml_is_contiguous(sadd) &&
                                 ggml_is_contiguous(sshift) &&
                                 sshift->ne[0] == gate->ne[0] && sshift->ne[1] == 1 &&
@@ -5274,7 +5334,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+    static const bool no_graph = getenv("GGML_CUDA_NO_GRAPH") != nullptr;
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+
+    if (no_graph) { graph->disable_due_to_gpu_arch = true; return false; }
 
     if (graph->graph == nullptr) {
         if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_AMPERE) {
@@ -6322,11 +6385,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             // return false so the scheduler keeps it on the CPU backend. The graph only emits
             // GGML_OP_CONV_3D (via ggml_conv_3d_direct) when the same env is set, so this stays
             // consistent and is byte-identical (CPU conv_3d) when cuDNN is off.
+            // src[1] (activations) and dst may be F16 (WAN_VAE_F16 F16-activation decode):
+            // conv3d-cudnn.cu transposes/casts NCDHW<->NDHWC-f16 around cuDNN regardless of
+            // the ggml-side activation dtype, so F16 in/out is exact-as-the-F32 path here.
             return ggml_cuda_conv3d_cudnn_available() &&
                    (getenv("GGML_CUDNN_CONV3D") || getenv("GGML_CUDNN_CONV")) &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
                    (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
-                   op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+                   (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32) &&
+                   (op->type         == GGML_TYPE_F16 || op->type         == GGML_TYPE_F32);
         case GGML_OP_CONV_2D_DEFORM:
             // CUDA kernel implements the whcn path only (src + kernel contiguous);
             // the cwhn path falls back to the CPU backend via the scheduler.

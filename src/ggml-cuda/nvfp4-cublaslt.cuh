@@ -22,7 +22,12 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
 // off => prod byte-identical. Returns true if it handled the op, false to fall back.
 bool ggml_cuda_fp8_ffn_enabled();
 bool ggml_cuda_fp8_ffn_name_match(const char * name);
+// `bias` (optional, default null): when set AND GGML_FP8_GEMM_EPILOGUE=1, the 1D Linear
+// bias [N] is folded into the cuBLASLt epilogue (CUBLASLT_EPILOGUE_BIAS) and `dst` is the
+// post-bias output. Returns false (dst untouched) if the epilogue can't be served, so the
+// caller must fall back to a separate bias add. Null bias = the normal byte-identical path.
 bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
                                     const ggml_tensor * src0,
                                     const ggml_tensor * src1,
-                                    ggml_tensor * dst);
+                                    ggml_tensor * dst,
+                                    const ggml_tensor * bias = nullptr);

@@ -1,15 +1,5 @@
 #include "common.cuh"
 
-// LongCat lap-31.2 — fattn.cu owns the device-resident bsa-bitmap symbols. Define
-// them BEFORE pulling in fattn-mma-f16.cuh so the kernel template body (which
-// references the symbols) sees the definitions in this TU. Other TUs (template
-// instances) get the symbols via the extern declarations in
-// longcat-fa-bsa-bitmap.cuh, included from fattn-mma-f16.cuh.
-__device__ const uint32_t * g_longcat_fa_bsa_bitmap_dev = nullptr;
-__device__ int              g_longcat_fa_bsa_n_kwords_dev = 0;
-__device__ int              g_longcat_fa_bsa_n_qtiles_dev = 0;
-#define LONGCAT_FA_BSA_BITMAP_DEFINING_TU
-
 #include "fattn-common.cuh"
 #include "fattn-cudnn.cuh"
 #include "fattn-mma-f16.cuh"
@@ -19,16 +9,40 @@ __device__ int              g_longcat_fa_bsa_n_qtiles_dev = 0;
 #include "fattn.cuh"
 #include "ggml-cuda.h"
 
+// WAN SLA fix (see longcat-fa-bsa-bitmap.cuh for the full why): the BSA bitmap state
+// now lives in a HOST struct here (single source of truth, external linkage links
+// fine cross-TU — no -rdc). Each fattn instance TU keeps its own STATIC __device__
+// copies and re-syncs them from this struct in launch_fattn, generation-gated. The
+// setters just update the struct and bump the generation; no cudaMemcpyToSymbol here.
+static longcat_fa_bsa_host_state_t g_longcat_fa_bsa_host = { nullptr, 0, 0, 0, 0, 0, 0 };
+
+const longcat_fa_bsa_host_state_t & ggml_cuda_longcat_fa_bsa_host_state() {
+    return g_longcat_fa_bsa_host;
+}
+
 void ggml_cuda_set_longcat_fa_bsa_bitmap(const void * device_bitmap_u32,
                                           int n_qtiles, int n_kwords) {
-    // Copy the pointer + dims into the device-resident symbols. We use
-    // cudaMemcpyToSymbol because the symbols are __device__ memory; passing a
-    // nullptr clears the state (the FA kernel reads g_..._bitmap_dev and skips
-    // the bitmap path when it's null).
-    const void * ptr = device_bitmap_u32;
-    CUDA_CHECK(cudaMemcpyToSymbol(g_longcat_fa_bsa_bitmap_dev, &ptr, sizeof(void *)));
-    CUDA_CHECK(cudaMemcpyToSymbol(g_longcat_fa_bsa_n_kwords_dev, &n_kwords, sizeof(int)));
-    CUDA_CHECK(cudaMemcpyToSymbol(g_longcat_fa_bsa_n_qtiles_dev, &n_qtiles, sizeof(int)));
+    // device_bitmap_u32 == nullptr clears the state (kernel skips the bitmap path).
+    g_longcat_fa_bsa_host.bitmap_dev = device_bitmap_u32;
+    g_longcat_fa_bsa_host.n_qtiles   = n_qtiles;
+    g_longcat_fa_bsa_host.n_kwords   = n_kwords;
+    ++g_longcat_fa_bsa_host.generation;
+}
+
+// WAN SLA: when enabled, the FA K-tile bitmap skip engages even on the MASK-FREE
+// self-attn path (Wan self-attn is dense/maskless; an N×N -INF mask just to carry the
+// skip gate would be ~10 GB at 81f). n_ktiles scopes the (process-wide) bitmap to the
+// self-attn sequence it was built for, so the shorter cross-attention is untouched.
+void ggml_cuda_set_longcat_fa_bsa_mask_free(int enabled, int n_ktiles) {
+    g_longcat_fa_bsa_host.mask_free = enabled ? 1 : 0;
+    g_longcat_fa_bsa_host.n_ktiles  = enabled ? n_ktiles : 0;
+    ++g_longcat_fa_bsa_host.generation;
+}
+
+// WAN SLA Stage 1: >0 ⇒ per-head bitmap laid out [n_heads, n_qtiles, n_kwords].
+void ggml_cuda_set_longcat_fa_bsa_n_heads(int n_heads) {
+    g_longcat_fa_bsa_host.n_heads = n_heads > 0 ? n_heads : 0;
+    ++g_longcat_fa_bsa_host.generation;
 }
 
 template <int DKQ, int DV, int ncols2>

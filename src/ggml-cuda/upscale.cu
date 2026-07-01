@@ -1,6 +1,10 @@
 #include "upscale.cuh"
 
-static __global__ void upscale_f32(const float * x, float * dst,
+// Nearest-neighbour upscale. Templated on the element type so the WAN_VAE_F16 F16-activation
+// VAE decode (Resample's 2x spatial upscale, a heavy tensor) keeps it half-width; the legacy
+// F32 path is byte-identical (T = float). Pure gather/copy -> no precision change vs casting.
+template <typename T>
+static __global__ void upscale_nearest(const T * x, T * dst,
         const int nb00, const int nb01, const int nb02, const int nb03,
         const int ne10, const int ne11, const int ne12, const int ne13,
         const float sf0, const float sf1, const float sf2, const float sf3) {
@@ -19,7 +23,7 @@ static __global__ void upscale_f32(const float * x, float * dst,
     int i02 = i12 / sf2;
     int i03 = i13 / sf3;
 
-    dst[index] = *( (const float *)((const char *)x + i03 * nb03 + i02 * nb02 + i01 * nb01 + i00 * nb00) );
+    dst[index] = *( (const T *)((const char *)x + i03 * nb03 + i02 * nb02 + i01 * nb01 + i00 * nb00) );
 }
 
 static __global__ void upscale_f32_bilinear(const float * x, float * dst,
@@ -215,7 +219,8 @@ static __global__ void upscale_f32_bicubic(const float * x, float * dst,
     dst[index] = result;
 }
 
-static void upscale_f32_cuda(const float * x, float * dst,
+template <typename T>
+static void upscale_nearest_cuda(const T * x, T * dst,
         const int nb00, const int nb01, const int nb02, const int nb03,
         const int ne10, const int ne11, const int ne12, const int ne13,
         const float sf0, const float sf1, const float sf2, const float sf3,
@@ -223,7 +228,7 @@ static void upscale_f32_cuda(const float * x, float * dst,
     const int64_t dst_size   = ne10 * ne11 * ne12 * ne13;
     const int64_t num_blocks = (dst_size + CUDA_UPSCALE_BLOCK_SIZE - 1) / CUDA_UPSCALE_BLOCK_SIZE;
 
-    upscale_f32<<<num_blocks, CUDA_UPSCALE_BLOCK_SIZE,0,stream>>>(x, dst, nb00, nb01, nb02, nb03, ne10, ne11, ne12, ne13, sf0, sf1, sf2, sf3);
+    upscale_nearest<T><<<num_blocks, CUDA_UPSCALE_BLOCK_SIZE,0,stream>>>(x, dst, nb00, nb01, nb02, nb03, ne10, ne11, ne12, ne13, sf0, sf1, sf2, sf3);
 }
 
 static void upscale_f32_bilinear_cuda(const float * x, float * dst,
@@ -260,8 +265,10 @@ void ggml_cuda_op_upscale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     float * dst_d = (float *)dst->data;
     cudaStream_t stream = ctx.stream();
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+    // NEAREST also supports F16 (WAN_VAE_F16 F16-activation VAE decode); the interpolating
+    // modes (bilinear/bicubic) remain F32-only — nothing feeds them F16. src/dst share type.
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+    GGML_ASSERT( dst->type == src0->type);
 
     const int mode_flags = dst->op_params[0];
     const ggml_scale_mode mode = (ggml_scale_mode)(mode_flags & 0xFF);
@@ -279,13 +286,19 @@ void ggml_cuda_op_upscale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 
     if (mode == GGML_SCALE_MODE_NEAREST) {
-        upscale_f32_cuda(src0_d, dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], sf0, sf1, sf2, sf3, stream);
+        if (src0->type == GGML_TYPE_F16) {
+            upscale_nearest_cuda<half>((const half *)src0->data, (half *)dst->data, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], sf0, sf1, sf2, sf3, stream);
+        } else {
+            upscale_nearest_cuda<float>(src0_d, dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], sf0, sf1, sf2, sf3, stream);
+        }
     } else if (mode == GGML_SCALE_MODE_BILINEAR) {
+        GGML_ASSERT(src0->type == GGML_TYPE_F32);
         const bool antialias = (mode_flags & GGML_SCALE_FLAG_ANTIALIAS);
         upscale_f32_bilinear_cuda(src0_d, dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
                                  src0->ne[0], src0->ne[1], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
                                  sf0, sf1, sf2, sf3, pixel_offset, antialias, stream);
     } else if (mode == GGML_SCALE_MODE_BICUBIC) {
+        GGML_ASSERT(src0->type == GGML_TYPE_F32);
         upscale_f32_bicubic_cuda(src0_d, dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
                                  src0->ne[0], src0->ne[1], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
                                  sf0, sf1, sf2, sf3, pixel_offset, stream);

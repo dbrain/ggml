@@ -75,20 +75,29 @@ static __global__ void kcrs3d_to_krsc3d_f16(const T * __restrict__ in, half * __
     out[o] = __float2half((float)in[idx]);
 }
 
-// NCDHW f32 -> NDHWC f16: per batch n, [C, S] (NCDHW) -> [S, C] (NDHWC), S = D*H*W.
-static __global__ void ncdhw_f32_to_ndhwc_f16_tiled(const float * __restrict__ in, half * __restrict__ out,
-                                                    int N, int C, int S) {
+// dtype helpers so the layout transposes are agnostic to the ggml-side activation dtype
+// (F32 for the legacy path, F16 for the WAN_VAE_F16 F16-activation decode). cuDNN's IO is
+// always HALF; only the ggml src/dst tensors differ.
+static __device__ __forceinline__ float cv3d_to_f32(float v) { return v; }
+static __device__ __forceinline__ float cv3d_to_f32(half  v) { return __half2float(v); }
+static __device__ __forceinline__ void  cv3d_store(float * p, float v) { *p = v; }
+static __device__ __forceinline__ void  cv3d_store(half  * p, float v) { *p = __float2half(v); }
+
+// NCDHW (ggml src, Tin) -> NDHWC f16 (cuDNN X): per batch n, [C, S] -> [S, C], S = D*H*W.
+template <typename Tin>
+static __global__ void ncdhw_to_ndhwc_f16_tiled(const Tin * __restrict__ in, half * __restrict__ out,
+                                                int N, int C, int S) {
     __shared__ float tile[CV_TILE][CV_TILE + 1];
     int n = blockIdx.z;
-    const float * inb  = in  + (long)n * C * S;   // [C, S]
-    half        * outb = out + (long)n * S * C;   // [S, C]
+    const Tin * inb  = in  + (long)n * C * S;   // [C, S]
+    half      * outb = out + (long)n * S * C;   // [S, C]
 
     int c0 = blockIdx.y * CV_TILE;
     int s0 = blockIdx.x * CV_TILE;
     for (int j = 0; j < CV_TILE; j += CV_BR) {
         int c = c0 + threadIdx.y + j;
         int s = s0 + threadIdx.x;
-        if (c < C && s < S) tile[threadIdx.y + j][threadIdx.x] = inb[(long)c * S + s];
+        if (c < C && s < S) tile[threadIdx.y + j][threadIdx.x] = cv3d_to_f32(inb[(long)c * S + s]);
     }
     __syncthreads();
     int sT = s0 + threadIdx.y;   // becomes row
@@ -99,13 +108,14 @@ static __global__ void ncdhw_f32_to_ndhwc_f16_tiled(const float * __restrict__ i
     }
 }
 
-// NDHWC f16 -> NCDHW f32: per batch n, [S, C] (NDHWC) -> [C, S] (NCDHW), S = OD*OH*OW.
-static __global__ void ndhwc_f16_to_ncdhw_f32_tiled(const half * __restrict__ in, float * __restrict__ out,
-                                                    int N, int C, int S) {
+// NDHWC f16 (cuDNN Y) -> NCDHW (ggml dst, Tout): per batch n, [S, C] -> [C, S], S = OD*OH*OW.
+template <typename Tout>
+static __global__ void ndhwc_f16_to_ncdhw_tiled(const half * __restrict__ in, Tout * __restrict__ out,
+                                                int N, int C, int S) {
     __shared__ float tile[CV_TILE][CV_TILE + 1];
     int n = blockIdx.z;
     const half * inb  = in  + (long)n * S * C;    // [S, C]
-    float      * outb = out + (long)n * C * S;    // [C, S]
+    Tout       * outb = out + (long)n * C * S;    // [C, S]
 
     int s0 = blockIdx.y * CV_TILE;
     int c0 = blockIdx.x * CV_TILE;
@@ -119,7 +129,7 @@ static __global__ void ndhwc_f16_to_ncdhw_f32_tiled(const half * __restrict__ in
     int sT = s0 + threadIdx.x;   // becomes col (contiguous in out)
     for (int j = 0; j < CV_TILE; j += CV_BR) {
         int c = cT + j;
-        if (c < C && sT < S) outb[(long)c * S + sT] = tile[threadIdx.x][threadIdx.y + j];
+        if (c < C && sT < S) cv3d_store(&outb[(long)c * S + sT], tile[threadIdx.x][threadIdx.y + j]);
     }
 }
 
@@ -272,7 +282,10 @@ bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         return false; } while (0)
     if (!ggml_is_contiguous(kernel) || !ggml_is_contiguous(input)) CONV3D_REJECT("noncontig");
     if (kernel->type != GGML_TYPE_F16 && kernel->type != GGML_TYPE_F32) CONV3D_REJECT("wtype");
-    if (input->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) CONV3D_REJECT("not-f32");
+    // Activations may be F32 (legacy) or F16 (WAN_VAE_F16 F16-activation decode). cuDNN runs
+    // HALF internally either way; the layout transposes below cast in/out per the ggml dtype.
+    if (input->type != GGML_TYPE_F32 && input->type != GGML_TYPE_F16) CONV3D_REJECT("in-dtype");
+    if (dst->type   != GGML_TYPE_F32 && dst->type   != GGML_TYPE_F16) CONV3D_REJECT("dst-dtype");
 
     const int KW = kernel->ne[0], KH = kernel->ne[1], KD = kernel->ne[2];
     const int W  = input->ne[0],  H  = input->ne[1],  D  = input->ne[2];
@@ -306,7 +319,11 @@ bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     {
         dim3 blk(CV_TILE, CV_BR);
         dim3 grd((S_in + CV_TILE - 1) / CV_TILE, (c + CV_TILE - 1) / CV_TILE, n);
-        ncdhw_f32_to_ndhwc_f16_tiled<<<grd, blk, 0, stream>>>((const float *)input->data, x_ndhwc.get(), n, c, S_in);
+        if (input->type == GGML_TYPE_F16) {
+            ncdhw_to_ndhwc_f16_tiled<half><<<grd, blk, 0, stream>>>((const half *)input->data, x_ndhwc.get(), n, c, S_in);
+        } else {
+            ncdhw_to_ndhwc_f16_tiled<float><<<grd, blk, 0, stream>>>((const float *)input->data, x_ndhwc.get(), n, c, S_in);
+        }
     }
 
     const int S_out = OD * OH * OW;
@@ -327,7 +344,11 @@ bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     {
         dim3 blk(CV_TILE, CV_BR);
         dim3 grd((oc + CV_TILE - 1) / CV_TILE, (S_out + CV_TILE - 1) / CV_TILE, n);
-        ndhwc_f16_to_ncdhw_f32_tiled<<<grd, blk, 0, stream>>>(y_ndhwc.get(), (float *)dst->data, n, oc, S_out);
+        if (dst->type == GGML_TYPE_F16) {
+            ndhwc_f16_to_ncdhw_tiled<half><<<grd, blk, 0, stream>>>(y_ndhwc.get(), (half *)dst->data, n, oc, S_out);
+        } else {
+            ndhwc_f16_to_ncdhw_tiled<float><<<grd, blk, 0, stream>>>(y_ndhwc.get(), (float *)dst->data, n, oc, S_out);
+        }
     }
 
     return true;

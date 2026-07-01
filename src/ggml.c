@@ -5199,7 +5199,12 @@ struct ggml_tensor * ggml_conv_3d_direct(
     ne[2] = ggml_calc_conv_output_size(b->ne[2], a->ne[2], s2, p2, d2);
     ne[3] = (int64_t) oc * n;
 
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    // F16-activation VAE decode (WAN_VAE_F16): when the input activations are F16, emit an
+    // F16 result so the conv-boundary activation tensors stay half-width (the cuDNN conv3d
+    // path already computes in F16 internally; conv3d-cudnn.cu now accepts F16 src/dst).
+    // Default (F32 input) is byte-identical: result stays F32.
+    const enum ggml_type conv3d_rt = (b->type == GGML_TYPE_F16) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    struct ggml_tensor * result = ggml_new_tensor(ctx, conv3d_rt, 4, ne);
 
     ggml_set_op_params_i32(result, 0,  s0);
     ggml_set_op_params_i32(result, 1,  s1);
@@ -5359,7 +5364,10 @@ static struct ggml_tensor * ggml_interpolate_impl(
     GGML_ASSERT((mode & 0xFF) < GGML_SCALE_MODE_COUNT);
     // TODO: implement antialias for modes other than bilinear
     GGML_ASSERT(!(mode & GGML_SCALE_FLAG_ANTIALIAS) || (mode & 0xFF) == GGML_SCALE_MODE_BILINEAR);
-    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    // F16 input is allowed for NEAREST (pure gather/copy) — used by the WAN_VAE_F16
+    // F16-activation VAE decode. The interpolating modes stay F32-only.
+    GGML_ASSERT(a->type == GGML_TYPE_F32 ||
+                (a->type == GGML_TYPE_F16 && (mode & 0xFF) == GGML_SCALE_MODE_NEAREST));
 
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, a->type, ne0, ne1, ne2, ne3);
 

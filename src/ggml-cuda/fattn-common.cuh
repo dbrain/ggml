@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "longcat-fa-bsa-bitmap.cuh"  // WAN SLA: per-TU device symbols + launch_fattn sync helper
 
 #include <cstdint>
 
@@ -922,7 +923,8 @@ static __global__ void flash_attn_combine_results(
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
+    const bool bsa_sync = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1155,6 +1157,13 @@ void launch_fattn(
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
+
+    // WAN SLA: push the BSA bitmap state into THIS TU's per-TU device symbols (the ones
+    // the kernel reads) right before the launch. Only the MMA path passes bsa_sync=true;
+    // generation-gated so it's a no-op unless wan_sla/avatar changed the state.
+    if (bsa_sync) {
+        longcat_fa_bsa_sync_this_tu();
+    }
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
     ggml_cuda_kernel_launch(fattn_kernel, launch_params,

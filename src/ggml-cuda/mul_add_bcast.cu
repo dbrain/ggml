@@ -220,17 +220,21 @@ void ggml_cuda_op_mul_add_bcast(ggml_backend_cuda_context & ctx,
                                 const ggml_tensor *         gate,
                                 const ggml_tensor *         shift) {
     // BIG = x/y/dst type (F32 prod path, or F16 dit_f16 residual stream); MOD = gate/shift
-    // type (the modulation tables, always F32). The detector guarantees x/y_view/add share BIG.
+    // type — F32 (the modulation tables) by default, or F16 under WAN_DIT_F16_MOD so the
+    // F16 residual stream's adaLN runs uniform F16. The detector guarantees x/y_view/add
+    // share BIG and (gate, shift) share MOD.
     const bool big_f16 = (add_n->type == GGML_TYPE_F16);
+    const bool mod_f16 = (gate->type == GGML_TYPE_F16);
     GGML_ASSERT(add_n->type == GGML_TYPE_F32 || add_n->type == GGML_TYPE_F16);
     GGML_ASSERT(x->type == add_n->type);
     GGML_ASSERT(y_view->type == add_n->type);
-    GGML_ASSERT(gate->type == GGML_TYPE_F32);
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 || gate->type == GGML_TYPE_F16);
+    GGML_ASSERT(!mod_f16 || big_f16);   // an F16 gate only pairs with the F16 residual stream
     GGML_ASSERT(ggml_is_contiguous(x));
     GGML_ASSERT(ggml_is_contiguous(gate));
     GGML_ASSERT(ggml_is_contiguous(add_n));
     if (shift) {
-        GGML_ASSERT(shift->type == GGML_TYPE_F32);
+        GGML_ASSERT(shift->type == gate->type);
         GGML_ASSERT(ggml_is_contiguous(shift));
     }
 
@@ -273,15 +277,15 @@ void ggml_cuda_op_mul_add_bcast(ggml_backend_cuda_context & ctx,
     const int64_t num_blocks = (n_elem + block_size - 1) / block_size;
     GGML_ASSERT(num_blocks <= (1LL << 31) - 1);
 
-#define MAB_LAUNCH(BIG)                                                                  \
+#define MAB_LAUNCH(BIG, MOD)                                                             \
     do {                                                                                 \
         const BIG  * x_d     = (const BIG  *) x->data;                                   \
         const BIG  * y_d     = (const BIG  *) y_buf->data;                               \
-        const float * gate_d  = (const float *) gate->data;                             \
-        const float * shift_d = shift ? (const float *) shift->data : nullptr;          \
+        const MOD  * gate_d  = (const MOD  *) gate->data;                                \
+        const MOD  * shift_d = shift ? (const MOD  *) shift->data : nullptr;             \
         BIG        * dst_d   = (BIG  *)       add_n->data;                               \
-        auto kern = has_shift ? mul_add_bcast_dim1_kernel<true,  BIG, float>             \
-                              : mul_add_bcast_dim1_kernel<false, BIG, float>;            \
+        auto kern = has_shift ? mul_add_bcast_dim1_kernel<true,  BIG, MOD>               \
+                              : mul_add_bcast_dim1_kernel<false, BIG, MOD>;              \
         kern<<<(int)num_blocks, block_size, 0, ctx.stream()>>>(                          \
             x_d, y_d, gate_d, shift_d, dst_d,                                            \
             n_elem, d0, d1, d2,                                                          \
@@ -289,8 +293,14 @@ void ggml_cuda_op_mul_add_bcast(ggml_backend_cuda_context & ctx,
             /*plane_d2 =*/ d0 * d2, /*gate_d0d2=*/ d0 * d2);                             \
     } while (0)
 
-    if (big_f16) { MAB_LAUNCH(__half); }
-    else         { MAB_LAUNCH(float);  }
+    // F32 residual -> F32 gate (byte-identical to the original). F16 residual takes
+    // either an F32 gate (the WAN_DIT_F16-only path) or an F16 gate (WAN_DIT_F16_MOD).
+    if (big_f16) {
+        if (mod_f16) { MAB_LAUNCH(__half, __half); }
+        else         { MAB_LAUNCH(__half, float);  }
+    } else {
+        MAB_LAUNCH(float, float);
+    }
 #undef MAB_LAUNCH
 }
 

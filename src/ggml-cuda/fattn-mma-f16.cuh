@@ -2,7 +2,7 @@
 #include "cp-async.cuh"
 #include "mma.cuh"
 #include "fattn-common.cuh"
-#include "longcat-fa-bsa-bitmap.cuh"  // LongCat lap-31.2 — extern __device__ symbols (defined in fattn.cu)
+#include "longcat-fa-bsa-bitmap.cuh"  // WAN SLA: per-TU __device__ BSA symbols (also pulled via fattn-common.cuh)
 
 using namespace ggml_cuda_mma;
 
@@ -1223,6 +1223,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int stride_mask,
         const int jt,
         const int zt_gqa,
+        const int head_idx,   // WAN SLA Stage 1: global Q head (zt_Q) for per-head bitmap indexing
         const int kb0_start,
         const int kb0_stop) {
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
@@ -1363,20 +1364,54 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     // the avatar runner has set the bitmap; otherwise the loop runs uncompacted
     // exactly as before (lap-29.2 in-iter sparse-skip is still in place as a
     // second-line filter when the bitmap doesn't catch a denied tile).
-    // 16 words = 512 K-tiles cap (avatar's worst case at 480p is 6 words / 171 K-tiles).
-    __shared__ uint32_t s_bsa_bitmap_words[16];
+    // 64 words = 2048 K-tiles cap = 131072 tokens (avatar 480p = 6 words / 171 K-tiles;
+    // WAN SLA at 1280x704x81 ≈ 74K tokens = ~1157 K-tiles = 37 words — needs > the old
+    // 16-word cap, hence 64). 256 B shared/CTA, negligible vs the K/V/Q tiles.
+    __shared__ uint32_t s_bsa_bitmap_words[64];
     bool bsa_bitmap_active = false;
     if constexpr (ncols2 == 1) {
-        if (mask_h != nullptr && g_longcat_fa_bsa_bitmap_dev != nullptr &&
+        // WAN SLA: the bitmap skip also engages on the maskless path when
+        // g_longcat_fa_bsa_mask_free_dev is set (Wan self-attn is dense/maskless —
+        // an N×N mask just to gate the skip would be ~10 GB at 81f). The legacy
+        // avatar BSA path still requires mask_h (mask_free flag default 0).
+        // WAN SLA: scope the (process-wide) bitmap to the self-attn it was built for.
+        // n_ktiles_dev==0 = legacy avatar (no scoping). Otherwise this FA call's own
+        // K-tile count must match, so the bitmap is NOT applied to the shorter
+        // cross-attention (or any other maskless ncols2==1 FA) in the same graph.
+        const int n_ktiles_call = (int)((ne11 + nbatch_fa - 1) / nbatch_fa);
+        const bool ktiles_ok    = (g_longcat_fa_bsa_n_ktiles_dev == 0) ||
+                                  (g_longcat_fa_bsa_n_ktiles_dev == n_ktiles_call);
+        // WAN-SLA TEMP DIAGNOSTIC: print gate values once per launch when sparse is armed.
+        if (g_longcat_fa_bsa_mask_free_dev && threadIdx.x==0 && threadIdx.y==0 &&
+            blockIdx.x==0 && blockIdx.y==0 && blockIdx.z==0) {
+            printf("[BSA-DBG] mf=%d n_kt_dev=%d n_kt_call=%d ne11=%d nbatch_fa=%d jt=%d n_qt_dev=%d n_kw_dev=%d bmp=%d ncols1=%d\n",
+                g_longcat_fa_bsa_mask_free_dev, g_longcat_fa_bsa_n_ktiles_dev, n_ktiles_call,
+                (int)ne11, (int)nbatch_fa, jt, g_longcat_fa_bsa_n_qtiles_dev,
+                g_longcat_fa_bsa_n_kwords_dev, g_longcat_fa_bsa_bitmap_dev!=nullptr, (int)ncols1);
+        }
+        if ((mask_h != nullptr || g_longcat_fa_bsa_mask_free_dev) && ktiles_ok &&
+            g_longcat_fa_bsa_bitmap_dev != nullptr &&
             jt < g_longcat_fa_bsa_n_qtiles_dev) {
             const int n_kw = g_longcat_fa_bsa_n_kwords_dev;
-            // n_kw is bounded by the avatar's resolution (≤16 in practice); fall
-            // through the bitmap path quietly if the runner mis-sized it.
-            if (n_kw > 0 && n_kw <= 16) {
+            // Fall through the bitmap path quietly if the runner mis-sized it.
+            if (n_kw > 0 && n_kw <= 64) {
                 bsa_bitmap_active = true;
-                if ((int)(threadIdx.y * blockDim.x + threadIdx.x) < n_kw) {
-                    const int tid_linear = threadIdx.y * blockDim.x + threadIdx.x;
-                    s_bsa_bitmap_words[tid_linear] = g_longcat_fa_bsa_bitmap_dev[jt * n_kw + tid_linear];
+                // WAN SLA Stage 1: per-head bitmap. n_heads_dev==0 → single shared
+                // bitmap row `jt` (Stage 0 / avatar, byte-identical). n_heads_dev>0 →
+                // offset by this CTA's Q head (head_idx == zt_Q; ncols2==1 ⇒ one head
+                // per CTA), layout [n_heads, n_qtiles, n_kwords]. Clamp head_idx defensively.
+                const uint32_t* bm_base = g_longcat_fa_bsa_bitmap_dev;
+                if (g_longcat_fa_bsa_n_heads_dev > 0) {
+                    const int h = head_idx < g_longcat_fa_bsa_n_heads_dev ? head_idx : 0;
+                    bm_base += (size_t) h * g_longcat_fa_bsa_n_qtiles_dev * n_kw;
+                }
+                // Strided load so n_kw (≤64) words are covered even if the CTA has
+                // fewer than n_kw threads (was a single-thread-per-word load capped
+                // at 16; the 64-word WAN SLA cap can exceed a small CTA's thread count).
+                const int tid_linear = threadIdx.y * blockDim.x + threadIdx.x;
+                const int nthreads    = blockDim.x * blockDim.y;
+                for (int w = tid_linear; w < n_kw; w += nthreads) {
+                    s_bsa_bitmap_words[w] = bm_base[jt * n_kw + w];
                 }
                 __syncthreads();
             }
@@ -1947,12 +1982,12 @@ static __global__ void flash_attn_ext_f16(
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, zt_Q, kb0_start, kb0_stop);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, zt_Q, kb0_start, kb0_stop);
         }
 
         kbc += iter_k;
@@ -1994,7 +2029,7 @@ static __global__ void flash_attn_ext_f16(
     constexpr bool needs_fixup = false;
     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
         (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, zt_Q, kb0_start, kb0_stop);
 #else
     GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -2077,7 +2112,8 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     }
 
     launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, warp_size_host);
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, warp_size_host,
+         /*bsa_sync=*/true);  // WAN SLA: sync this TU's per-TU BSA device symbols before launch
 }
 
 

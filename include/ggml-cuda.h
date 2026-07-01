@@ -105,6 +105,35 @@ GGML_BACKEND_API void ggml_cuda_nvfp4_register_weight_global(const char * name, 
 GGML_BACKEND_API void ggml_cuda_set_longcat_fa_bsa_bitmap(const void * device_bitmap_u32,
                                                           int n_qtiles, int n_kwords);
 
+// WAN SLA (lightx2v sparse-attention port): enable the FA K-tile bitmap skip on the
+// MASK-FREE self-attn path (mask_h == nullptr). Wan2.2 self-attention is dense/maskless;
+// carrying an N×N -INF mask only to gate the skip would be ~10 GB at 81f. With this on,
+// the (tiny) bitmap set above is the sole sparsity artifact. Pass enabled=0 to restore the
+// legacy avatar behaviour (skip requires a real mask). `n_ktiles` scopes the bitmap to FA
+// calls whose K-tile count matches (so the self-attn bitmap is NOT applied to the shorter
+// cross-attention in the same graph); pass the self-attn ceil(L_k/64).
+GGML_BACKEND_API void ggml_cuda_set_longcat_fa_bsa_mask_free(int enabled, int n_ktiles);
+
+// WAN SLA Stage 1 (per-head): when n_heads > 0 the bitmap set above is read as
+// [n_heads, n_qtiles, n_kwords] and the kernel offsets its per-Q-tile slice by the
+// CTA's Q head (ncols2==1 self-attn: one head per CTA), so each head selects its own
+// K-blocks. Pass 0 to restore the single shared bitmap (Stage 0 / avatar) layout.
+GGML_BACKEND_API void ggml_cuda_set_longcat_fa_bsa_n_heads(int n_heads);
+
+// FP8 FFN activation-quant reuse cache: bump the generation once per graph
+// compute so the cache (which reuses the e4m3-quantized activation across the
+// q/k/v Linears that share it) can never serve a stale buffer from a prior
+// compute. Cheap relaxed atomic; no-op effect on non-FP8 paths. Call right
+// before issuing the graph's ops (execute_graph). Off-switch for the cache
+// itself is GGML_FP8_ACT_QUANT_CACHE=0 (default on).
+GGML_BACKEND_API void ggml_cuda_fp8_act_cache_new_generation(void);
+
+// FP8 FFN e4m3 WEIGHT cache (GGML_FP8_WEIGHT_QUANT_CACHE=1, budget
+// GGML_FP8_WEIGHT_CACHE_MB): frees all cached e4m3 weight buffers. Optional —
+// the cache otherwise persists until process exit. Call at render/model teardown
+// if the ~budget of VRAM should be reclaimed between renders.
+GGML_BACKEND_API void ggml_cuda_fp8_weight_cache_clear(void);
+
 #ifdef  __cplusplus
 }
 #endif
