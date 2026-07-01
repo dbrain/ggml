@@ -535,7 +535,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = !per_head_mask && Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // The fattn VEC kernel has partial-warp __shfl reductions that are
+    // nondeterministic on Blackwell (sm120+, no implicit warp reconvergence) —
+    // see fattn-vec.cuh. Route Blackwell onto the MMA kernel instead (the same
+    // deterministic path pre-Ada GPUs already use for these shapes). Gated by
+    // FATTN_VEC_ON_BLACKWELL=1 for A/B. TODO: drop once fattn-vec is fully
+    // __syncwarp-hardened.
+    static const bool s_vec_on_blackwell = getenv("FATTN_VEC_ON_BLACKWELL") != nullptr;
+    const bool blackwell_no_vec = ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL && !s_vec_on_blackwell;
+    const bool can_use_vector_kernel = !blackwell_no_vec && !per_head_mask && Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
