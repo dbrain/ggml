@@ -25,11 +25,22 @@
 // One thread computes one output PAIR (2 dst elements). Grid covers
 // (d_head/2) * L * (n_head*N) pairs.  No intermediate buffers.
 
-template <bool INTERLEAVED>
+// T = element storage type of src0 `a` and dst (float or half). pe is ALWAYS
+// float. The rotation math runs in F32 regardless of T (load T->float, compute,
+// store float->T), so the F16 path is bit-identical to F32-rope-then-round-to-F16
+// (which is exactly what the F16-residual stream did downstream via ggml_cast /
+// cuDNN's internal q cast). Keeping q/k F16 through RoPE drops the two 1237 MB
+// F32 rope tensors from the DiT compute buffer (VACE 1280x704x65f: ~-1.85 GB).
+static __device__ __forceinline__ float rp_ld(const float * p, int64_t i) { return p[i]; }
+static __device__ __forceinline__ float rp_ld(const __half * p, int64_t i) { return __half2float(p[i]); }
+static __device__ __forceinline__ void  rp_st(float * p, int64_t i, float v) { p[i] = v; }
+static __device__ __forceinline__ void  rp_st(__half * p, int64_t i, float v) { p[i] = __float2half_rn(v); }
+
+template <bool INTERLEAVED, typename T>
 static __global__ void rope_pe_f32(
-        const float * __restrict__ a,
+        const T     * __restrict__ a,
         const float * __restrict__ pe,
-        float       * __restrict__ dst,
+        T           * __restrict__ dst,
         const int64_t d_head,
         const int64_t n_head,
         const int64_t L,
@@ -62,8 +73,8 @@ static __global__ void rope_pe_f32(
     const int64_t d_e = INTERLEAVED ? (2 * j) : j;          // even/first elem dim
     const int64_t d_o = INTERLEAVED ? (2 * j + 1) : (j + half);  // odd/second elem dim
     const int64_t a_base = d_e * a_s0 + head * a_s1 + t * a_s2 + n * a_s3;
-    const float x_e = a[a_base];
-    const float x_o = a[a_base + (d_o - d_e) * a_s0];
+    const float x_e = rp_ld(a, a_base);
+    const float x_o = rp_ld(a, a_base + (d_o - d_e) * a_s0);
 
     // pe is contiguous [2,2,half,L]: cos=pe[0,0,j,t]=4j+2*d_head*t, sin=pe[0,1,j,t]=2+4j+2*d_head*t
     const int64_t pe_base = 4 * j + (int64_t)2 * d_head * t;
@@ -84,37 +95,39 @@ static __global__ void rope_pe_f32(
     // for the odd lane.
     const float pe_e = __fmul_rn(x_e, c);  // x_e * cos
     const float po_e = __fmul_rn(x_o, s);  // x_o * sin
-    dst[d_base]            = __fsub_rn(pe_e, po_e);   // x_e*cos - x_o*sin
+    rp_st(dst, d_base,             __fsub_rn(pe_e, po_e));   // x_e*cos - x_o*sin
     const float pe_o = __fmul_rn(x_e, s);  // x_e * sin
     const float po_o = __fmul_rn(x_o, c);  // x_o * cos
-    dst[d_base + (d_o - d_e)] = __fadd_rn(pe_o, po_o);  // x_e*sin + x_o*cos
+    rp_st(dst, d_base + (d_o - d_e), __fadd_rn(pe_o, po_o));  // x_e*sin + x_o*cos
 }
 
 void ggml_cuda_op_rope_pe(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * a  = dst->src[0];
     const ggml_tensor * pe = dst->src[1];
 
-    GGML_ASSERT(a->type  == GGML_TYPE_F32);
+    // a/dst may be F32 (prod default) or F16 (the *_DIT_F16 residual stream keeps
+    // q/k F16 through RoPE so the two full-size F32 rope tensors leave the compute
+    // buffer). pe is always F32. dst type must match a.
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
     GGML_ASSERT(pe->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == a->type);
 
     const int64_t d_head = a->ne[0];
     const int64_t n_head = a->ne[1];
     const int64_t L      = a->ne[2];
     const int64_t N      = a->ne[3];
 
-    // strides in elements
-    const int64_t a_s0 = a->nb[0] / sizeof(float);
-    const int64_t a_s1 = a->nb[1] / sizeof(float);
-    const int64_t a_s2 = a->nb[2] / sizeof(float);
-    const int64_t a_s3 = a->nb[3] / sizeof(float);
+    // strides in elements (element size == the a/dst element size)
+    const size_t  esz  = ggml_type_size(a->type);
+    const int64_t a_s0 = a->nb[0] / esz;
+    const int64_t a_s1 = a->nb[1] / esz;
+    const int64_t a_s2 = a->nb[2] / esz;
+    const int64_t a_s3 = a->nb[3] / esz;
 
     GGML_ASSERT(ggml_is_contiguous(pe));
     GGML_ASSERT(ggml_is_contiguous(dst));
 
-    const float * a_d  = (const float *) a->data;
     const float * pe_d = (const float *) pe->data;
-    float       * d_d  = (float *) dst->data;
 
     cudaStream_t stream = ctx.stream();
 
@@ -125,11 +138,25 @@ void ggml_cuda_op_rope_pe(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     // op_params[0]: 1 = interleaved (GPT-J), 0 = non-interleaved (NeoX, LTX video).
     const int interleaved = ((const int32_t *) dst->op_params)[0];
-    if (interleaved) {
-        rope_pe_f32<true><<<grid, block, 0, stream>>>(
-            a_d, pe_d, d_d, d_head, n_head, L, N, a_s0, a_s1, a_s2, a_s3);
+    if (a->type == GGML_TYPE_F16) {
+        const __half * a_d = (const __half *) a->data;
+        __half     * d_d = (__half *) dst->data;
+        if (interleaved) {
+            rope_pe_f32<true, __half><<<grid, block, 0, stream>>>(
+                a_d, pe_d, d_d, d_head, n_head, L, N, a_s0, a_s1, a_s2, a_s3);
+        } else {
+            rope_pe_f32<false, __half><<<grid, block, 0, stream>>>(
+                a_d, pe_d, d_d, d_head, n_head, L, N, a_s0, a_s1, a_s2, a_s3);
+        }
     } else {
-        rope_pe_f32<false><<<grid, block, 0, stream>>>(
-            a_d, pe_d, d_d, d_head, n_head, L, N, a_s0, a_s1, a_s2, a_s3);
+        const float * a_d = (const float *) a->data;
+        float       * d_d = (float *) dst->data;
+        if (interleaved) {
+            rope_pe_f32<true, float><<<grid, block, 0, stream>>>(
+                a_d, pe_d, d_d, d_head, n_head, L, N, a_s0, a_s1, a_s2, a_s3);
+        } else {
+            rope_pe_f32<false, float><<<grid, block, 0, stream>>>(
+                a_d, pe_d, d_d, d_head, n_head, L, N, a_s0, a_s1, a_s2, a_s3);
+        }
     }
 }

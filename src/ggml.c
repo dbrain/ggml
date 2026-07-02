@@ -4431,7 +4431,10 @@ static struct ggml_tensor * ggml_rope_pe_impl(
         struct ggml_tensor  * a,
         struct ggml_tensor  * pe,
         int                   interleaved) {
-    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    // a may be F32 (default) or F16 (the *_DIT_F16 stream keeps q/k F16 through
+    // RoPE to drop the two full-size F32 rope tensors from the compute buffer).
+    // pe is always F32; the result element type follows a.
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
     GGML_ASSERT(pe->type == GGML_TYPE_F32);
     const int64_t d_head = a->ne[0];
     const int64_t n_head = a->ne[1];
@@ -4442,7 +4445,7 @@ static struct ggml_tensor * ggml_rope_pe_impl(
     GGML_ASSERT(pe->ne[2] == d_head / 2);
     GGML_ASSERT(pe->ne[3] == L);
 
-    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_head, L, n_head * N);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, a->type, d_head, L, n_head * N);
 
     ggml_set_op_params_i32(result, 0, interleaved ? 1 : 0);
 
