@@ -258,6 +258,17 @@ static void launch_bin_bcast_pack(const ggml_tensor * src0, const ggml_tensor * 
         GGML_ASSERT(nb02 % sizeof(src0_t) == 0);
         GGML_ASSERT(nb03 % sizeof(src0_t) == 0);
 
+        // WAN_DIT_F16=0 diagnostic: the F32 residual path can present a src1 whose dim-0 byte
+        // stride is 2-aligned (F16-safe) but not 4-aligned (F32) -> the assert below fires. Print
+        // the exact op + tensor names/strides once so the offending broadcast can be pinpointed.
+        if ((nb10 % sizeof(src1_t)) || (nb11 % sizeof(src1_t)) ||
+            (nb12 % sizeof(src1_t)) || (nb13 % sizeof(src1_t))) {
+            fprintf(stderr, "[binbcast-misalign] op=%s dst='%s' src0='%s'(type=%d) src1='%s'(type=%d) "
+                            "src1.nb=[%zu,%zu,%zu,%zu] sizeof(src1)=%zu ne1=[%ld,%ld,%ld,%ld]\n",
+                    ggml_op_name(dst->op), dst->name, src0->name, (int)src0->type,
+                    src1->name, (int)src1->type, nb10, nb11, nb12, nb13, sizeof(src1_t),
+                    (long)ne10, (long)ne11, (long)ne12, (long)ne13);
+        }
         GGML_ASSERT(nb10 % sizeof(src1_t) == 0);
         GGML_ASSERT(nb11 % sizeof(src1_t) == 0);
         GGML_ASSERT(nb12 % sizeof(src1_t) == 0);

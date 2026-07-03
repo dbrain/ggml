@@ -162,6 +162,33 @@ __device__ __forceinline__ uint8_t nvfp4_quant_elem(float val, float inv_scale,
     return ggml_cuda_float_to_fp4_e2m1(val, inv_scale);
 }
 
+// Stochastic rounding of the per-16-block UE4M3 activation SCALE code (not the E2M1
+// element). ggml_cuda_fp32_to_ue4m3 round-to-nearest bakes a per-block scale bias that
+// is COHERENT across blocks and frames -> the drifting nvfp4 "grid". Instead, pick which
+// of the two bracketing e4m3 scale codes to store at random, weighted by the fractional
+// distance of the target between them: E[stored scale] == target (unbiased), so the
+// coherent bias becomes a zero-mean ~sqrt(N) random walk that averages out. rnd in [0,1).
+// t must be > 0 (the block target amax/scale_div[/per_tensor], same value fed to
+// ggml_cuda_fp32_to_ue4m3); t==0 returns code 0 (==RTN). NOTE the grid: fp32_to_ue4m3 snaps t
+// to the *standard* e4m3 value grid, while ue4m3_to_fp32 decodes standard/2 (ggml's UE /2
+// convention, cancelled later by the 2x E2M1 LUT). So the code's grid value is 2*ue4m3_to_fp32;
+// t is bracketed on THAT grid so E[stored scale] == t (unbiased) exactly like the RTN it replaces.
+// Positive e4m3 byte order is monotonic in value, so the RTN code and its neighbour bracket t.
+__device__ __forceinline__ uint8_t nvfp4_ue4m3_stoch(float t, float rnd) {
+    int rtn = (int) ggml_cuda_fp32_to_ue4m3(t);
+    rtn = rtn < 0 ? 0 : (rtn > 0x7e ? 0x7e : rtn);
+    int c_lo, c_hi;
+    if (2.0f * ggml_cuda_ue4m3_to_fp32((uint8_t)rtn) <= t) { c_lo = rtn;     c_hi = rtn + 1; }
+    else                                                   { c_lo = rtn - 1; c_hi = rtn;     }
+    c_lo = c_lo < 0 ? 0 : c_lo;
+    c_hi = c_hi > 0x7e ? 0x7e : c_hi;
+    const float v_lo = 2.0f * ggml_cuda_ue4m3_to_fp32((uint8_t)c_lo);   // standard-e4m3 grid values
+    const float v_hi = 2.0f * ggml_cuda_ue4m3_to_fp32((uint8_t)c_hi);
+    const float span = v_hi - v_lo;
+    const float frac = span > 0.f ? (t - v_lo) / span : 0.f;   // 0 at/below range floor, clamps at top
+    return (uint8_t)((rnd < frac) ? c_hi : c_lo);
+}
+
 // REFINE=true runs the ggml-MMQ ±2 scale-refinement search (5 candidate scale codes,
 // each re-quantizing the 16-lane sub-block and keeping the min-reconstruction-error one).
 // REFINE=false is comfy/ModelOpt's native one-shot scaled_mm quantization: scale =
@@ -215,7 +242,8 @@ static __global__ void quant_act_kernel(const act_t * __restrict__ X,
                                         uint8_t * __restrict__ out_data,    // M*(K/2)
                                         uint8_t * __restrict__ out_scales,  // swizzled
                                         int M, int K, float per_tensor, bool stoch,
-                                        bool hadamard, bool scale_ceil, bool refine_act) {
+                                        bool hadamard, bool scale_ceil, bool refine_act, float scale_div,
+                                        bool scale_stoch) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
     const int nsub = K/16;
     const int idx = blockIdx.x*blockDim.x + threadIdx.x;
@@ -241,20 +269,28 @@ static __global__ void quant_act_kernel(const act_t * __restrict__ X,
     // the block scale, so alpha = A_per_tensor only). At per_tensor==1 this is byte-
     // identical to the single-level one-shot below.
     if (per_tensor > 0.f) {
-        const float tgt = (amax/6.0f)/per_tensor;
-        int tc = (int) ggml_cuda_fp32_to_ue4m3(tgt);
+        const float tgt = (amax/scale_div)/per_tensor;
+        // Stochastic block-scale rounding (GGML_NVFP4_ACT_SCALE_STOCH) SUPERSEDES the RTN +
+        // ceil/refine deterministic strategies: it is the alternative that breaks the coherent
+        // grid into a zero-mean random walk. Keyed on the (block,frame) index so it stays
+        // reproducible for a fixed seed but decorrelates across frames (tgt drifts).
+        int tc = scale_stoch
+            ? (int) nvfp4_ue4m3_stoch(tgt, ggml_cuda_srand01((unsigned int)(r*nsub+ss), __float_as_uint(tgt)))
+            : (int) ggml_cuda_fp32_to_ue4m3(tgt);
         tc = tc < 0 ? 0 : (tc > 0x7e ? 0x7e : tc);
         // "Four Over Six" scale round-UP: nearest e4m3 can land BELOW the target block scale,
         // making the block's peak element scale past E2M1's +-6 and clamp -> systematic
         // magnitude UNDERESTIMATE = the dimming blob. Bump to the next (larger) e4m3 code so
         // the scale is >= target -> no clip. Positive e4m3 byte order is monotonic in value.
-        if (scale_ceil && tc < 0x7e && ggml_cuda_ue4m3_to_fp32((uint8_t)tc) < tgt) tc++;
+        if (!scale_stoch && scale_ceil && tc < 0x7e && ggml_cuda_ue4m3_to_fp32((uint8_t)tc) < tgt) tc++;
         // Per-block scale REFINEMENT: search the +-2 neighbouring e4m3 scale codes and keep the
         // one with min L2 reconstruction error. Unlike scale-ceil it balances peak-clip against
         // small-value resolution PER BLOCK -> flat blocks (near the 0<->0.5*scale FP4 boundary,
         // the source of the drifting "worms") pick a finer scale, and a block can never collapse
         // to zero (that is max error, never chosen). Pure FP4, full GEMM speed. GGML_NVFP4_ACT_REFINE.
-        if (refine_act) {
+        // Skipped under scale_stoch: the min-error search is a deterministic scale strategy that
+        // would collapse the random walk back to the biased RTN pick.
+        if (!scale_stoch && refine_act) {
             float best_err = FLT_MAX; int best_tc = tc;
             #pragma unroll
             for (int off=-2; off<=2; off++) {
@@ -288,8 +324,18 @@ static __global__ void quant_act_kernel(const act_t * __restrict__ X,
         return;
     }
 
-    const int first_code = (int) ggml_cuda_fp32_to_ue4m3(amax/6.0f);
     uint8_t fp8_code; float subblock_scale;
+    if (scale_stoch) {
+        // Single-level stochastic block-scale rounding (GGML_NVFP4_ACT_SCALE_STOCH): supersedes
+        // both the REFINE min-error search and the ceil, exactly as in the two-level branch. Same
+        // per-(block,frame) RNG keying so it's reproducible for a fixed seed, coherent-bias-free.
+        const float t = amax/scale_div;
+        int tc = (int) nvfp4_ue4m3_stoch(t, ggml_cuda_srand01((unsigned int)(r*nsub+ss), __float_as_uint(t)));
+        tc = tc < 0 ? 0 : (tc > 0x7e ? 0x7e : tc);
+        fp8_code = (uint8_t)tc;
+        subblock_scale = ggml_cuda_ue4m3_to_fp32((uint8_t)tc);
+    } else {
+    const int first_code = (int) ggml_cuda_fp32_to_ue4m3(amax/scale_div);
     if (REFINE) {
         static constexpr int test_offsets[5] = {0,-1,1,-2,2};
         float best_err = FLT_MAX; fp8_code = 0; subblock_scale = 0.f;
@@ -311,9 +357,10 @@ static __global__ void quant_act_kernel(const act_t * __restrict__ X,
     } else {
         int tc = first_code < 0 ? 0 : (first_code > 0x7e ? 0x7e : first_code);
         // "Four Over Six" scale round-UP (see two-level branch): avoid peak-element clipping.
-        if (scale_ceil && tc < 0x7e && ggml_cuda_ue4m3_to_fp32((uint8_t)tc) < amax/6.0f) tc++;
+        if (scale_ceil && tc < 0x7e && ggml_cuda_ue4m3_to_fp32((uint8_t)tc) < amax/scale_div) tc++;
         fp8_code = (uint8_t)tc;
         subblock_scale = ggml_cuda_ue4m3_to_fp32((uint8_t)tc);
+    }
     }
     out_scales[swz_off(r, ss, nsub)] = fp8_code;
     const float inv_scale = subblock_scale > 0.f ? 0.5f/subblock_scale : 0.f;
@@ -570,10 +617,26 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     static int s_scaleceil = -1;
     if (s_scaleceil < 0) { const char* e = getenv("GGML_NVFP4_ACT_SCALE_CEIL"); s_scaleceil = (e && atoi(e)) ? 1 : 0; }
     const bool scale_ceil = s_scaleceil != 0;
+    // "Four Over Six" (arXiv 2512.02010): target the block peak at E2M1's 4 (not 6) so the
+    // round-to-nearest e4m3 block scale can't push the peak past 6 and clip -> removes the
+    // systematic DOWNWARD magnitude bias that is worst in flat/low-variance regions and is the
+    // DETERMINISTIC (coherent, temporally-accumulating) part of the nvfp4 grid. Env-gated,
+    // default 6.0f => byte-identical to prod. Pairs with GGML_NVFP4_ACT_SCALE_CEIL.
+    static int s_4o6 = -1;
+    if (s_4o6 < 0) { const char* e = getenv("GGML_NVFP4_ACT_4OVER6"); s_4o6 = (e && atoi(e)) ? 1 : 0; }
+    const float scale_div = s_4o6 ? 4.0f : 6.0f;
     // Per-block scale refinement search (two-level path) — min-error scale per block. Off by default.
     static int s_refine = -1;
     if (s_refine < 0) { const char* e = getenv("GGML_NVFP4_ACT_REFINE"); s_refine = (e && atoi(e)) ? 1 : 0; }
     const bool refine_act = s_refine != 0;
+    // Stochastic rounding of the per-16-block UE4M3 activation SCALE code — env-gated, off by
+    // default (byte-identical to prod). When on it supersedes scale_ceil/refine at both the two-
+    // level and single-level quant sites: randomizes up/down between the two bracketing e4m3 scale
+    // codes (weighted by fractional distance, unbiased) so the coherent grid becomes a ~sqrt(N)
+    // random walk. Reproducible for a fixed seed (keyed on the (block,frame) index). GGML_NVFP4_ACT_SCALE_STOCH.
+    static int s_scalestoch = -1;
+    if (s_scalestoch < 0) { const char* e = getenv("GGML_NVFP4_ACT_SCALE_STOCH"); s_scalestoch = (e && atoi(e)) ? 1 : 0; }
+    const bool scale_stoch = s_scalestoch != 0;
     float a_per_tensor = 0.f;
     {
         static int s_twolevel = -1;
@@ -608,14 +671,14 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
         const float pt = a_per_tensor;   // >0 => two-level branch in the kernel
         if (rotate_blk) {
             // activation already block-rotated into rot_src (F32); quantize per-16 with no further rotation.
-            if (s_norefine || pt > 0.f) quant_act_kernel<float,false><<<blocks, threads, 0, stream>>>(rot_src, a_data.get(), a_scales.get(), M, K, pt, stoch, false, scale_ceil, refine_act);
-            else                        quant_act_kernel<float,true ><<<blocks, threads, 0, stream>>>(rot_src, a_data.get(), a_scales.get(), M, K, pt, stoch, false, scale_ceil, refine_act);
+            if (s_norefine || pt > 0.f) quant_act_kernel<float,false><<<blocks, threads, 0, stream>>>(rot_src, a_data.get(), a_scales.get(), M, K, pt, stoch, false, scale_ceil, refine_act, scale_div, scale_stoch);
+            else                        quant_act_kernel<float,true ><<<blocks, threads, 0, stream>>>(rot_src, a_data.get(), a_scales.get(), M, K, pt, stoch, false, scale_ceil, refine_act, scale_div, scale_stoch);
         } else if (src1->type == GGML_TYPE_F16) {
-            if (s_norefine || pt > 0.f) quant_act_kernel<half,false><<<blocks, threads, 0, stream>>>((const half*)src1->data, a_data.get(), a_scales.get(), M, K, pt, stoch, inkernel_had, scale_ceil, refine_act);
-            else                        quant_act_kernel<half,true ><<<blocks, threads, 0, stream>>>((const half*)src1->data, a_data.get(), a_scales.get(), M, K, pt, stoch, inkernel_had, scale_ceil, refine_act);
+            if (s_norefine || pt > 0.f) quant_act_kernel<half,false><<<blocks, threads, 0, stream>>>((const half*)src1->data, a_data.get(), a_scales.get(), M, K, pt, stoch, inkernel_had, scale_ceil, refine_act, scale_div, scale_stoch);
+            else                        quant_act_kernel<half,true ><<<blocks, threads, 0, stream>>>((const half*)src1->data, a_data.get(), a_scales.get(), M, K, pt, stoch, inkernel_had, scale_ceil, refine_act, scale_div, scale_stoch);
         } else {
-            if (s_norefine || pt > 0.f) quant_act_kernel<float,false><<<blocks, threads, 0, stream>>>((const float*)src1->data, a_data.get(), a_scales.get(), M, K, pt, stoch, inkernel_had, scale_ceil, refine_act);
-            else                        quant_act_kernel<float,true ><<<blocks, threads, 0, stream>>>((const float*)src1->data, a_data.get(), a_scales.get(), M, K, pt, stoch, inkernel_had, scale_ceil, refine_act);
+            if (s_norefine || pt > 0.f) quant_act_kernel<float,false><<<blocks, threads, 0, stream>>>((const float*)src1->data, a_data.get(), a_scales.get(), M, K, pt, stoch, inkernel_had, scale_ceil, refine_act, scale_div, scale_stoch);
+            else                        quant_act_kernel<float,true ><<<blocks, threads, 0, stream>>>((const float*)src1->data, a_data.get(), a_scales.get(), M, K, pt, stoch, inkernel_had, scale_ceil, refine_act, scale_div, scale_stoch);
         }
         if (cudaPeekAtLastError() != cudaSuccess) return false;
     }
