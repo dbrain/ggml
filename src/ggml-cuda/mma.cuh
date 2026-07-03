@@ -967,6 +967,27 @@ namespace ggml_cuda_mma {
 #endif // TURING_MMA_AVAILABLE
     }
 
+    // e4m3 (FP8) variant of the m16n8k32 int8 MMA above. The fragment shapes are
+    // byte-identical to the s8 case (A = tile<16,8,int> holding 4 regs of 4 packed
+    // e4m3 bytes, B = tile<8,8,int> holding 2 regs), so the int8 tile fragment types
+    // and their load_ldmatrix / load_generic loaders are reused verbatim; only the
+    // tensor core decodes each byte as __nv_fp8_e4m3 and accumulates into an F32
+    // C-fragment (tile<16,8,float>). Consumer Blackwell (sm120) only; used by the FP8
+    // flash-attention QK^T path (GGML_FP8_ATTN).
+    static __device__ __forceinline__ void mma(
+            tile<16, 8, float> & D, const tile<16, 8, int> & A, const tile<8, 8, int> & B) {
+#ifdef BLACKWELL_MMA_AVAILABLE
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+            : "+f"(D.x[0]), "+f"(D.x[1]), "+f"(D.x[2]), "+f"(D.x[3])
+            : "r"(A.x[0]), "r"(A.x[1]), "r"(A.x[2]), "r"(A.x[3]), "r"(B.x[0]), "r"(B.x[1]));
+#else
+        GGML_UNUSED_VARS(D, A, B);
+        NO_DEVICE_CODE;
+#endif // BLACKWELL_MMA_AVAILABLE
+    }
+
     static __device__ __forceinline__ void mma(
             tile<16, 4, half2> & D, const tile<16, 8, half2> & A, const tile<8, 8, half2> & B) {
 #ifdef TURING_MMA_AVAILABLE

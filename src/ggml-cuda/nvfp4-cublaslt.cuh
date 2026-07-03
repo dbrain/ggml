@@ -22,6 +22,14 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
 // off => prod byte-identical. Returns true if it handled the op, false to fall back.
 bool ggml_cuda_fp8_ffn_enabled();
 bool ggml_cuda_fp8_ffn_name_match(const char * name);
+
+// Per-tensor e4m3 quantization of a contiguous [n]-element F16/F32 activation buffer
+// (scale = amax/448). Reused by the FP8 flash-attention kernel (fattn-fp8.cu) to
+// quantize Q/K. `out` = n e4m3 bytes, `d_scale` = scalar scale (1 float, owned by the
+// caller), `d_amax` = scratch (1 uint). Runs on `stream`.
+void ggml_cuda_fp8_quant_pertensor(const void * X, ggml_type xtype,
+                                   uint8_t * out, float * d_scale, unsigned int * d_amax,
+                                   long n, cudaStream_t stream);
 // `bias` (optional, default null): when set AND GGML_FP8_GEMM_EPILOGUE=1, the 1D Linear
 // bias [N] is folded into the cuBLASLt epilogue (CUBLASLT_EPILOGUE_BIAS) and `dst` is the
 // post-bias output. Returns false (dst untouched) if the epilogue can't be served, so the

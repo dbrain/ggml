@@ -862,6 +862,33 @@ static __global__ void fp8_scale_from_amax(const unsigned int * __restrict__ ama
     scale_out[0] = (a > 0.f) ? a * (1.0f / FP8_E4M3_MAX) : 1.0f;
 }
 
+// Non-static wrapper exposing the per-tensor e4m3 quantization above to other TUs
+// (the FP8 flash-attention kernel quantizes Q/K with it). Reuses the exact amax ->
+// scale (amax/448) -> per-element __nv_fp8_e4m3(x/scale) math; no duplication. `X` is a
+// contiguous [n]-element F16 or F32 buffer, `out` receives n e4m3 bytes, `d_scale`
+// (1 float, caller-owned) receives the scalar scale, `d_amax` (1 uint) is scratch.
+void ggml_cuda_fp8_quant_pertensor(const void * X, ggml_type xtype,
+                                   uint8_t * out, float * d_scale, unsigned int * d_amax,
+                                   long n, cudaStream_t stream) {
+    cudaMemsetAsync(d_amax, 0, sizeof(unsigned int), stream);
+    const int bs = 256;
+    long gsl = (n + bs - 1) / bs;
+    if (gsl > 1024) gsl = 1024;
+    if (gsl < 1)    gsl = 1;
+    const int gs = (int) gsl;
+    if (xtype == GGML_TYPE_F16) {
+        fp8_a_amax_kernel<half> <<<gs, bs, 0, stream>>>((const half *)  X, d_amax, n);
+    } else {
+        fp8_a_amax_kernel<float><<<gs, bs, 0, stream>>>((const float *) X, d_amax, n);
+    }
+    fp8_scale_from_amax<<<1, 1, 0, stream>>>(d_amax, d_scale);
+    if (xtype == GGML_TYPE_F16) {
+        fp8_a_quant_kernel<half> <<<gs, bs, 0, stream>>>((const half *)  X, out, n, d_scale);
+    } else {
+        fp8_a_quant_kernel<float><<<gs, bs, 0, stream>>>((const float *) X, out, n, d_scale);
+    }
+}
+
 bool ggml_cuda_fp8_ffn_enabled() {
     static int v = -1;
     if (v < 0) { const char * e = getenv("GGML_FP8_FFN"); v = (e && atoi(e)) ? 1 : 0; }
@@ -1188,18 +1215,64 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
         a_scale_ptr = a_scale_pool.alloc(1);
     }
     if (!act_reused) {
+        // --- Hadamard activation rotation (matches the nvfp4 path + the folded weight) ---
+        // When GGML_NVFP4_ACT_HADAMARD is on, the FP8-diverted weight was folded by H offline
+        // (all-folded "-had" gguf), so the activation MUST be rotated by the SAME block-B H
+        // before the e4m3 quant: folded_W(=W@H) x rotated_A(=A@H) == W x A (H@H==I), identical
+        // math to the FP4 path — but the finer e4m3 (~16x FP4) removes the residual FP4 grain.
+        // Pre-rotate src1 into an F32 scratch ONCE with the SAME kernel/scale/butterfly the nvfp4
+        // path uses (nvfp4_rotate_kernel == nvfp4_hadN, single 1/sqrt(B)); BOTH the per-tensor
+        // amax AND the quant then consume the rotated scratch (never raw src1). PER-TENSOR block
+        // rule is identical to the nvfp4 path: had_block = (K % B == 0) ? B : 16. When the flag is
+        // off, fp8_rot_src stays null and the raw-src1 launches below are byte-identical to before.
+        static int s_fp8_had = -1;
+        if (s_fp8_had < 0) { const char* e = getenv("GGML_NVFP4_ACT_HADAMARD"); s_fp8_had = (e && atoi(e)) ? 1 : 0; }
+        static int s_fp8_had_block = -1;
+        if (s_fp8_had_block < 0) {
+            const char* e = getenv("GGML_NVFP4_ACT_HADAMARD_BLOCK");
+            int b = e ? atoi(e) : 256;
+            if (b < 16 || (b & (b - 1)) != 0) b = 16;
+            s_fp8_had_block = b;
+        }
+        const bool fp8_hadamard  = s_fp8_had != 0;
+        const int  fp8_had_block = (fp8_hadamard && (K % s_fp8_had_block) == 0) ? s_fp8_had_block : 16;
+        // LIFO pool ordering (ggml_cuda_pool is a stack allocator; ggml-cuda.cu:650 asserts on a
+        // non-LIFO free): a_amax is FUNCTION-scope (freed at return) while the rotation scratch
+        // a_rot is freed at the end of THIS block, so a_amax MUST be pushed BEFORE a_rot -> a_rot's
+        // lifetime then nests strictly inside a_amax's (same nesting the nvfp4 path uses). Reversing
+        // this (a_rot pushed first) freed a_rot while a_amax was still on top -> the crash.
         a_amax.alloc(1);
         cudaMemsetAsync(a_amax.get(), 0, sizeof(unsigned int), stream);
+
+        ggml_cuda_pool_alloc<float> a_rot(ctx.pool());
+        const float * fp8_rot_src = nullptr;
+        if (fp8_hadamard) {
+            a_rot.alloc((size_t)M * (size_t)K);
+            const size_t nblocks  = (size_t)M * (size_t)K / (size_t)fp8_had_block;
+            const int    rthreads = fp8_had_block < 1024 ? fp8_had_block : 1024;
+            unsigned int rgrid    = nblocks > 65535u ? 65535u : (unsigned int)nblocks;
+            if (rgrid == 0) rgrid = 1;
+            const size_t shmem = (size_t)fp8_had_block * sizeof(float);
+            if (src1->type == GGML_TYPE_F16)
+                nvfp4_rotate_kernel<half> <<<rgrid, rthreads, shmem, stream>>>((const half*) src1->data, a_rot.get(), fp8_had_block, nblocks);
+            else
+                nvfp4_rotate_kernel<float><<<rgrid, rthreads, shmem, stream>>>((const float*)src1->data, a_rot.get(), fp8_had_block, nblocks);
+            if (cudaPeekAtLastError() != cudaSuccess) return false;
+            fp8_rot_src = a_rot.get();
+        }
+
         const int  threads = 256;
         unsigned int grid = (unsigned int)((n_act + threads - 1)/threads);
         if (grid > 1024u) grid = 1024u; if (grid == 0) grid = 1;
-        if (src1->type == GGML_TYPE_F16) fp8_a_amax_kernel<half ><<<grid, threads, 0, stream>>>((const half*)src1->data,  a_amax.get(), n_act);
-        else                             fp8_a_amax_kernel<float><<<grid, threads, 0, stream>>>((const float*)src1->data, a_amax.get(), n_act);
+        if (fp8_rot_src)                      fp8_a_amax_kernel<float><<<grid, threads, 0, stream>>>(fp8_rot_src,               a_amax.get(), n_act);
+        else if (src1->type == GGML_TYPE_F16) fp8_a_amax_kernel<half ><<<grid, threads, 0, stream>>>((const half*)src1->data,  a_amax.get(), n_act);
+        else                                  fp8_a_amax_kernel<float><<<grid, threads, 0, stream>>>((const float*)src1->data, a_amax.get(), n_act);
         fp8_scale_from_amax<<<1, 1, 0, stream>>>(a_amax.get(), a_scale_ptr);
         unsigned int qgrid = (unsigned int)((n_act + threads - 1)/threads);
         if (qgrid > 65535u) qgrid = 65535u; if (qgrid == 0) qgrid = 1;
-        if (src1->type == GGML_TYPE_F16) fp8_a_quant_kernel<half ><<<qgrid, threads, 0, stream>>>((const half*)src1->data,  a_fp8_ptr, n_act, a_scale_ptr);
-        else                             fp8_a_quant_kernel<float><<<qgrid, threads, 0, stream>>>((const float*)src1->data, a_fp8_ptr, n_act, a_scale_ptr);
+        if (fp8_rot_src)                      fp8_a_quant_kernel<float><<<qgrid, threads, 0, stream>>>(fp8_rot_src,               a_fp8_ptr, n_act, a_scale_ptr);
+        else if (src1->type == GGML_TYPE_F16) fp8_a_quant_kernel<half ><<<qgrid, threads, 0, stream>>>((const half*)src1->data,  a_fp8_ptr, n_act, a_scale_ptr);
+        else                                  fp8_a_quant_kernel<float><<<qgrid, threads, 0, stream>>>((const float*)src1->data, a_fp8_ptr, n_act, a_scale_ptr);
         if (cudaPeekAtLastError() != cudaSuccess) return false;
     }
 

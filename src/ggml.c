@@ -5191,7 +5191,8 @@ struct ggml_tensor * ggml_conv_3d_direct(
         int                   d2,
         int                   c,
         int                   n,
-        int                   oc) {
+        int                   oc,
+        int                   hi_prec) {
 
     GGML_ASSERT(a->ne[3] == (int64_t) c * oc);
     GGML_ASSERT(b->ne[3] == (int64_t) c * n);
@@ -5202,11 +5203,15 @@ struct ggml_tensor * ggml_conv_3d_direct(
     ne[2] = ggml_calc_conv_output_size(b->ne[2], a->ne[2], s2, p2, d2);
     ne[3] = (int64_t) oc * n;
 
-    // F16-activation VAE decode (WAN_VAE_F16): when the input activations are F16, emit an
-    // F16 result so the conv-boundary activation tensors stay half-width (the cuDNN conv3d
-    // path already computes in F16 internally; conv3d-cudnn.cu now accepts F16 src/dst).
-    // Default (F32 input) is byte-identical: result stays F32.
-    const enum ggml_type conv3d_rt = (b->type == GGML_TYPE_F16) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    // Result dtype:
+    //  * hi_prec (WAN_VAE_HEAD_F32 head.2): force F32 so the cuDNN F32-IO plan writes an fp32
+    //    output straight into the ggml dst (no fp16 -> no per-channel unpatchify grid). Holds
+    //    even under WAN_VAE_F16, where the input activations are F16.
+    //  * else, F16-activation VAE decode (WAN_VAE_F16): F16 input -> F16 result so the
+    //    conv-boundary activation tensors stay half-width (cuDNN computes in F16 internally;
+    //    conv3d-cudnn.cu accepts F16 src/dst). Default (F32 input) is byte-identical: F32.
+    const enum ggml_type conv3d_rt = hi_prec ? GGML_TYPE_F32
+                                             : ((b->type == GGML_TYPE_F16) ? GGML_TYPE_F16 : GGML_TYPE_F32);
     struct ggml_tensor * result = ggml_new_tensor(ctx, conv3d_rt, 4, ne);
 
     ggml_set_op_params_i32(result, 0,  s0);
@@ -5221,6 +5226,7 @@ struct ggml_tensor * ggml_conv_3d_direct(
     ggml_set_op_params_i32(result, 9,  c);
     ggml_set_op_params_i32(result, 10, n);
     ggml_set_op_params_i32(result, 11, oc);
+    ggml_set_op_params_i32(result, 12, hi_prec ? 1 : 0);   // cuDNN F32-IO plan request (head.2)
 
     result->op = GGML_OP_CONV_3D;
     result->src[0] = a;

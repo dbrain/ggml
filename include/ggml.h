@@ -2328,7 +2328,8 @@ extern "C" {
             int                   d2,
             int                   n_channels,
             int                   n_batch,
-            int                   n_channels_out);
+            int                   n_channels_out,
+            int                   hi_prec);   // 1 = F32 result + F32-IO cuDNN plan (no fp16 Y); 0 = default
 
     enum ggml_op_pool {
         GGML_OP_POOL_MAX,

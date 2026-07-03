@@ -450,7 +450,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
         if (logit_softcap == 0.0f && gqa_ratio == 1 &&
             K->ne[0] == V->ne[0] && (K->ne[0] == 64 || K->ne[0] == 128) &&
-            K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
+            K->type == V->type && (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_BF16)) {
+            // bf16 K/V (WAN_ATTN_BF16): the cuDNN SDPA wrapper builds a bf16 IO graph; keeping
+            // it on cuDNN (not the F16-only MMA path) avoids the missing-bf16-D128-instance
+            // fallback that O(N^2)-OOMs. No other path produces bf16 K/V, so this is inert by
+            // default.
             return BEST_FATTN_KERNEL_CUDNN;
         }
     }

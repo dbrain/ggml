@@ -19,7 +19,9 @@
 //                          memory ((((oc*c+ic)*KD+kd)*KH+kh)*KW+kw))
 //   input  = dst->src[1]  ne=[W,H,D,c*n]      f32, NCDHW memory (per n: [c][d][h][w])
 //   dst                    ne=[OW,OH,OD,oc*n]  f32, NCDHW memory (per n: [oc][od][oh][ow])
-//   op_params = {s0,s1,s2, p0,p1,p2, d0,d1,d2, c, n, oc}   (axis 0=W, 1=H, 2=D)
+//   op_params = {s0,s1,s2, p0,p1,p2, d0,d1,d2, c, n, oc, hi_prec}   (axis 0=W, 1=H, 2=D)
+//              hi_prec=1 -> F32-IO plan: cuDNN writes fp32 Y (not fp16) into an F32 dst, so the
+//              output isn't fp16-quantized (WAN_VAE_HEAD_F32 head.2 unpatchify-grid fix).
 //
 // Returns true if it handled the op (ran cuDNN), false to fall back (caller aborts /
 // CPU). Activations transposed/cast NCDHW-f32 <-> NDHWC-f16 around the call with the
