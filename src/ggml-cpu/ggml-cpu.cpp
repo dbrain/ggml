@@ -468,6 +468,14 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_OUT_PROD:
             return (src0->type == GGML_TYPE_F32 || (ggml_is_quantized(src0->type) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_ROPE_PE:
+            // longcat-avatar: fused RoPE-from-precomputed-pe is a CUDA-only op (no CPU
+            // ggml_compute_forward path, no ggml_get_n_tasks entry). The generic `default:
+            // return true` below would let ggml_backend_sched place a ROPE_PE node on the CPU
+            // backend under --offload-to-cpu, which then aborts in ggml_get_n_tasks ("op not
+            // implemented: ROPE_PE"). Report it unsupported so the scheduler always keeps it
+            // on a backend (CUDA) that actually implements it.
+            return false;
         default:
             return true;
     }
