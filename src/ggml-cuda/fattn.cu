@@ -488,6 +488,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
+        case 384:
+            // Wan 2.1 VAE mid-block self-attention: single-head (n_head==1, gqa_ratio==1),
+            // maskless, DKQ==DV==384, F16 K/V, large L_q==L_k. Only the tile kernel has a
+            // D==384 instance (see the forced-TILE route below); MMA/WMMA/vec have no
+            // ncols2==1 large-D path. Accept only the symmetric-D shape.
+            if (V->ne[0] != K->ne[0]) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            break;
         case 512:
             if (V->ne[0] != K->ne[0]) {
                 return BEST_FATTN_KERNEL_NONE;
@@ -549,6 +558,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (gqa_ratio != 1) {
             return BEST_FATTN_KERNEL_NONE;
         }
+    }
+
+    // D == 384 (Wan 2.1 VAE mid-block attn): only the tile kernel is instantiated for this
+    // head size. The MMA/WMMA/vec kernels have no ncols2==1 large-D (>256) path, so route
+    // D==384 straight to tile regardless of tensor-core availability. Guarded on ==384 so
+    // every other head size dispatches byte-identically to before. The tile kernel has no
+    // per-head mask offset, so reject that sub-case (Wan VAE is maskless / broadcast-mask).
+    if (Q->ne[0] == 384) {
+        if (per_head_mask) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        return BEST_FATTN_KERNEL_TILE;
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:

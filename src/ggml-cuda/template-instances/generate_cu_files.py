@@ -3,7 +3,7 @@
 from glob import glob
 import os
 
-HEAD_SIZES_KQ = [40, 64, 72, 80, 96, 112, 128, 192, 256, 320, 512, 576]
+HEAD_SIZES_KQ = [40, 64, 72, 80, 96, 112, 128, 192, 256, 320, 384, 512, 576]
 
 # DKQ -> DV override for asymmetric head dims.
 HEAD_SIZES_V_OVERRIDE = {576: 512, 320: 256, 192: 128}
@@ -86,6 +86,11 @@ for ncols in [8, 16, 32, 64]:
                 if head_size_kq == 40:
                     continue
                 if head_size_kq == 72:
+                    continue
+                if head_size_kq == 384:
+                    # Wan 2.1 VAE mid-block attn (single-head, maskless, DKQ==DV==384) is
+                    # served exclusively by the tile kernel; the MMA kernel has no ncols2==1
+                    # large-D (>256) path, so do not emit MMA instances for it.
                     continue
                 # Skip compilation of unused ncols2 values for niche head sizes:
                 if head_size_kq == 192 and ncols2 not in (8, 16): # MiMo-V2.5

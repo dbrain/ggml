@@ -76,6 +76,15 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 16, 256, 2,  64,  64)
 
+    // Wan 2.1 VAE mid-block attn (single-head, maskless, DKQ==DV==384). ncols2==1 only, so
+    // the reachable total-ncols values are {2,4,8,16}. nbatch_K=48 (384%48==0, 48%8==0) keeps
+    // nbatch_V = nbatch_K*nbatch_fa/DV = 48*64/384 = 8 integral and dividing nbatch_fa, and
+    // caps per-block smem at ~21 KiB (occ 2 → ~43 KiB/SM < 48 KiB static-smem limit).
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(384, 384,  2,  64, 2,  64,  48)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(384, 384,  4, 128, 2,  64,  48)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(384, 384,  8, 256, 2,  64,  48)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(384, 384, 16, 256, 2,  64,  48)
+
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  4, 128, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  8, 256, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 16, 256, 2,  64,  64)
@@ -143,6 +152,14 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  32,  64)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 16, 256, 2,  32,  64)
+
+    // Wan 2.1 VAE mid-block attn (single-head, maskless, DKQ==DV==384), FP16-less path.
+    // nbatch_fa=32 keeps Q_tmp/KV_tmp within the 48 KiB static-smem limit at occ 1
+    // (ncols=16: ~33 KiB/block). nbatch_V = 48*32/384 = 4 divides nbatch_fa.
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(384, 384,  2,  64, 1,  32,  48)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(384, 384,  4, 128, 1,  32,  48)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(384, 384,  8, 256, 1,  32,  48)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(384, 384, 16, 256, 1,  32,  48)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  4, 128, 2,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  8, 256, 2,  32,  64)
@@ -218,6 +235,12 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  32, 128)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 32, 512, 1, 128,  64)
+
+    // Wan 2.1 VAE mid-block attn (single-head, maskless, DKQ==DV==384). ncols2==1 only.
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(384, 384,  2,  64, 2,  64,  48)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(384, 384,  4, 128, 2,  64,  48)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(384, 384,  8, 256, 2,  64,  48)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(384, 384, 16, 256, 2,  64,  48)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  4, 128, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  8, 256, 2,  64,  64)
@@ -295,6 +318,12 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 3,  64, 128)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 32, 256, 2, 128,  64)
+
+    // Wan 2.1 VAE mid-block attn (single-head, maskless, DKQ==DV==384). ncols2==1 only.
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(384, 384,  2,  64, 2,  64,  48)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(384, 384,  4, 128, 2,  64,  48)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(384, 384,  8, 256, 2,  64,  48)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(384, 384, 16, 256, 2,  64,  48)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  4, 128, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  8, 256, 2,  64,  64)
@@ -1276,6 +1305,18 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
         }
     }
 
+    if constexpr (DKQ == 384) {
+        // Wan 2.1 VAE mid-block self-attention: single-head (gqa_ratio==1), maskless,
+        // DKQ==DV==384. DV>256 so the generic block below (which only reaches the ncols2==1
+        // fallback under `DV <= 256`) would GGML_ABORT. Force the ncols2==1 tile variant —
+        // the only D==384 kernel instantiated. ncols2>1 is intentionally not built for 384
+        // (would be NO_DEVICE_CODE under GGML_USE_WMMA_FATTN), and our shape is always
+        // single-head anyway; a GQA/masked 384 caller still runs correctly here, just
+        // without per-block head packing.
+        launch_fattn_tile_switch_ncols1<DKQ, DV, 1, use_logit_softcap>(ctx, dst);
+        return;
+    }
+
     if constexpr (DKQ == 192) {
         // MiMo-V2.5 / V2.5-Pro / V2-Flash: gqa_ratio is 8 (SWA) or 16 (full attn)
         if (use_gqa_opt && gqa_ratio % 16 == 0) {
@@ -1345,5 +1386,6 @@ extern DECL_FATTN_TILE_CASE(128, 128);
 extern DECL_FATTN_TILE_CASE(192, 128);
 extern DECL_FATTN_TILE_CASE(256, 256);
 extern DECL_FATTN_TILE_CASE(320, 256);
+extern DECL_FATTN_TILE_CASE(384, 384);
 extern DECL_FATTN_TILE_CASE(512, 512);
 extern DECL_FATTN_TILE_CASE(576, 512);
