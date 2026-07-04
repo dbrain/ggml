@@ -34,6 +34,10 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
 // different type than x — read with no cast; the +1 is intrinsic to the kernel).
 void ggml_cuda_op_rms_modulate(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// RMS-norm over the CHANNEL dim (ne[3]) of a [W,H,T,C] activation + fold in gamma, one coalesced
+// pass (no transpose/cont). dst->src[0]=x (F16|F32), dst->src[1]=gamma (F32, ne[0]==x->ne[3]).
+void ggml_cuda_op_rms_norm_channels(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

@@ -3234,6 +3234,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_RMS_MODULATE:
             ggml_cuda_op_rms_modulate(ctx, dst);
             break;
+        case GGML_OP_RMS_NORM_CHANNELS:
+            ggml_cuda_op_rms_norm_channels(ctx, dst);
+            break;
         case GGML_OP_RMS_NORM_BACK:
             ggml_cuda_op_rms_norm_back(ctx, dst);
             break;
@@ -6025,12 +6028,17 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
     switch (op->op) {
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
+                case GGML_UNARY_OP_SILU:
+                    // ggml_cuda_op_unary gathers a (possibly non-contiguous) src0 by strides into a
+                    // CONTIGUOUS dst, so SiLU accepts a permuted-view src as long as the result is
+                    // contiguous (WAN_VAE_RMS_CF absorbs RMS's permute-back into SiLU). Keying on the
+                    // dst excludes the unsafe inplace-on-strided case. Contiguous callers: unchanged.
+                    return ggml_is_contiguous(op);
                 case GGML_UNARY_OP_ABS:
                 case GGML_UNARY_OP_SGN:
                 case GGML_UNARY_OP_NEG:
                 case GGML_UNARY_OP_STEP:
                 case GGML_UNARY_OP_GELU:
-                case GGML_UNARY_OP_SILU:
                 case GGML_UNARY_OP_RELU:
                 case GGML_UNARY_OP_SIGMOID:
                 case GGML_UNARY_OP_HARDSIGMOID:
@@ -6374,6 +6382,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    op->src[1]->type == GGML_TYPE_F32 && op->type == op->src[0]->type;
         case GGML_OP_RMS_MODULATE:
             return true;
+        case GGML_OP_RMS_NORM_CHANNELS:
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                   op->type == op->src[0]->type && op->src[1]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]);
         case GGML_OP_IM2COL:
         case GGML_OP_IM2COL_3D:
         case GGML_OP_CONV_2D:

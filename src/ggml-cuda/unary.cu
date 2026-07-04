@@ -134,6 +134,38 @@ static void unary_cuda(const T * x, T * dst, const int k, cudaStream_t stream) {
     ggml_cuda_kernel_launch(unary_op_kernel<op, T>, launch_params, x, dst, k);
 }
 
+// Non-contiguous src0 variant: dst is contiguous (fresh alloc, dst->ne == src0->ne), src0 is read
+// through its per-dim element strides. Used when an elementwise unary consumes a permuted VIEW so
+// the transpose is absorbed into the (already-running) unary instead of a separate ggml_cont — see
+// wan_vae.hpp WAN_VAE_RMS_CF (SiLU reads the channels-first->[W,H,T,C] view, writes contiguous).
+// Contiguous callers never reach this path, so existing behavior is byte-identical.
+template <float (*op)(float), typename T>
+static __global__ void unary_op_strided_kernel(const T * x, T * dst,
+                                               int64_t ne0, int64_t ne1, int64_t ne2, int64_t k,
+                                               int64_t s00, int64_t s01, int64_t s02, int64_t s03) {
+    const int64_t i = (int64_t) blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    const int64_t i0 = i % ne0;
+    int64_t t        = i / ne0;
+    const int64_t i1 = t % ne1;
+    t               /= ne1;
+    const int64_t i2 = t % ne2;
+    const int64_t i3 = t / ne2;
+    const int64_t off = i0 * s00 + i1 * s01 + i2 * s02 + i3 * s03;
+    dst[i] = (T) op((float) x[off]);
+}
+
+template <float (*op)(float), typename T>
+static void unary_strided_cuda(const T * x, T * dst,
+                               int64_t ne0, int64_t ne1, int64_t ne2, int64_t k,
+                               int64_t s00, int64_t s01, int64_t s02, int64_t s03, cudaStream_t stream) {
+    const unsigned int num_blocks = (unsigned int) ((k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE);
+    unary_op_strided_kernel<op, T><<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(
+        x, dst, ne0, ne1, ne2, k, s00, s01, s02, s03);
+}
+
 template <float (*op)(float)>
 void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
@@ -141,16 +173,31 @@ void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     void * dst_d = dst->data;
     cudaStream_t stream = ctx.stream();
 
-    GGML_ASSERT(ggml_is_contiguous(src0));
-
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
     GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
     GGML_ASSERT(src0->type == dst->type);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
 
-    if (src0->type == GGML_TYPE_F16) {
-        unary_cuda<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);
+    if (ggml_is_contiguous(src0)) {
+        if (src0->type == GGML_TYPE_F16) {
+            unary_cuda<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);
+        } else {
+            unary_cuda<op>((const float *)src0_d, (float *)dst_d, ggml_nelements(src0), stream);
+        }
     } else {
-        unary_cuda<op>((const float *)src0_d, (float *)dst_d, ggml_nelements(src0), stream);
+        // Strided src0 (permuted view): gather by element strides, scatter contiguous into dst.
+        const int64_t ts  = ggml_type_size(src0->type);
+        const int64_t s00 = src0->nb[0] / ts, s01 = src0->nb[1] / ts;
+        const int64_t s02 = src0->nb[2] / ts, s03 = src0->nb[3] / ts;
+        const int64_t k   = ggml_nelements(src0);
+        if (src0->type == GGML_TYPE_F16) {
+            unary_strided_cuda<op>((const half *)src0_d, (half *)dst_d,
+                                   src0->ne[0], src0->ne[1], src0->ne[2], k, s00, s01, s02, s03, stream);
+        } else {
+            unary_strided_cuda<op>((const float *)src0_d, (float *)dst_d,
+                                   src0->ne[0], src0->ne[1], src0->ne[2], k, s00, s01, s02, s03, stream);
+        }
     }
 }
 

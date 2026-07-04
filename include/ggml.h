@@ -505,6 +505,7 @@ extern "C" {
         GGML_OP_NORM, // normalize
         GGML_OP_RMS_NORM,
         GGML_OP_RMS_MODULATE,  // longcat-avatar: fused AdaLN rms_norm(x)*(1+scale)+shift, mixed-type, CUDA-only
+        GGML_OP_RMS_NORM_CHANNELS,  // wan-vae: rms_norm over the CHANNEL dim (ne[3]) + fold gamma, [W,H,T,C] native, CUDA-only
         GGML_OP_RMS_NORM_BACK,
         GGML_OP_GROUP_NORM,
         GGML_OP_L2_NORM,
@@ -1898,6 +1899,18 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * scale,
             struct ggml_tensor  * shift,
+            float                 eps);
+
+    // ggml_rms_norm_channels — RMS-normalize x over the CHANNEL dim (ne[3]) and fold in the
+    // per-channel gamma, as ONE op reading the [W,H,T,C] activation natively (no permute/cont).
+    //   out[..,c] = x[..,c] / sqrt(mean_over_c(x^2) + eps) * gamma[c]
+    // Equivalent to ggml_mul(ggml_rms_norm(<x permuted so C is ne[0]>, eps), gamma) but without
+    // the two transposes + separate mul. x is F16 or F32 (output type = x type), gamma is F32
+    // with gamma->ne[0] == x->ne[3]. Reduction accumulates in FLOAT. CUDA-only.
+    GGML_API struct ggml_tensor * ggml_rms_norm_channels(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gamma,
             float                 eps);
 
     // RoPE operations with extended options

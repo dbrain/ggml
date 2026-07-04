@@ -1004,6 +1004,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "NORM",
     "RMS_NORM",
     "RMS_MODULATE",
+    "RMS_NORM_CHANNELS",
     "RMS_NORM_BACK",
     "GROUP_NORM",
     "L2_NORM",
@@ -1090,7 +1091,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "COL2IM_1D",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1121,6 +1122,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "norm(x)",
     "rms_norm(x)",
     "rms_modulate(x)",
+    "rms_norm_channels(x)",
     "rms_norm_back(x)",
     "group_norm(x)",
     "l2_norm(x)",
@@ -1207,7 +1209,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "col2im_1d(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4492,6 +4494,27 @@ struct ggml_tensor * ggml_rms_modulate(
     return result;
 }
 
+// ggml_rms_norm_channels — RMS-normalize over the CHANNEL dim (ne[3]) + fold gamma, [W,H,T,C]
+// native (no transpose). out shape+type == x; gamma is F32 with gamma->ne[0] == x->ne[3]. CUDA-only
+// (see ggml-cuda/norm.cu). No contiguity transpose here: x is already the contiguous activation.
+struct ggml_tensor * ggml_rms_norm_channels(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * gamma,
+        float                 eps) {
+    GGML_ASSERT(gamma->ne[0] == x->ne[3]);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, x);   // same shape+type as x, contiguous
+
+    ggml_set_op_params(result, &eps, sizeof(eps));
+
+    result->op     = GGML_OP_RMS_NORM_CHANNELS;
+    result->src[0] = x;
+    result->src[1] = gamma;
+
+    return result;
+}
+
 struct ggml_tensor * ggml_rope_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -6205,7 +6228,13 @@ static struct ggml_tensor * ggml_unary_impl(
         struct ggml_tensor  * a,
         enum ggml_unary_op    op,
         bool                  inplace) {
-    GGML_ASSERT(ggml_is_contiguous_rows(a));
+    // Non-inplace unary permits a non-contiguous (e.g. permuted-view) src: the result is a fresh
+    // CONTIGUOUS ggml_dup_tensor and backends whose unary kernel gathers src by strides (CUDA
+    // ggml_cuda_op_unary) handle it; backends that need contiguous rows still self-assert in their
+    // op impl and are only selected when supports_op says so. Inplace still requires contiguous rows
+    // (result aliases src, so a strided write would be wrong). Contiguous callers are unaffected.
+    // Used by WAN_VAE_RMS_CF: SiLU reads a channels-first->[W,H,T,C] view, writes contiguous.
+    GGML_ASSERT(!inplace || ggml_is_contiguous_rows(a));
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 

@@ -1235,6 +1235,68 @@ static void rms_modulate_cuda(const T_x *    x,
     }
 }
 
+// ggml_rms_norm_channels — RMS-normalize over the CHANNEL dim (ne[3]) of a [W,H,T,C] activation,
+// folding in per-channel gamma, in ONE coalesced pass. The Wan VAE decoder keeps activations
+// [W,H,T,C] (channels = ne[3], stride S = ne0*ne1*ne2); stock ggml_rms_norm only reduces over
+// ne[0], so the VAE path used permute(C->ne0)+cont, rms, mul(gamma), permute-back+cont == 2 conts
+// + a separate mul per RMS_norm. This op reads [W,H,T,C] natively: one thread per spatial position
+// p in [0,S) loops the C channels at stride S (adjacent threads -> adjacent p -> fully coalesced),
+// reduces mean-square in FLOAT, then writes out[p+c*S] = x*rsqrt(ms+eps)*gamma[c]. x/dst F16 or F32
+// (same type); gamma F32. Bit-for-bit formula-identical to rms_norm+mul (up to float reduction
+// order). CUDA-only, mirrors ggml_rms_modulate.
+template <typename T>
+static __global__ void rms_norm_channels_kernel(const T * __restrict__ x, const float * __restrict__ gamma,
+                                                T * __restrict__ dst, const int64_t S, const int C, const float eps) {
+    const int64_t p = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= S) {
+        return;
+    }
+    float ss = 0.0f;
+    for (int c = 0; c < C; ++c) {
+        const float v = (float) x[p + (int64_t) c * S];
+        ss += v * v;
+    }
+    const float scale = rsqrtf(ss / (float) C + eps);
+    for (int c = 0; c < C; ++c) {
+        const int64_t idx = p + (int64_t) c * S;
+        dst[idx] = (T) ((float) x[idx] * scale * gamma[c]);
+    }
+}
+
+template <typename T>
+static void rms_norm_channels_cuda(const T * x, const float * gamma, T * dst,
+                                   const int64_t S, const int C, const float eps, cudaStream_t stream) {
+    const int64_t block = 256;
+    const int64_t grid  = (S + block - 1) / block;
+    rms_norm_channels_kernel<T><<<(unsigned int) grid, (unsigned int) block, 0, stream>>>(x, gamma, dst, S, C, eps);
+}
+
+void ggml_cuda_op_rms_norm_channels(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];  // [W,H,T,C] contiguous activation, F16 or F32
+    const ggml_tensor * w = dst->src[1];  // gamma [C], F32
+
+    float eps = 0.0f;
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16);
+    GGML_ASSERT(dst->type == x->type);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(w->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->ne[0] == x->ne[3]);
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int64_t S = x->ne[0] * x->ne[1] * x->ne[2];
+    const int     C = (int) x->ne[3];
+    cudaStream_t  stream = ctx.stream();
+
+    if (x->type == GGML_TYPE_F16) {
+        rms_norm_channels_cuda<half>((const half *) x->data, (const float *) w->data, (half *) dst->data, S, C, eps, stream);
+    } else {
+        rms_norm_channels_cuda<float>((const float *) x->data, (const float *) w->data, (float *) dst->data, S, C, eps, stream);
+    }
+}
+
 void ggml_cuda_op_rms_modulate(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * x     = dst->src[0]; // activation (pre-rms), F16 or F32
     const ggml_tensor * scale = dst->src[1]; // modulation scale (mul), F16 or F32
