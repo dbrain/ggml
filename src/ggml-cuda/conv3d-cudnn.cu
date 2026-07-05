@@ -119,19 +119,24 @@ static __global__ void ndhwc_f16_to_ncdhw_tiled(const half * __restrict__ in, To
     const half * inb  = in  + (long)n * S * C;    // [S, C]
     Tout       * outb = out + (long)n * C * S;    // [C, S]
 
-    int s0 = blockIdx.y * CV_TILE;
     int c0 = blockIdx.x * CV_TILE;
-    for (int j = 0; j < CV_TILE; j += CV_BR) {
-        int s = s0 + threadIdx.y + j;
-        int c = c0 + threadIdx.x;
-        if (s < S && c < C) tile[threadIdx.y + j][threadIdx.x] = __half2float(inb[(long)s * C + c]);
-    }
-    __syncthreads();
-    int cT = c0 + threadIdx.y;   // becomes row
-    int sT = s0 + threadIdx.x;   // becomes col (contiguous in out)
-    for (int j = 0; j < CV_TILE; j += CV_BR) {
-        int c = cT + j;
-        if (c < C && sT < S) cv3d_store(&outb[(long)c * S + sT], tile[threadIdx.x][threadIdx.y + j]);
+    // grid-stride over S tiles: grid.y is capped at 65535 (the CUDA grid.y limit) at launch, so a
+    // large output spatial volume (S = OD*OH*OW, e.g. 2.3M on the full-res LTX 0.9.x decoder conv)
+    // is walked in gridDim.y-strided s-blocks rather than overflowing grid.y -> "invalid argument".
+    for (int s0 = blockIdx.y * CV_TILE; s0 < S; s0 += gridDim.y * CV_TILE) {
+        for (int j = 0; j < CV_TILE; j += CV_BR) {
+            int s = s0 + threadIdx.y + j;
+            int c = c0 + threadIdx.x;
+            if (s < S && c < C) tile[threadIdx.y + j][threadIdx.x] = __half2float(inb[(long)s * C + c]);
+        }
+        __syncthreads();
+        int cT = c0 + threadIdx.y;   // becomes row
+        int sT = s0 + threadIdx.x;   // becomes col (contiguous in out)
+        for (int j = 0; j < CV_TILE; j += CV_BR) {
+            int c = cT + j;
+            if (c < C && sT < S) cv3d_store(&outb[(long)c * S + sT], tile[threadIdx.x][threadIdx.y + j]);
+        }
+        __syncthreads();
     }
 }
 
@@ -190,19 +195,23 @@ static __global__ void ndhwc_f32_to_ncdhw_f32_tiled(const float * __restrict__ i
     const float * inb  = in  + (long)n * S * C;    // [S, C]
     float       * outb = out + (long)n * C * S;    // [C, S]
 
-    int s0 = blockIdx.y * CV_TILE;
     int c0 = blockIdx.x * CV_TILE;
-    for (int j = 0; j < CV_TILE; j += CV_BR) {
-        int s = s0 + threadIdx.y + j;
-        int c = c0 + threadIdx.x;
-        if (s < S && c < C) tile[threadIdx.y + j][threadIdx.x] = inb[(long)s * C + c];
-    }
-    __syncthreads();
-    int cT = c0 + threadIdx.y;   // becomes row
-    int sT = s0 + threadIdx.x;   // becomes col (contiguous in out)
-    for (int j = 0; j < CV_TILE; j += CV_BR) {
-        int c = cT + j;
-        if (c < C && sT < S) outb[(long)c * S + sT] = tile[threadIdx.x][threadIdx.y + j];
+    // grid-stride over S tiles (see ndhwc_f16_to_ncdhw_tiled): grid.y capped at 65535 at launch,
+    // large S walked in gridDim.y-strided s-blocks instead of overflowing grid.y.
+    for (int s0 = blockIdx.y * CV_TILE; s0 < S; s0 += gridDim.y * CV_TILE) {
+        for (int j = 0; j < CV_TILE; j += CV_BR) {
+            int s = s0 + threadIdx.y + j;
+            int c = c0 + threadIdx.x;
+            if (s < S && c < C) tile[threadIdx.y + j][threadIdx.x] = inb[(long)s * C + c];
+        }
+        __syncthreads();
+        int cT = c0 + threadIdx.y;   // becomes row
+        int sT = s0 + threadIdx.x;   // becomes col (contiguous in out)
+        for (int j = 0; j < CV_TILE; j += CV_BR) {
+            int c = cT + j;
+            if (c < C && sT < S) outb[(long)c * S + sT] = tile[threadIdx.x][threadIdx.y + j];
+        }
+        __syncthreads();
     }
 }
 
@@ -556,7 +565,9 @@ bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     // Y: NDHWC (cuDNN) -> NCDHW (ggml dst), tiled transpose with S = OD*OH*OW.
     {
         dim3 blk(CV_TILE, CV_BR);
-        dim3 grd((oc + CV_TILE - 1) / CV_TILE, (S_out + CV_TILE - 1) / CV_TILE, n);
+        int gy = (int)((S_out + CV_TILE - 1) / CV_TILE);
+        if (gy > 65535) { gy = 65535; }   // CUDA grid.y limit; kernels grid-stride the rest
+        dim3 grd((oc + CV_TILE - 1) / CV_TILE, gy, n);
         if (hi_prec) {
             // fp32 Y -> fp32 dst, no fp16 round-trip (the grid fix).
             ndhwc_f32_to_ncdhw_f32_tiled<<<grd, blk, 0, stream>>>((const float *)y_ptr, (float *)dst->data, n, oc, S_out);
