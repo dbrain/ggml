@@ -5,6 +5,16 @@
 #define MAX_GRIDDIM_Y 65535
 #define MAX_GRIDDIM_Z 65535
 
+// Load an im2col input element as float, agnostic to the ggml-side activation dtype.
+// The im2col ops are pure data movement (no arithmetic on the value), so reading an F16
+// activation as half and widening to float is bit-exact vs the F32 stream: the value is
+// stored straight into dst (which does the final float->dst-dtype convert). This lets the
+// F16-activation decode (LTX_VAE_DECODE_F16 / WAN_VAE_F16) route a conv3d through im2col
+// (encode-only-cuDNN recipe, phase flag, or force_prec_f32 head) without the old hard
+// GGML_TYPE_F32 assert. The float overload is the identity, so the F32 path is byte-identical.
+static __device__ __forceinline__ float im2col_load_src(const float * p, int64_t i) { return p[i]; }
+static __device__ __forceinline__ float im2col_load_src(const half  * p, int64_t i) { return __half2float(p[i]); }
+
 template <typename T>
 static  __global__ void im2col_kernel(
         const float * x, T * dst,
@@ -118,9 +128,12 @@ void ggml_cuda_op_im2col(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 // [N*IC, ID, IH, IW] => [N*OD, OH, OW, IC * KD * KH * KW]
-template <typename T>
+// SrcT is the ggml-side activation dtype (float for the F32 stream, half for the
+// F16-activation decode). Templating src keeps the F32 path byte-identical (im2col_load_src
+// is the identity for float) while adding an F16 read that widens to float before the store.
+template <typename SrcT, typename T>
 static  __global__ void im2col_3d_kernel(
-        const float * src, T * dst,
+        const SrcT * src, T * dst,
         int64_t N, int64_t IC, int64_t ID, int64_t IH, int64_t IW, int64_t OC,
         int64_t KD, int64_t KH, int64_t KW, int64_t OD, int64_t OH, int64_t OW,
         int64_t OH_OW, int64_t KD_KH_KW, int64_t ID_IH_IW, int64_t KH_KW, int64_t IH_IW, int64_t IC_ID_IH_IW,
@@ -167,7 +180,7 @@ static  __global__ void im2col_3d_kernel(
                 dst[offset_dst] = 0.0f;
             } else {
                 const int64_t offset_src = ((in * IC + iic) * stride_q) + (iid * stride_z) + (iih * stride_y) + (iiw * stride_x);
-                dst[offset_dst] = src[offset_src];
+                dst[offset_dst] = im2col_load_src(src, offset_src);
             }
         }
     }
@@ -195,9 +208,9 @@ static  __global__ void im2col_3d_kernel(
 // per-warp write transaction 64B→128B, the lever past the ~155 GB/s scalar-store
 // plateau. Falls back (host returns false) on any shape it can't cover.
 // Bit-exact vs the fastdiv kernel (pure data movement, no arithmetic on values).
-template <typename T, int VEC, bool HAS_PAD>
+template <typename SrcT, typename T, int VEC, bool HAS_PAD>
 static __global__ void im2col_3d_tiled_kernel(
-        const float * __restrict__ src, T * __restrict__ dst,
+        const SrcT * __restrict__ src, T * __restrict__ dst,
         int IC, int ID, int IH, int IW,
         int KD, int KH, int KW, int OD, int OH, int OW,
         int CB, int TOH, int TOW, int p0, int p1,
@@ -253,7 +266,7 @@ static __global__ void im2col_3d_tiled_kernel(
         }
         float v = 0.0f;
         if (in_bounds) {
-            v = src[src_chan_base + (int64_t)icl * ID * IH * IW + (int64_t)iid * IH * IW + (int64_t)iih * IW + iiw];
+            v = im2col_load_src(src, src_chan_base + (int64_t)icl * ID * IH * IW + (int64_t)iid * IH * IW + (int64_t)iih * IW + iiw);
         }
         smem[(int64_t)icl * DHW + ((int64_t)iid * SH + sr) * SW + sc] = v;
     }
@@ -315,8 +328,8 @@ static __global__ void im2col_3d_tiled_kernel(
 
 // Launch the tiled fast path. Returns false (no launch) for shapes it doesn't
 // cover, so the caller falls back to the fastdiv kernel (correctness can't regress).
-template <typename T>
-static bool im2col_3d_tiled_try(const float * src, T * dst,
+template <typename SrcT, typename T>
+static bool im2col_3d_tiled_try(const SrcT * src, T * dst,
     int64_t N, int64_t IC, int64_t ID, int64_t IH, int64_t IW,
     int64_t KD, int64_t KH, int64_t KW, int64_t OD, int64_t OH, int64_t OW,
     int s0, int s1, int s2, int p0, int p1, int p2, int d0, int d1, int d2, cudaStream_t stream) {
@@ -404,7 +417,7 @@ static bool im2col_3d_tiled_try(const float * src, T * dst,
     dim3 grid(n_ow_tiles, n_oh_tiles, (unsigned) gz);
     dim3 block(tpx, P, 1);
 #define LC_TILED_LAUNCH(VECN, HASPAD) \
-    im2col_3d_tiled_kernel<T, VECN, HASPAD><<<grid, block, smem_bytes, stream>>>( \
+    im2col_3d_tiled_kernel<SrcT, T, VECN, HASPAD><<<grid, block, smem_bytes, stream>>>( \
         src, dst, (int)IC, (int)ID, (int)IH, (int)IW, \
         (int)KD, (int)KH, (int)KW, (int)OD, (int)OH, (int)OW, \
         CB, TOH, TOW, p0, p1, (int)(KH * KW), KD_KH_KW, \
@@ -421,8 +434,8 @@ static bool im2col_3d_tiled_try(const float * src, T * dst,
 }
 
 // [N*IC, ID, IH, IW] => [N*OD, OH, OW, IC * KD * KH * KW]
-template <typename T>
-static void im2col_3d_cuda(const float * src, T* dst,
+template <typename SrcT, typename T>
+static void im2col_3d_cuda(const SrcT * src, T* dst,
     int64_t N, int64_t IC, int64_t ID, int64_t IH, int64_t IW, int64_t OC,
     int64_t KD, int64_t KH, int64_t KW, int64_t OD, int64_t OH, int64_t OW,
     int64_t stride_q, int64_t stride_z, int64_t stride_y, int64_t stride_x,
@@ -468,7 +481,7 @@ static void im2col_3d_cuda(const float * src, T* dst,
     if (lc_im2col_prof) { cudaEventCreate(&lc_ev0); cudaEventCreate(&lc_ev1); cudaEventRecord(lc_ev0, stream); }
 
     // lap-23: try the smem-tiled fast path; fall back to fastdiv on uncovered shapes.
-    const bool used_tiled = im2col_3d_tiled_try<T>(src, dst, N, IC, ID, IH, IW, KD, KH, KW, OD, OH, OW,
+    const bool used_tiled = im2col_3d_tiled_try<SrcT, T>(src, dst, N, IC, ID, IH, IW, KD, KH, KW, OD, OH, OW,
                                                    s0, s1, s2, p0, p1, p2, d0, d1, d2, stream);
     if (!used_tiled) {
         launch_fastdiv(dst);
@@ -479,7 +492,7 @@ static void im2col_3d_cuda(const float * src, T* dst,
         float lc_ms = 0.0f; cudaEventElapsedTime(&lc_ms, lc_ev0, lc_ev1);
         const double out_elems = (double)OD_OH_OW_IC_KD_KH_KW * (double)N;   // im2col output elements
         const double wbytes    = out_elems * (double)sizeof(T);             // write traffic (dominant)
-        const double rbytes    = (double)IC_ID_IH_IW * (double)N * 4.0;     // input read once (F32)
+        const double rbytes    = (double)IC_ID_IH_IW * (double)N * (double)sizeof(SrcT); // input read once
         const double gbps_w    = lc_ms > 0 ? (wbytes / 1e9) / (lc_ms / 1e3) : 0.0;
         fprintf(stderr, "[IM2COL_PROF] %s N=%ld IC=%ld ID=%ld IH=%ld IW=%ld K=%ldx%ldx%ld OD=%ld OH=%ld OW=%ld | %.3f ms | wrote %.1f MiB (%.0f GB/s) | in %.1f MiB | expand x%ld\n",
                 used_tiled ? "TILED" : "fastd",
@@ -516,36 +529,31 @@ static void im2col_3d_cuda(const float * src, T* dst,
     }
 }
 
-static void im2col_3d_cuda_f16(const float * src, half * dst,
+// dst-dtype wrapper, templated on the activation (src) dtype so both F32 and F16 activation
+// streams reach the same im2col_3d_cuda body. SrcT=float keeps the F32 stream byte-identical.
+template <typename SrcT, typename T>
+static void im2col_3d_cuda_t(const SrcT * src, T * dst,
     int64_t N, int64_t IC, int64_t ID, int64_t IH, int64_t IW, int64_t OC,
     int64_t KD, int64_t KH, int64_t KW, int64_t OD, int64_t OH, int64_t OW,
     int64_t stride_q, int64_t stride_z, int64_t stride_y, int64_t stride_x,
     int s0, int s1, int s2, int p0, int p1, int p2, int d0, int d1, int d2, cudaStream_t stream) {
 
-    im2col_3d_cuda<half>(src, dst, N, IC, ID, IH, IW, OC, KD, KH, KW, OD, OH, OW,
-                         stride_q, stride_z, stride_y, stride_x,
-                         s0, s1, s2, p0, p1, p2, d0, d1, d2, stream);
-}
-
-static void im2col_3d_cuda_f32(const float * src, float * dst,
-    int64_t N, int64_t IC, int64_t ID, int64_t IH, int64_t IW, int64_t OC,
-    int64_t KD, int64_t KH, int64_t KW, int64_t OD, int64_t OH, int64_t OW,
-    int64_t stride_q, int64_t stride_z, int64_t stride_y, int64_t stride_x,
-    int s0, int s1, int s2, int p0, int p1, int p2, int d0, int d1, int d2, cudaStream_t stream) {
-
-    im2col_3d_cuda<float>(src, dst, N, IC, ID, IH, IW, OC, KD, KH, KW, OD, OH, OW,
-                          stride_q, stride_z, stride_y, stride_x,
-                          s0, s1, s2, p0, p1, p2, d0, d1, d2, stream);
+    im2col_3d_cuda<SrcT, T>(src, dst, N, IC, ID, IH, IW, OC, KD, KH, KW, OD, OH, OW,
+                            stride_q, stride_z, stride_y, stride_x,
+                            s0, s1, s2, p0, p1, p2, d0, d1, d2, stream);
 }
 
 void ggml_cuda_op_im2col_3d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
-    const float * src1_d = (const float *)src1->data;
-    float * dst_d = (float *)dst->data;
+    const void * src1_d = (const void *)src1->data;
+    void * dst_d = dst->data;
     cudaStream_t stream = ctx.stream();
 
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    // src1 (activations) may be F32 (legacy) or F16 (LTX_VAE_DECODE_F16 / WAN_VAE_F16 stream);
+    // read below is dtype-agnostic (im2col_load_src). dst dtype is set by the graph (im2col dst
+    // follows the conv weight type, typically F16) and remains F16 or F32.
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
     GGML_ASSERT( dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32);
 
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -581,13 +589,24 @@ void ggml_cuda_op_im2col_3d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int64_t stride_z = src1->nb[2] / es;
     const int64_t stride_q = src1->nb[3] / es;
 
-    if(dst->type == GGML_TYPE_F16) {
-        im2col_3d_cuda_f16(src1_d, (half *) dst_d, N, IC, ID, IH, IW, OC, KD, KH, KW, OD, OH, OW,
-                           stride_q, stride_z, stride_y, stride_x,
-                           s0, s1, s2, p0, p1, p2, d0, d1, d2, stream);
+    // Dispatch on (activation dtype, im2col dst dtype). The F32-src instantiations are
+    // byte-identical to the pre-F16 code; the half-src ones add the F16-activation decode path.
+    const bool src_f16 = (src1->type == GGML_TYPE_F16);
+    if (dst->type == GGML_TYPE_F16) {
+        if (src_f16) {
+            im2col_3d_cuda_t<half, half>((const half *) src1_d, (half *) dst_d, N, IC, ID, IH, IW, OC, KD, KH, KW, OD, OH, OW,
+                                         stride_q, stride_z, stride_y, stride_x, s0, s1, s2, p0, p1, p2, d0, d1, d2, stream);
+        } else {
+            im2col_3d_cuda_t<float, half>((const float *) src1_d, (half *) dst_d, N, IC, ID, IH, IW, OC, KD, KH, KW, OD, OH, OW,
+                                          stride_q, stride_z, stride_y, stride_x, s0, s1, s2, p0, p1, p2, d0, d1, d2, stream);
+        }
     } else {
-        im2col_3d_cuda_f32(src1_d, (float *) dst_d, N, IC, ID, IH, IW, OC, KD, KH, KW, OD, OH, OW,
-                           stride_q, stride_z, stride_y, stride_x,
-                           s0, s1, s2, p0, p1, p2, d0, d1, d2, stream);
+        if (src_f16) {
+            im2col_3d_cuda_t<half, float>((const half *) src1_d, (float *) dst_d, N, IC, ID, IH, IW, OC, KD, KH, KW, OD, OH, OW,
+                                          stride_q, stride_z, stride_y, stride_x, s0, s1, s2, p0, p1, p2, d0, d1, d2, stream);
+        } else {
+            im2col_3d_cuda_t<float, float>((const float *) src1_d, (float *) dst_d, N, IC, ID, IH, IW, OC, KD, KH, KW, OD, OH, OW,
+                                           stride_q, stride_z, stride_y, stride_x, s0, s1, s2, p0, p1, p2, d0, d1, d2, stream);
+        }
     }
 }
