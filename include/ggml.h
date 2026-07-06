@@ -380,6 +380,8 @@ extern "C" {
     GGML_API void        ggml_bf16_to_fp32_row(const ggml_bf16_t *, float *, int64_t);
     GGML_API void        ggml_fp32_to_bf16_row_ref(const float *, ggml_bf16_t *, int64_t);
     GGML_API void        ggml_fp32_to_bf16_row(const float *, ggml_bf16_t *, int64_t);
+    GGML_API void        ggml_f8_e4m3_to_fp32_row(const uint8_t *, float *, int64_t);
+    GGML_API void        ggml_fp32_to_f8_e4m3_row_ref(const float *, uint8_t *, int64_t);
 
     struct ggml_object;
     struct ggml_context;
@@ -429,7 +431,8 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_COUNT   = 42,
+        GGML_TYPE_F8_E4M3 = 42, // FP8 e4m3 weight storage (1 byte/elem, standard __nv_fp8_e4m3)
+        GGML_TYPE_COUNT   = 43,
     };
 
     // precision
@@ -473,6 +476,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
+        GGML_FTYPE_MOSTLY_F8_E4M3 = 28, // except 1d tensors
     };
 
     // available tensor operations:

@@ -193,6 +193,35 @@ static cudnn_sdpa_plan & get_or_build_plan(cudnnHandle_t handle, const sdpa_key 
     return ins->second;
 }
 
+// GGML_F8_DBG: device max-abs of an attention operand, to confirm whether Q (unprotected by
+// kv_scale) exceeds F16 max (65504) before cuDNN casts it to F16 — the suspected NaN source.
+static __global__ void f8dbg_amax_f16_k(const half * __restrict__ x, size_t n, unsigned int * __restrict__ out) {
+    float local = 0.f;
+    for (size_t i = (size_t)blockIdx.x*blockDim.x+threadIdx.x; i < n; i += (size_t)gridDim.x*blockDim.x)
+        local = fmaxf(local, fabsf(__half2float(x[i])));
+    __shared__ float s[256]; s[threadIdx.x]=local; __syncthreads();
+    for (int st=blockDim.x/2; st>0; st>>=1){ if(threadIdx.x<st) s[threadIdx.x]=fmaxf(s[threadIdx.x],s[threadIdx.x+st]); __syncthreads(); }
+    if (threadIdx.x==0) atomicMax(out, __float_as_uint(s[0]));
+}
+static __global__ void f8dbg_amax_f32_k(const float * __restrict__ x, size_t n, unsigned int * __restrict__ out) {
+    float local = 0.f;
+    for (size_t i = (size_t)blockIdx.x*blockDim.x+threadIdx.x; i < n; i += (size_t)gridDim.x*blockDim.x)
+        local = fmaxf(local, fabsf(x[i]));
+    __shared__ float s[256]; s[threadIdx.x]=local; __syncthreads();
+    for (int st=blockDim.x/2; st>0; st>>=1){ if(threadIdx.x<st) s[threadIdx.x]=fmaxf(s[threadIdx.x],s[threadIdx.x+st]); __syncthreads(); }
+    if (threadIdx.x==0) atomicMax(out, __float_as_uint(s[0]));
+}
+static float f8dbg_amax_dev(const void * d, bool is_f16, size_t n, cudaStream_t stream) {
+    static unsigned int * dm = nullptr;
+    if (dm == nullptr && cudaMalloc((void**)&dm, sizeof(unsigned int)) != cudaSuccess) return -1.f;
+    cudaMemsetAsync(dm, 0, sizeof(unsigned int), stream);
+    const int thr = 256; unsigned int gr = (unsigned int)((n + thr - 1)/thr); if (gr > 1024u) gr = 1024u; if (gr == 0) gr = 1;
+    if (is_f16) f8dbg_amax_f16_k<<<gr, thr, 0, stream>>>((const half*)d, n, dm);
+    else        f8dbg_amax_f32_k<<<gr, thr, 0, stream>>>((const float*)d, n, dm);
+    unsigned int bits = 0; cudaMemcpyAsync(&bits, dm, sizeof(unsigned int), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream); float f; memcpy(&f, &bits, sizeof(float)); return f;
+}
+
 void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -243,6 +272,25 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
     cudnnHandle_t handle = get_cudnn_handle();
     if (cudnnSetStream(handle, stream) != CUDNN_STATUS_SUCCESS) {
         GGML_ABORT("cudnnSetStream failed");
+    }
+
+    // GGML_F8_DBG: report max|Q|/|K|/|V| for the first few SDPA calls. Q>65504 confirms the
+    // F16-cast overflow (Q is unprotected by kv_scale) -> the DiT-NaN root cause.
+    {
+        static int s_dbg = -1;
+        if (s_dbg < 0) { const char * e = getenv("GGML_F8_DBG"); s_dbg = (e && atoi(e)) ? 1 : 0; }
+        if (s_dbg) {
+            static int s_n = 0;
+            if (s_n++ < 8) {
+                const float aq = f8dbg_amax_dev(Q->data, Q->type == GGML_TYPE_F16, ggml_nelements(Q), stream);
+                const float ak = f8dbg_amax_dev(K->data, K->type == GGML_TYPE_F16, ggml_nelements(K), stream);
+                const float av = f8dbg_amax_dev(V->data, V->type == GGML_TYPE_F16, ggml_nelements(V), stream);
+                fprintf(stderr, "[F8_DBG] cudnn-SDPA #%d  max|Q|=%.6g(%s) max|K|=%.6g max|V|=%.6g  F16max=65504  %s  D=%ld Lq=%ld Lkv=%ld H=%ld\n",
+                        s_n - 1, aq, Q->type == GGML_TYPE_F16 ? "f16" : "f32", ak, av,
+                        aq > 65504.f ? "*** Q>F16MAX -> cast overflows to inf ***" : "(Q fits F16)",
+                        (long)D, (long)Lq, (long)Lkv, (long)H);
+            }
+        }
     }
 
     // Q IO dtype must match the K/V IO dtype the graph was built for. fp16 path: Q may arrive

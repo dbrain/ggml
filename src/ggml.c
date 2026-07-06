@@ -510,6 +510,60 @@ void ggml_fp32_to_bf16_row(const float * x, ggml_bf16_t * y, int64_t n) {
     }
 }
 
+// ---- FP8 e4m3 (standard __nv_fp8_e4m3 / IEEE-ish "fn" variant, NO /2 scale) ----
+// 1 byte per element: S EEEE MMM. exp bias 7; exp==0 => subnormal (mant * 2^-9);
+// 0x7F/0xFF == NaN (no infinities). This is the storage of ComfyUI's dev-fp8 weights,
+// repacked verbatim by tools/import_ltx_fp8.py. Distinct from the UE4M3 /2-scaled decode
+// used for NVFP4 sub-block scales (see ggml_cuda_ue4m3_to_fp32).
+static inline float ggml_e4m3_to_fp32(uint8_t x) {
+    const int sign = (x >> 7) & 1;
+    const int exp  = (x >> 3) & 0xF;
+    const int man  = x & 0x7;
+    if ((x & 0x7F) == 0x7F) {   // NaN -> 0 (match CPU nvfp4 convention)
+        return 0.0f;
+    }
+    float raw;
+    if (exp == 0) {
+        raw = ldexpf((float) man, -9);          // subnormal: mant * 2^-9
+    } else {
+        raw = ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+    }
+    return sign ? -raw : raw;
+}
+
+static inline uint8_t ggml_fp32_to_e4m3(float f) {
+    const uint8_t sign = (f < 0.0f || (f == 0.0f && 1.0f / f < 0.0f)) ? 0x80 : 0x00;
+    float a = fabsf(f);
+    if (!(a > 0.0f)) {
+        return sign;                            // +/-0
+    }
+    if (a >= 448.0f) {
+        return sign | 0x7E;                     // clamp to e4m3 max (448), never emit NaN
+    }
+    // brute-force nearest over the 127 finite positive codes (0x01..0x7E); tiny, only used
+    // by the reference from_float (our real import path writes bytes verbatim).
+    uint8_t  best_c = 0x00;
+    float    best_e = a;                        // distance to 0
+    for (int c = 1; c <= 0x7E; ++c) {
+        const float v = ggml_e4m3_to_fp32((uint8_t) c);
+        const float e = fabsf(a - v);
+        if (e < best_e) { best_e = e; best_c = (uint8_t) c; }
+    }
+    return sign | best_c;
+}
+
+void ggml_f8_e4m3_to_fp32_row(const uint8_t * x, float * y, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) {
+        y[i] = ggml_e4m3_to_fp32(x[i]);
+    }
+}
+
+void ggml_fp32_to_f8_e4m3_row_ref(const float * x, uint8_t * y, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) {
+        y[i] = ggml_fp32_to_e4m3(x[i]);
+    }
+}
+
 bool ggml_guid_matches(ggml_guid_t guid_a, ggml_guid_t guid_b) {
     return memcmp(guid_a, guid_b, sizeof(ggml_guid)) == 0;
 }
@@ -751,6 +805,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_nvfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_nvfp4_ref,
+    },
+    [GGML_TYPE_F8_E4M3] = {
+        .type_name                = "f8_e4m3",
+        .blck_size                = 1,
+        .type_size                = 1,
+        .is_quantized             = false,
+        .to_float                 = (ggml_to_float_t) ggml_f8_e4m3_to_fp32_row,
+        .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_f8_e4m3_row_ref,
     },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
@@ -1432,6 +1494,7 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_Q8_0:          wtype = GGML_TYPE_Q8_0;  break;
         case GGML_FTYPE_MOSTLY_MXFP4:         wtype = GGML_TYPE_MXFP4; break;
         case GGML_FTYPE_MOSTLY_NVFP4:         wtype = GGML_TYPE_NVFP4; break;
+        case GGML_FTYPE_MOSTLY_F8_E4M3:       wtype = GGML_TYPE_F8_E4M3; break;
         case GGML_FTYPE_MOSTLY_Q2_K:          wtype = GGML_TYPE_Q2_K;  break;
         case GGML_FTYPE_MOSTLY_Q3_K:          wtype = GGML_TYPE_Q3_K;  break;
         case GGML_FTYPE_MOSTLY_Q4_K:          wtype = GGML_TYPE_Q4_K;  break;
@@ -8140,6 +8203,11 @@ size_t ggml_quantize_chunk(
                 size_t elemsize = sizeof(float);
                 result = n * elemsize;
                 memcpy((uint8_t *)dst + start * elemsize, src + start, result);
+            } break;
+        case GGML_TYPE_F8_E4M3:
+            {
+                ggml_fp32_to_f8_e4m3_row_ref(src + start, (uint8_t *)dst + start, n);
+                result = n; // 1 byte/elem
             } break;
         default:
             assert(false);

@@ -388,6 +388,14 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_BF16,
         .nrows                    = 1,
     },
+    // FP8 e4m3 weights are computed on the CUDA backend only (uploaded verbatim); the CPU
+    // backend never runs a vec_dot for them. nrows=1 avoids a zero-nrows edge in mul_mat.
+    [GGML_TYPE_F8_E4M3] = {
+        .from_float               = (ggml_from_float_t) ggml_fp32_to_f8_e4m3_row_ref,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_TQ1_0] = {
         .from_float               = quantize_row_tq1_0,
         .vec_dot                  = ggml_vec_dot_tq1_0_q8_K,

@@ -1049,6 +1049,14 @@ struct ggml_cuda_type_traits<GGML_TYPE_NVFP4> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_F8_E4M3> {
+    // 1 byte per element, no sub-blocks (standard __nv_fp8_e4m3 weight storage).
+    static constexpr int qk = 1;
+    static constexpr int qr = 1;
+    static constexpr int qi = 1;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q2_K> {
     static constexpr int qk = QK_K;
     static constexpr int qr = QR2_K;

@@ -2777,6 +2777,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    // Native F8_E4M3 weight (ComfyUI dev-fp8, repacked verbatim) -> cuBLASLt FP8xFP8 GEMM,
+    // feeding the already-e4m3 weight bytes straight in (A_scale=1.0) + an e4m3-quantized
+    // activation. Default ON on Blackwell (GGML_CUDA_F8_GEMM); on any miss it falls through
+    // to the dequant->cuBLAS path below (to_fp16/to_fp32 for GGML_TYPE_F8_E4M3).
+    if (src0->type == GGML_TYPE_F8_E4M3 && ggml_cuda_f8_gemm_enabled()
+            && blackwell_mma_available(ggml_cuda_info().devices[ctx.device].cc)
+            && ggml_cuda_fp8_cublaslt_mul_mat(ctx, src0, src1, dst)) {
+        return;
+    }
+
     // Phase-1 fast FP4 GEMM: NVFP4 weight matmul -> cuBLASLt blockscaled FP4 (Blackwell
     // FP4 tensor cores, ~3.3x MMQ). Env-gated (GGML_NVFP4_CUBLASLT=1); falls back cleanly.
     if (src0->type == GGML_TYPE_NVFP4 && ggml_cuda_nvfp4_cublaslt_enabled()
@@ -2807,6 +2817,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_mul_mat_vec_f = (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
     bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
+        && src0->type != GGML_TYPE_F8_E4M3   // 1-byte fp8 weight: dequant->cuBLAS fallback (no mmf kernel)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
@@ -5067,6 +5078,54 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// GGML_F8_DBG first-NaN hunt: scan a just-computed node's F16/F32 output for any non-finite
+// element (device reduction into a flag). Used to pin the EXACT node where the DiT forward
+// first goes NaN/inf (the suspected F16 attention-score overflow). Debug-only; syncs the
+// stream per scanned node, so it's gated behind GGML_F8_DBG and stops after the first hit.
+static __global__ void f8dbg_nonfinite_kernel(const void * __restrict__ vx, int is_f16, size_t n, int * __restrict__ flag) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = is_f16 ? __half2float(((const half *)vx)[i]) : ((const float *)vx)[i];
+    if (!isfinite(v)) atomicExch(flag, 1);
+}
+
+static bool f8dbg_enabled() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_F8_DBG"); v = (e && atoi(e)) ? 1 : 0; }
+    return v == 1;
+}
+
+// Returns true (and prints once) if `node`'s output holds a NaN/inf. Only F16/F32 nodes scanned.
+static bool f8dbg_scan_node_nonfinite(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+    if (node == nullptr || node->data == nullptr) return false;
+    if (node->type != GGML_TYPE_F16 && node->type != GGML_TYPE_F32) return false;
+    if (node->buffer == nullptr || !ggml_backend_buffer_is_cuda(node->buffer)) return false;
+    const size_t n = ggml_nelements(node);
+    if (n == 0) return false;
+    cudaStream_t stream = ctx.stream();
+    // Never scan (sync) while a CUDA graph is being captured — it would abort the capture.
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cap) != cudaSuccess || cap != cudaStreamCaptureStatusNone) return false;
+    static int * d_flag = nullptr;
+    if (d_flag == nullptr) { if (cudaMalloc((void **)&d_flag, sizeof(int)) != cudaSuccess) return false; }
+    cudaMemsetAsync(d_flag, 0, sizeof(int), stream);
+    const int  thr = 256;
+    const size_t nb = (n + thr - 1) / thr;
+    const unsigned int grid = (unsigned int)(nb > 65535u ? 65535u : (nb ? nb : 1));
+    // grid-stride not needed for correctness of a flag; cap grid and let large tensors under-cover?
+    // No — cover fully: loop the kernel in chunks if n exceeds grid*thr.
+    for (size_t off = 0; off < n; off += (size_t)grid * thr) {
+        const size_t rem = n - off;
+        const void * base = (const char *)node->data + off * (node->type == GGML_TYPE_F16 ? 2 : 4);
+        f8dbg_nonfinite_kernel<<<grid, thr, 0, stream>>>(base, node->type == GGML_TYPE_F16 ? 1 : 0,
+                                                         rem < (size_t)grid * thr ? rem : (size_t)grid * thr, d_flag);
+    }
+    int flag = 0;
+    cudaMemcpyAsync(&flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    return flag != 0;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -5262,6 +5321,26 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                // GGML_F8_DBG first-NaN hunt: scan each node's output for non-finite values and
+                // print the FIRST node (name + op + src names/types) that goes NaN/inf. Stops after
+                // the first hit (static flag) so the rest of the graph runs at full speed. Pins the
+                // exact birthplace of the DiT NaN (suspected F16 attention-score overflow).
+                if (f8dbg_enabled() && ok) {
+                    static bool s_found = false;
+                    if (!s_found && f8dbg_scan_node_nonfinite(*cuda_ctx, node)) {
+                        s_found = true;
+                        const ggml_tensor * s0 = node->src[0];
+                        const ggml_tensor * s1 = node->src[1];
+                        fprintf(stderr,
+                                "[F8_DBG] *** FIRST NON-FINITE NODE *** '%s' op=%s type=%s ne=[%ld,%ld,%ld,%ld]\n"
+                                "         src0='%s' op=%s type=%s | src1='%s' op=%s type=%s\n",
+                                node->name, ggml_op_name(node->op), ggml_type_name(node->type),
+                                (long)node->ne[0], (long)node->ne[1], (long)node->ne[2], (long)node->ne[3],
+                                s0 ? s0->name : "-", s0 ? ggml_op_name(s0->op) : "-", s0 ? ggml_type_name(s0->type) : "-",
+                                s1 ? s1->name : "-", s1 ? ggml_op_name(s1->op) : "-", s1 ? ggml_type_name(s1->type) : "-");
+                    }
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -6100,7 +6179,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     // fast tensor-core GEMM instead of forcing a per-Linear F16->F32
                     // cast. Gated on the cuBLASLt env so prod (Q4_K, cuBLASLt off) is
                     // byte-identical.
-                    if (!(a->type == GGML_TYPE_NVFP4 && ggml_cuda_nvfp4_cublaslt_enabled())) {
+                    // F8_E4M3 weights likewise accept an F16 activation via the cuBLASLt
+                    // FP8 GEMM (activation quantized to e4m3); keep the dit_f16 stream on the
+                    // fast path. Default-on gate, so an fp8 gguf works without an env flag.
+                    if (!((a->type == GGML_TYPE_NVFP4 && ggml_cuda_nvfp4_cublaslt_enabled()) ||
+                          (a->type == GGML_TYPE_F8_E4M3 && ggml_cuda_f8_gemm_enabled()))) {
                         return false;
                     }
                 }
@@ -6116,6 +6199,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     // FP4 path (F32 accum, F16 store) — the dit_f16 residual stream.
                     if (a->type == GGML_TYPE_NVFP4 && b->type == GGML_TYPE_F16 &&
                         ggml_cuda_nvfp4_cublaslt_enabled()) {
+                        return true;
+                    }
+                    // F8_E4M3 weight + F16 activation + F16 dst: cuBLASLt FP8 GEMM (F32 accum,
+                    // F16 store) — the dit_f16 residual stream. Default-on gate.
+                    if (a->type == GGML_TYPE_F8_E4M3 && b->type == GGML_TYPE_F16 &&
+                        ggml_cuda_f8_gemm_enabled()) {
                         return true;
                     }
                     if (!((a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_F32) &&
@@ -6151,6 +6240,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_NVFP4:
+                    case GGML_TYPE_F8_E4M3:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_K:

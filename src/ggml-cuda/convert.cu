@@ -656,6 +656,37 @@ static void dequantize_row_nvfp4_cuda(
     const int nb = k / QK_NVFP4;
     dequantize_block_nvfp4<<<nb, 32, 0, stream>>>(vx, y, k);
 }
+
+// Standard e4m3 (fn) software decode — bit-exact to __nv_fp8_e4m3, portable across arches
+// (the fp8 GEMM only runs on Blackwell; this dequant is the non-fp8 fallback / CPU-parity
+// path). S EEEE MMM, bias 7, exp==0 subnormal, 0x7F/0xFF == NaN -> 0.
+static __device__ __forceinline__ float ggml_cuda_e4m3_to_fp32(uint8_t x) {
+    if ((x & 0x7F) == 0x7F) {
+        return 0.0f;                 // NaN -> 0
+    }
+    const int sign = (x >> 7) & 1;
+    const int exp  = (x >> 3) & 0xF;
+    const int man  = x & 0x7;
+    float raw = (exp == 0) ? ldexpf((float) man, -9)
+                           : ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+    return sign ? -raw : raw;
+}
+
+template <typename dst_t>
+static __global__ void dequantize_block_f8_e4m3(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
+    const int64_t i = (int64_t) blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    const uint8_t * x = (const uint8_t *) vx;
+    y[i] = ggml_cuda_cast<dst_t>(ggml_cuda_e4m3_to_fp32(x[i]));
+}
+
+template <typename dst_t>
+static void dequantize_row_f8_e4m3_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int64_t nb = (k + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
+    dequantize_block_f8_e4m3<<<nb, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k);
+}
 template <typename src_t, typename dst_t>
 static __global__ void convert_unary(
         const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t ne00, const int64_t ne01,
@@ -758,6 +789,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_F8_E4M3:
+            return dequantize_row_f8_e4m3_cuda;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -813,6 +846,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_F8_E4M3:
+            return dequantize_row_f8_e4m3_cuda;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:

@@ -23,6 +23,11 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
 bool ggml_cuda_fp8_ffn_enabled();
 bool ggml_cuda_fp8_ffn_name_match(const char * name);
 
+// Native F8_E4M3 weight GEMM gate (default ON; GGML_CUDA_F8_GEMM=0 forces the dequant
+// fallback). When a mul_mat's weight (src0) is GGML_TYPE_F8_E4M3, ggml_cuda_fp8_cublaslt_mul_mat
+// feeds the already-e4m3 weight bytes verbatim to the cuBLASLt FP8xFP8 GEMM (A_scale = 1.0).
+bool ggml_cuda_f8_gemm_enabled();
+
 // Per-tensor e4m3 quantization of a contiguous [n]-element F16/F32 activation buffer
 // (scale = amax/448). Reused by the FP8 flash-attention kernel (fattn-fp8.cu) to
 // quantize Q/K. `out` = n e4m3 bytes, `d_scale` = scalar scale (1 float, owned by the
