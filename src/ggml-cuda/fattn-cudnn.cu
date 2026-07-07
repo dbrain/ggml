@@ -136,14 +136,22 @@ struct sdpa_key_hash {
 static std::mutex g_plan_mtx;
 static std::unordered_map<sdpa_key, cudnn_sdpa_plan, sdpa_key_hash> g_plan_cache;
 
-// Free the cuDNN-backend device memory pinned by every cached SDPA plan. Clearing
-// the map destroys each cudnn_sdpa_plan (its shared_ptr<fe::graph::Graph>), whose
-// destructor tears down the cuDNN backend execution plan + its internal device
-// allocations. The thread_local handle is intentionally left alive (small, and
-// re-usable). See the header for why this exists (cross-phase high-water tax).
+// Drop every cached SDPA plan. Some cuDNN-internal device reservations appear to
+// be handle-owned rather than graph-owned, so ggml_cuda_cudnn_sdpa_release_handle
+// is the stronger boundary reset used by the public API.
 void ggml_cuda_cudnn_sdpa_release_plans() {
     std::lock_guard<std::mutex> lk(g_plan_mtx);
     g_plan_cache.clear();
+}
+
+void ggml_cuda_cudnn_sdpa_release_handle() {
+    ggml_cuda_cudnn_sdpa_release_plans();
+    if (g_cudnn_handle) {
+        if (cudnnDestroy(g_cudnn_handle) != CUDNN_STATUS_SUCCESS) {
+            GGML_ABORT("cudnnDestroy failed");
+        }
+        g_cudnn_handle = nullptr;
+    }
 }
 
 static cudnn_sdpa_plan & get_or_build_plan(cudnnHandle_t handle, const sdpa_key & key, float scale) {
@@ -391,6 +399,7 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
 bool ggml_cuda_cudnn_available() { return false; }
 
 void ggml_cuda_cudnn_sdpa_release_plans() {}
+void ggml_cuda_cudnn_sdpa_release_handle() {}
 
 void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED(ctx);

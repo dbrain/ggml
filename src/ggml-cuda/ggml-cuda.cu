@@ -5859,14 +5859,33 @@ void ggml_backend_cuda_trim_pools(ggml_backend_t backend) {
 
 void ggml_backend_cuda_release_cudnn_plans(void) {
     // The cuDNN SDPA + conv3d plan caches are file-scope statics keyed by shape,
-    // guarded by their own mutexes, and hold cuDNN-backend device memory that
-    // ggml_backend_cuda_trim_pools cannot reach (outside the ggml VMM pool). A
-    // plan built for a bigger shape in one phase squats for the whole process,
-    // taxing every later phase's reserve-time high-water. Drop them so that memory
-    // returns to the driver; they rebuild lazily. No-op stubs when built without
-    // cuDNN. Caller guarantees nothing is in flight (segment boundary + sync).
-    ggml_cuda_cudnn_sdpa_release_plans();
-    ggml_cuda_cudnn_conv3d_release_plans();
+    // guarded by their own mutexes, and hold cuDNN-backend state that
+    // ggml_backend_cuda_trim_pools cannot reach (outside the ggml VMM pool). In
+    // practice, clearing cudnn-frontend Graph objects is not enough on current
+    // cuDNN: the large device reservation appears to stay attached to the
+    // thread-local cudnnHandle_t. Destroy this thread's handles as well; the next
+    // SDPA/conv3d op recreates them lazily and rebuilds only the needed plans.
+    //
+    // This must run on the same CUDA worker thread that created the thread_local
+    // handles, at a phase/segment boundary. Synchronize before teardown so no
+    // queued cuDNN work can still reference the handle.
+    const bool trace = getenv("GGML_CUDNN_TRACE") || getenv("LONGCAT_VRAM_BREAKDOWN");
+    size_t free_before = 0, total_before = 0;
+    if (trace) {
+        CUDA_CHECK(cudaMemGetInfo(&free_before, &total_before));
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    ggml_cuda_cudnn_sdpa_release_handle();
+    ggml_cuda_cudnn_conv3d_release_handle();
+    if (trace) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        size_t free_after = 0, total_after = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_after, &total_after));
+        fprintf(stderr, "[cudnn-reset] handle reset free %.1f -> %.1f MB (delta %+.1f MB, total %.1f MB)\n",
+                free_before / 1048576.0, free_after / 1048576.0,
+                ((double) free_after - (double) free_before) / 1048576.0,
+                total_after / 1048576.0);
+    }
 }
 
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {

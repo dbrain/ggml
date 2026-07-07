@@ -29,3 +29,9 @@ bool ggml_cuda_cudnn_available();
 // the next attention op of that shape (one-time build cost, not per-step).
 // No-op stub when the TU was built without GGML_CUDNN.
 void ggml_cuda_cudnn_sdpa_release_plans();
+
+// Clear cached SDPA plans and destroy this thread's cuDNN handle. Use this when
+// plan-cache clearing alone does not return cuDNN-internal per-handle device
+// reservations to the driver. Must be called from the CUDA worker thread that
+// created the handle, at a boundary with no in-flight cuDNN op.
+void ggml_cuda_cudnn_sdpa_release_handle();

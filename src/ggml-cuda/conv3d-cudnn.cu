@@ -260,15 +260,25 @@ struct conv3d_key_hash {
 static std::mutex g_conv3d_mtx;
 static std::unordered_map<conv3d_key, conv3d_plan, conv3d_key_hash> g_conv3d_cache;
 
-// Free the cuDNN-backend device memory pinned by every cached 3D-conv plan.
-// Clearing the map destroys each conv3d_plan's shared_ptr<fe::graph::Graph>,
-// releasing the cuDNN execution plan + its internal device allocations. Only the
-// plan cache is cleared — the g_weight3d_cache / g_weight3d_f32_cache raw-cudaMalloc
-// reorder buffers (keyed by the persistent weight ptr) are deliberately kept, so
-// there is no leak and the next segment does not re-reorder weights.
+// Drop every cached 3D-conv plan. Only the plan cache is cleared here; the
+// g_weight3d_cache / g_weight3d_f32_cache raw-cudaMalloc reorder buffers (keyed
+// by the persistent weight ptr) are deliberately kept. Some cuDNN-internal
+// device reservations appear to be handle-owned rather than graph-owned, so
+// ggml_cuda_cudnn_conv3d_release_handle is the stronger boundary reset used by
+// the public API.
 void ggml_cuda_cudnn_conv3d_release_plans() {
     std::lock_guard<std::mutex> lk(g_conv3d_mtx);
     g_conv3d_cache.clear();
+}
+
+void ggml_cuda_cudnn_conv3d_release_handle() {
+    ggml_cuda_cudnn_conv3d_release_plans();
+    if (g_cudnn_conv3d_handle) {
+        if (cudnnDestroy(g_cudnn_conv3d_handle) != CUDNN_STATUS_SUCCESS) {
+            GGML_ABORT("cudnnDestroy (conv3d) failed");
+        }
+        g_cudnn_conv3d_handle = nullptr;
+    }
 }
 
 struct weight3d_buf { half * d = nullptr; size_t n = 0; };
@@ -597,6 +607,7 @@ bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 bool ggml_cuda_conv3d_cudnn_available() { return false; }
 
 void ggml_cuda_cudnn_conv3d_release_plans() {}
+void ggml_cuda_cudnn_conv3d_release_handle() {}
 
 bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED(ctx);

@@ -44,3 +44,9 @@ bool ggml_cuda_conv3d_cudnn_available();
 // persistent weight ptr) are kept, so no leak and no re-reorder. Call only when no
 // conv op is in flight. No-op stub when built without GGML_CUDNN.
 void ggml_cuda_cudnn_conv3d_release_plans();
+
+// Clear cached conv3d plans and destroy this thread's cuDNN handle. Use this when
+// plan-cache clearing alone does not return cuDNN-internal per-handle device
+// reservations to the driver. Must be called from the CUDA worker thread that
+// created the handle, at a boundary with no in-flight cuDNN op.
+void ggml_cuda_cudnn_conv3d_release_handle();
