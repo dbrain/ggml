@@ -25,6 +25,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
+#include "ggml-cuda/fattn-cudnn.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -5854,6 +5855,18 @@ void ggml_backend_cuda_trim_pools(ggml_backend_t backend) {
             cuda_ctx->pools[d][s].reset();
         }
     }
+}
+
+void ggml_backend_cuda_release_cudnn_plans(void) {
+    // The cuDNN SDPA + conv3d plan caches are file-scope statics keyed by shape,
+    // guarded by their own mutexes, and hold cuDNN-backend device memory that
+    // ggml_backend_cuda_trim_pools cannot reach (outside the ggml VMM pool). A
+    // plan built for a bigger shape in one phase squats for the whole process,
+    // taxing every later phase's reserve-time high-water. Drop them so that memory
+    // returns to the driver; they rebuild lazily. No-op stubs when built without
+    // cuDNN. Caller guarantees nothing is in flight (segment boundary + sync).
+    ggml_cuda_cudnn_sdpa_release_plans();
+    ggml_cuda_cudnn_conv3d_release_plans();
 }
 
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {

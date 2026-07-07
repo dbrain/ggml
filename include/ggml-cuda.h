@@ -87,6 +87,17 @@ GGML_BACKEND_API void ggml_backend_cuda_get_graph_cache_stats(
 // next segment's first large alloc; never touches params/weights buffers.
 GGML_BACKEND_API void ggml_backend_cuda_trim_pools(ggml_backend_t backend);
 
+// Destroy every cached cuDNN execution plan (fused SDPA + 3D conv). Each cached
+// cudnn-frontend graph pins cuDNN-backend device memory that is never returned to
+// the driver until the plan is destroyed; a plan built for a longer-token / larger
+// shape in one phase (e.g. a continuation segment's base pass or the first segment's
+// VAE decode) then squats for the whole process and inflates every later phase's
+// reserve-time VRAM high-water. ggml_backend_cuda_trim_pools does NOT reach this —
+// it lives outside the ggml VMM pool. Call only at a boundary with nothing in flight
+// (no attention/conv op executing); plans rebuild lazily on next use (one-time build
+// cost, never per-step). No-op on non-CUDA / non-cuDNN builds.
+GGML_BACKEND_API void ggml_backend_cuda_release_cudnn_plans(void);
+
 // Register a per-tensor NVFP4 weight global scale (ModelOpt weight_scale_2), keyed by
 // tensor name. The FP4 cuBLASLt GEMM folds it into the matmul alpha so the stored
 // per-block ue4m3 scales can keep their well-conditioned range (UNFOLDED import)

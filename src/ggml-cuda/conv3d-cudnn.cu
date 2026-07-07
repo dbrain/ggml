@@ -260,6 +260,17 @@ struct conv3d_key_hash {
 static std::mutex g_conv3d_mtx;
 static std::unordered_map<conv3d_key, conv3d_plan, conv3d_key_hash> g_conv3d_cache;
 
+// Free the cuDNN-backend device memory pinned by every cached 3D-conv plan.
+// Clearing the map destroys each conv3d_plan's shared_ptr<fe::graph::Graph>,
+// releasing the cuDNN execution plan + its internal device allocations. Only the
+// plan cache is cleared — the g_weight3d_cache / g_weight3d_f32_cache raw-cudaMalloc
+// reorder buffers (keyed by the persistent weight ptr) are deliberately kept, so
+// there is no leak and the next segment does not re-reorder weights.
+void ggml_cuda_cudnn_conv3d_release_plans() {
+    std::lock_guard<std::mutex> lk(g_conv3d_mtx);
+    g_conv3d_cache.clear();
+}
+
 struct weight3d_buf { half * d = nullptr; size_t n = 0; };
 static std::unordered_map<const void *, weight3d_buf> g_weight3d_cache;
 
@@ -584,6 +595,8 @@ bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 #else  // !GGML_CUDNN
 
 bool ggml_cuda_conv3d_cudnn_available() { return false; }
+
+void ggml_cuda_cudnn_conv3d_release_plans() {}
 
 bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED(ctx);

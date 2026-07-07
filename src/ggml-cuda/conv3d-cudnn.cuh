@@ -34,3 +34,13 @@ bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
 // True when this TU was compiled with cuDNN support.
 bool ggml_cuda_conv3d_cudnn_available();
+
+// Destroy every cached cuDNN 3D-conv execution plan (the file-scope, shape-keyed
+// plan cache). Like the SDPA plan cache, each cached fe::graph::Graph pins
+// cuDNN-backend device memory that is never returned to the driver until the plan
+// is destroyed — the big VAE-decoder conv plans built during the first segment's
+// decode then tax every subsequent phase's reserve-time high-water. Only the plan
+// cache is cleared; the per-weight reorder caches (raw cudaMalloc, keyed by the
+// persistent weight ptr) are kept, so no leak and no re-reorder. Call only when no
+// conv op is in flight. No-op stub when built without GGML_CUDNN.
+void ggml_cuda_cudnn_conv3d_release_plans();

@@ -18,3 +18,14 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
 
 // True when the TU was compiled with cuDNN support (GGML_CUDNN defined at build).
 bool ggml_cuda_cudnn_available();
+
+// Destroy every cached cuDNN SDPA execution plan (the file-scope, shape-keyed
+// plan cache). Each cached fe::graph::Graph holds cuDNN-backend device memory
+// that is NEVER returned to the driver — a plan built for one shape (e.g. a
+// longer-token base pass) squats for the rest of the process and taxes every
+// later phase's reserve-time high-water. ggml_backend_cuda_trim_pools cannot
+// reach it (it lives outside the ggml VMM pool). Call ONLY at a boundary where
+// no attention op is in flight (issues no sync itself). Plans rebuild lazily on
+// the next attention op of that shape (one-time build cost, not per-step).
+// No-op stub when the TU was built without GGML_CUDNN.
+void ggml_cuda_cudnn_sdpa_release_plans();
