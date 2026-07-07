@@ -49,6 +49,20 @@ static int64_t conv3d_ws_cap() {
     return c;
 }
 
+// Optional temporal shape bucket for continuation decode. cuDNN appears to keep
+// internal execution memory per unique conv3d shape, and the continuation path
+// alternates nearby temporal depths (e.g. 13f/16f). Padding the input depth at
+// the tail with zeros and discarding extra output frames is numerically neutral
+// for the real output prefix, while making cuDNN reuse one cached shape.
+static int conv3d_bucket_d() {
+    static int d = -1;
+    if (d < 0) {
+        const char * e = getenv("GGML_CUDNN_CONV3D_BUCKET_D");
+        d = (e && atoi(e) > 0) ? atoi(e) : 0;
+    }
+    return d;
+}
+
 bool ggml_cuda_conv3d_cudnn_available() { return true; }
 
 // ---- layout-conversion kernels (DHW collapsed to one spatial dim) ------------------
@@ -110,6 +124,45 @@ static __global__ void ncdhw_to_ndhwc_f16_tiled(const Tin * __restrict__ in, hal
     }
 }
 
+// NCDHW real input -> NDHWC padded input. S_pad = D_pad*H*W; any tail-depth
+// positions d >= D are materialized as zero, matching conv padding for the real
+// output prefix.
+template <typename Tin>
+static __global__ void ncdhw_to_ndhwc_f16_tiled_pad_d(const Tin * __restrict__ in, half * __restrict__ out,
+                                                      int N, int C, int D, int H, int W, int D_pad) {
+    __shared__ float tile[CV_TILE][CV_TILE + 1];
+    int n = blockIdx.z;
+    const int S     = D * H * W;
+    const int S_pad = D_pad * H * W;
+    const Tin * inb  = in  + (long)n * C * S;
+    half      * outb = out + (long)n * S_pad * C;
+
+    int c0 = blockIdx.y * CV_TILE;
+    int s0 = blockIdx.x * CV_TILE;
+    for (int j = 0; j < CV_TILE; j += CV_BR) {
+        int c = c0 + threadIdx.y + j;
+        int s = s0 + threadIdx.x;
+        float v = 0.0f;
+        if (c < C && s < S_pad) {
+            const int wh = H * W;
+            const int d  = s / wh;
+            const int rem = s - d * wh;
+            if (d < D) {
+                const int src_s = d * wh + rem;
+                v = cv3d_to_f32(inb[(long)c * S + src_s]);
+            }
+        }
+        tile[threadIdx.y + j][threadIdx.x] = v;
+    }
+    __syncthreads();
+    int sT = s0 + threadIdx.y;
+    int cT = c0 + threadIdx.x;
+    for (int j = 0; j < CV_TILE; j += CV_BR) {
+        int s = sT + j;
+        if (cT < C && s < S_pad) outb[(long)s * C + cT] = __float2half(tile[threadIdx.x][threadIdx.y + j]);
+    }
+}
+
 // NDHWC f16 (cuDNN Y) -> NCDHW (ggml dst, Tout): per batch n, [S, C] -> [C, S], S = OD*OH*OW.
 template <typename Tout>
 static __global__ void ndhwc_f16_to_ncdhw_tiled(const half * __restrict__ in, Tout * __restrict__ out,
@@ -164,6 +217,42 @@ static __global__ void ncdhw_to_ndhwc_f32_tiled(const Tin * __restrict__ in, flo
     for (int j = 0; j < CV_TILE; j += CV_BR) {
         int s = sT + j;
         if (cT < C && s < S) outb[(long)s * C + cT] = tile[threadIdx.x][threadIdx.y + j];
+    }
+}
+
+template <typename Tin>
+static __global__ void ncdhw_to_ndhwc_f32_tiled_pad_d(const Tin * __restrict__ in, float * __restrict__ out,
+                                                      int N, int C, int D, int H, int W, int D_pad) {
+    __shared__ float tile[CV_TILE][CV_TILE + 1];
+    int n = blockIdx.z;
+    const int S     = D * H * W;
+    const int S_pad = D_pad * H * W;
+    const Tin * inb  = in  + (long)n * C * S;
+    float     * outb = out + (long)n * S_pad * C;
+
+    int c0 = blockIdx.y * CV_TILE;
+    int s0 = blockIdx.x * CV_TILE;
+    for (int j = 0; j < CV_TILE; j += CV_BR) {
+        int c = c0 + threadIdx.y + j;
+        int s = s0 + threadIdx.x;
+        float v = 0.0f;
+        if (c < C && s < S_pad) {
+            const int wh = H * W;
+            const int d  = s / wh;
+            const int rem = s - d * wh;
+            if (d < D) {
+                const int src_s = d * wh + rem;
+                v = cv3d_to_f32(inb[(long)c * S + src_s]);
+            }
+        }
+        tile[threadIdx.y + j][threadIdx.x] = v;
+    }
+    __syncthreads();
+    int sT = s0 + threadIdx.y;
+    int cT = c0 + threadIdx.x;
+    for (int j = 0; j < CV_TILE; j += CV_BR) {
+        int s = sT + j;
+        if (cT < C && s < S_pad) outb[(long)s * C + cT] = tile[threadIdx.x][threadIdx.y + j];
     }
 }
 
@@ -524,15 +613,19 @@ bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     cudnnHandle_t handle = get_conv3d_handle();
     if (cudnnSetStream(handle, stream) != CUDNN_STATUS_SUCCESS) GGML_ABORT("cudnnSetStream (conv3d) failed");
 
+    const int D_plan = conv3d_bucket_d() > D ? conv3d_bucket_d() : D;
+    const int OD_plan = (D_plan + 2*PD - DD*(KD-1) - 1)/SD + 1;
+    const bool bucket_d = D_plan != D;
+
     static int traced = 0;
     if (getenv("GGML_CUDNN_TRACE") && traced++ < 8) {
-        fprintf(stderr, "[cudnn-conv3d] N=%d C=%d %dx%dx%d -> OC=%d %dx%dx%d  k=%dx%dx%d s=%d,%d,%d p=%d,%d,%d d=%d,%d,%d wt=%d\n",
-                n, c, D, H, W, oc, OD, OH, OW, KD, KH, KW, SD, SH, SW, PD, PH, PW, DD, DH, DW, kernel->type);
+        fprintf(stderr, "[cudnn-conv3d] N=%d C=%d %dx%dx%d(planD=%d) -> OC=%d %dx%dx%d(planOD=%d)  k=%dx%dx%d s=%d,%d,%d p=%d,%d,%d d=%d,%d,%d wt=%d\n",
+                n, c, D, H, W, D_plan, oc, OD, OH, OW, OD_plan, KD, KH, KW, SD, SH, SW, PD, PH, PW, DD, DH, DW, kernel->type);
     }
 
     std::lock_guard<std::mutex> lk(g_conv3d_mtx);
 
-    conv3d_key key{n, c, D, H, W, oc, KD, KH, KW, SD, SH, SW, PD, PH, PW, DD, DH, DW, hi_prec};
+    conv3d_key key{n, c, D_plan, H, W, oc, KD, KH, KW, SD, SH, SW, PD, PH, PW, DD, DH, DW, hi_prec};
     conv3d_plan * plan = &get_or_build_conv3d_plan(handle, key);
     if (!plan->supported && hi_prec) {
         // No F32-IO engine for this shape -> fall back to the standard fp16 plan (the same one
@@ -546,7 +639,7 @@ bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
                     "WAN_VAE_HEAD_F32=0 to A/B intentionally.\n", plan->fail.c_str());
         }
         hi_prec = false;
-        conv3d_key key_h{n, c, D, H, W, oc, KD, KH, KW, SD, SH, SW, PD, PH, PW, DD, DH, DW, false};
+        conv3d_key key_h{n, c, D_plan, H, W, oc, KD, KH, KW, SD, SH, SW, PD, PH, PW, DD, DH, DW, false};
         plan = &get_or_build_conv3d_plan(handle, key_h);
     } else if (hi_prec) {
         // F32-IO plan engaged: confirm once so the fix can be verified from the log.
@@ -566,37 +659,43 @@ bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
     // X: NCDHW (ggml) -> NDHWC (cuDNN), tiled transpose with S = D*H*W. fp32 for hi_prec, else fp16.
     const int S_in = D * H * W;
+    const int S_in_plan = D_plan * H * W;
     ggml_cuda_pool_alloc<half>  x_half(ctx.pool());
     ggml_cuda_pool_alloc<float> x_f32 (ctx.pool());
     void * x_ptr = nullptr;
     {
         dim3 blk(CV_TILE, CV_BR);
-        dim3 grd((S_in + CV_TILE - 1) / CV_TILE, (c + CV_TILE - 1) / CV_TILE, n);
+        dim3 grd((S_in_plan + CV_TILE - 1) / CV_TILE, (c + CV_TILE - 1) / CV_TILE, n);
         if (hi_prec) {
-            x_f32.alloc((size_t)n * c * S_in);  x_ptr = x_f32.get();
+            x_f32.alloc((size_t)n * c * S_in_plan);  x_ptr = x_f32.get();
             if (input->type == GGML_TYPE_F16) {
-                ncdhw_to_ndhwc_f32_tiled<half><<<grd, blk, 0, stream>>>((const half *)input->data, x_f32.get(), n, c, S_in);
+                if (bucket_d) ncdhw_to_ndhwc_f32_tiled_pad_d<half><<<grd, blk, 0, stream>>>((const half *)input->data, x_f32.get(), n, c, D, H, W, D_plan);
+                else          ncdhw_to_ndhwc_f32_tiled<half><<<grd, blk, 0, stream>>>((const half *)input->data, x_f32.get(), n, c, S_in);
             } else {
-                ncdhw_to_ndhwc_f32_tiled<float><<<grd, blk, 0, stream>>>((const float *)input->data, x_f32.get(), n, c, S_in);
+                if (bucket_d) ncdhw_to_ndhwc_f32_tiled_pad_d<float><<<grd, blk, 0, stream>>>((const float *)input->data, x_f32.get(), n, c, D, H, W, D_plan);
+                else          ncdhw_to_ndhwc_f32_tiled<float><<<grd, blk, 0, stream>>>((const float *)input->data, x_f32.get(), n, c, S_in);
             }
         } else {
-            x_half.alloc((size_t)n * c * S_in); x_ptr = x_half.get();
+            x_half.alloc((size_t)n * c * S_in_plan); x_ptr = x_half.get();
             if (input->type == GGML_TYPE_F16) {
-                ncdhw_to_ndhwc_f16_tiled<half><<<grd, blk, 0, stream>>>((const half *)input->data, x_half.get(), n, c, S_in);
+                if (bucket_d) ncdhw_to_ndhwc_f16_tiled_pad_d<half><<<grd, blk, 0, stream>>>((const half *)input->data, x_half.get(), n, c, D, H, W, D_plan);
+                else          ncdhw_to_ndhwc_f16_tiled<half><<<grd, blk, 0, stream>>>((const half *)input->data, x_half.get(), n, c, S_in);
             } else {
-                ncdhw_to_ndhwc_f16_tiled<float><<<grd, blk, 0, stream>>>((const float *)input->data, x_half.get(), n, c, S_in);
+                if (bucket_d) ncdhw_to_ndhwc_f16_tiled_pad_d<float><<<grd, blk, 0, stream>>>((const float *)input->data, x_half.get(), n, c, D, H, W, D_plan);
+                else          ncdhw_to_ndhwc_f16_tiled<float><<<grd, blk, 0, stream>>>((const float *)input->data, x_half.get(), n, c, S_in);
             }
         }
     }
 
     const int S_out = OD * OH * OW;
+    const int S_out_plan = OD_plan * OH * OW;
     // hi_prec -> the cuDNN plan's Y is FLOAT (fp32 store); else HALF (fp16). Only the requested
     // buffer is allocated; the other stays empty (default-constructed pool_alloc, no allocation).
     ggml_cuda_pool_alloc<half>  y_half (ctx.pool());
     ggml_cuda_pool_alloc<float> y_f32  (ctx.pool());
     void * y_ptr = nullptr;
-    if (hi_prec) { y_f32.alloc((size_t)n * oc * S_out);  y_ptr = y_f32.get();  }
-    else         { y_half.alloc((size_t)n * oc * S_out); y_ptr = y_half.get(); }
+    if (hi_prec) { y_f32.alloc((size_t)n * oc * S_out_plan);  y_ptr = y_f32.get();  }
+    else         { y_half.alloc((size_t)n * oc * S_out_plan); y_ptr = y_half.get(); }
 
     ggml_cuda_pool_alloc<uint8_t> ws(ctx.pool());
     void * ws_ptr = nullptr;
