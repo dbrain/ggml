@@ -406,8 +406,28 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         {O_UID, o_ptr},
     };
 
+    size_t free_before_exec = 0;
+    const bool trace_exec = cudnn_sdpa_vram_trace();
+    if (trace_exec) {
+        size_t total_before_exec = 0;
+        cudaStreamSynchronize(stream);
+        cudaMemGetInfo(&free_before_exec, &total_before_exec);
+    }
     if (!plan.graph->execute(handle, vpack, ws_ptr).is_good()) {
         GGML_ABORT("cudnn sdpa execute failed");
+    }
+    if (trace_exec) {
+        cudaStreamSynchronize(stream);
+        size_t free_after_exec = 0, total_after_exec = 0;
+        cudaMemGetInfo(&free_after_exec, &total_after_exec);
+        fprintf(stderr,
+                "[cudnn-sdpa-exec] B=%lld H=%lld Lq=%lld Lkv=%lld D=%lld io=%s ws=%lld MB "
+                "free %.1f -> %.1f MB (delta %+.1f MB, used %.1f MB)\n",
+                (long long)N, (long long)H, (long long)Lq, (long long)Lkv, (long long)D,
+                io_half ? "f16" : "bf16", (long long)(plan.workspace >> 20),
+                free_before_exec / 1048576.0, free_after_exec / 1048576.0,
+                ((double)free_after_exec - (double)free_before_exec) / 1048576.0,
+                (total_after_exec - free_after_exec) / 1048576.0);
     }
 
     // Permute BHSD (io dtype) -> BSHD dst (O seqlen = Lq). F32 dst = upcast (prod default);

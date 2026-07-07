@@ -13,6 +13,7 @@
 #include "ggml-cuda/clamp.cuh"
 #include "ggml-cuda/concat.cuh"
 #include "ggml-cuda/conv-transpose-1d.cuh"
+#include "ggml-cuda/conv2d-cudnn.cuh"
 #include "ggml-cuda/conv2d.cuh"
 #include "ggml-cuda/conv2d-dw.cuh"
 #include "ggml-cuda/conv2d-deform.cuh"
@@ -5997,6 +5998,7 @@ void ggml_backend_cuda_release_cudnn_plans(void) {
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     ggml_cuda_cudnn_sdpa_release_handle();
+    ggml_cuda_cudnn_conv2d_release_handle();
     ggml_cuda_cudnn_conv3d_release_handle();
     size_t free_after_handles = 0, total_after_handles = 0;
     if (trace) {

@@ -25,3 +25,7 @@ bool ggml_cuda_op_conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
 // True when this TU was compiled with cuDNN support.
 bool ggml_cuda_conv2d_cudnn_available();
+
+// Drop cached conv2d cuDNN frontend plans and destroy the thread-local handle.
+// Must be called from the CUDA worker thread that created the handle.
+void ggml_cuda_cudnn_conv2d_release_handle();

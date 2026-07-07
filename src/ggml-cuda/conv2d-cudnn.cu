@@ -15,10 +15,14 @@
 #include <cudnn.h>
 #include <cudnn_frontend.h>
 
+#include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace fe = cudnn_frontend;
 
@@ -27,6 +31,28 @@ namespace fe = cudnn_frontend;
 #define Y_UID 3
 
 bool ggml_cuda_conv2d_cudnn_available() { return true; }
+
+static int64_t conv2d_ws_cap() {
+    static int64_t c = -1;
+    if (c < 0) {
+        const char * e = getenv("GGML_CUDNN_CONV_WS_MB");
+        c = (e && atoll(e) > 0) ? ((int64_t) atoll(e) << 20) : 0;
+    }
+    return c;
+}
+
+static bool conv2d_filter_engines() {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("GGML_CUDNN_CONV_FILTER_ENGINES");
+        on = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return on != 0;
+}
+
+static bool cudnn_conv2d_vram_trace() {
+    return getenv("LONGCAT_VRAM_BREAKDOWN") || getenv("GGML_CUDNN_TRACE") || getenv("GGML_CONV2D_DBG");
+}
 
 // ---- layout-conversion kernels ----------------------------------------------------
 
@@ -123,6 +149,8 @@ static cudnnHandle_t get_conv_handle() {
 struct conv_plan {
     std::shared_ptr<fe::graph::Graph> graph;
     int64_t workspace = 0;
+    bool supported = false;
+    std::string fail;
 };
 
 struct conv_key {
@@ -153,13 +181,18 @@ struct weight_buf {
 };
 static std::unordered_map<const void *, weight_buf> g_weight_cache;
 
-static conv_plan & get_or_build_conv_plan(cudnnHandle_t handle, const conv_key & k) {
-    auto it = g_conv_cache.find(k);
-    if (it != g_conv_cache.end()) return it->second;
-
+static conv_plan build_conv_plan_once(cudnnHandle_t handle, const conv_key & k, bool apply_filter) {
     const int64_t N=k.N, C=k.C, H=k.H, W=k.W, Cout=k.Cout, R=k.KH, S=k.KW;
     const int64_t OH = (H + 2*k.PY - k.DY*(R-1) - 1)/k.SY + 1;
     const int64_t OW = (W + 2*k.PX - k.DX*(S-1) - 1)/k.SX + 1;
+
+    conv_plan plan;
+    size_t free_before = 0;
+    const bool trace_vram = cudnn_conv2d_vram_trace();
+    if (trace_vram) {
+        size_t total_before = 0;
+        cudaMemGetInfo(&free_before, &total_before);
+    }
 
     auto graph = std::make_shared<fe::graph::Graph>();
     graph->set_io_data_type(fe::DataType_t::HALF)
@@ -181,21 +214,84 @@ static conv_plan & get_or_build_conv_plan(cudnnHandle_t handle, const conv_key &
     Y->set_output(true).set_dim({N, Cout, OH, OW})
      .set_stride({OH*OW*Cout, 1, OW*Cout, Cout}).set_uid(Y_UID);
 
-    if (!graph->validate().is_good())                                  GGML_ABORT("cudnn conv validate failed");
-    if (!graph->build_operation_graph(handle).is_good())               GGML_ABORT("cudnn conv build_operation_graph failed");
-    if (!graph->create_execution_plans({fe::HeurMode_t::A}).is_good()) GGML_ABORT("cudnn conv create_execution_plans failed");
-    if (!graph->check_support(handle).is_good())                       GGML_ABORT("cudnn conv check_support failed (no conv engine for this arch?)");
-    if (!graph->build_plans(handle).is_good())                         GGML_ABORT("cudnn conv build_plans failed");
+    const bool v_ok  = graph->validate().is_good();
+    const bool b_ok  = v_ok && graph->build_operation_graph(handle).is_good();
+    const bool p_ok  = b_ok && graph->create_execution_plans({fe::HeurMode_t::A}).is_good();
+    if (p_ok && conv2d_ws_cap() > 0) {
+        graph->deselect_workspace_greater_than(conv2d_ws_cap());
+    }
+    if (p_ok && apply_filter) {
+        graph->deselect_numeric_notes({fe::NumericalNote_t::WINOGRAD,
+                                       fe::NumericalNote_t::WINOGRAD_TILE_4x4,
+                                       fe::NumericalNote_t::WINOGRAD_TILE_6x6,
+                                       fe::NumericalNote_t::WINOGRAD_TILE_13x13,
+                                       fe::NumericalNote_t::REDUCED_PRECISION_REDUCTION});
+    }
+    const bool s_ok  = p_ok && graph->check_support(handle).is_good();
+    const bool bp_ok = s_ok && graph->build_plans(handle).is_good();
 
-    int64_t ws = 0;
-    if (!graph->get_workspace_size(ws).is_good()) GGML_ABORT("cudnn conv get_workspace_size failed");
+    int64_t ws = -1;
+    if (bp_ok && graph->get_workspace_size(ws).is_good() && (conv2d_ws_cap() == 0 || ws <= conv2d_ws_cap())) {
+        plan.graph = graph;
+        plan.workspace = ws;
+        plan.supported = true;
+    }
+    if (!plan.supported) {
+        char buf[224];
+        snprintf(buf, sizeof(buf), "validate=%d opgraph=%d plans=%d support=%d build=%d ws=%lldMB(cap=%lldMB) filter=%d",
+                 v_ok, b_ok, p_ok, s_ok, bp_ok, (long long)(ws >> 20), (long long)(conv2d_ws_cap() >> 20), (int)apply_filter);
+        plan.fail = buf;
+    }
+    if (getenv("GGML_CUDNN_TRACE") || getenv("GGML_CONV2D_DBG")) {
+        fprintf(stderr, "[cudnn-conv2d] plan N=%lld C=%lld %lldx%lld->OC=%lld k=%lldx%lld s=%lld,%lld "
+                "filter=%d : validate=%d opgraph=%d plans=%d support=%d build=%d ws=%lldMB(cap=%lldMB) -> %s\n",
+                (long long)N, (long long)C, (long long)H, (long long)W, (long long)Cout,
+                (long long)R, (long long)S, (long long)k.SY, (long long)k.SX, (int)apply_filter,
+                v_ok, b_ok, p_ok, s_ok, bp_ok, (long long)(ws >> 20), (long long)(conv2d_ws_cap() >> 20),
+                plan.supported ? "CUDNN" : "FALLBACK(direct)");
+    }
+    if (trace_vram) {
+        size_t free_after = 0, total_after = 0;
+        cudaMemGetInfo(&free_after, &total_after);
+        fprintf(stderr,
+                "[cudnn-conv2d-plan] build N=%lld C=%lld %lldx%lld->OC=%lld k=%lldx%lld "
+                "filter=%d supported=%d ws=%lld MB free %.1f -> %.1f MB (delta %+.1f MB, used %.1f MB)\n",
+                (long long)N, (long long)C, (long long)H, (long long)W, (long long)Cout,
+                (long long)R, (long long)S, (int)apply_filter, (int)plan.supported, (long long)(ws >> 20),
+                free_before / 1048576.0, free_after / 1048576.0,
+                ((double)free_after - (double)free_before) / 1048576.0,
+                (total_after - free_after) / 1048576.0);
+    }
+    return plan;
+}
 
-    conv_plan plan;
-    plan.graph = graph;
-    plan.workspace = ws;
+static conv_plan & get_or_build_conv_plan(cudnnHandle_t handle, const conv_key & k) {
+    auto it = g_conv_cache.find(k);
+    if (it != g_conv_cache.end()) return it->second;
+
+    const bool filter = conv2d_filter_engines();
+    conv_plan plan = build_conv_plan_once(handle, k, filter);
+    if (!plan.supported && filter) {
+        fprintf(stderr, "[cudnn-conv2d] GGML_CUDNN_CONV_FILTER_ENGINES removed all engines for "
+                "C=%lld->OC=%lld %lldx%lld (%s) -> retrying unfiltered\n",
+                (long long)k.C, (long long)k.Cout, (long long)k.H, (long long)k.W, plan.fail.c_str());
+        plan = build_conv_plan_once(handle, k, false);
+    }
+
     auto [ins, ok] = g_conv_cache.emplace(k, std::move(plan));
     GGML_UNUSED(ok);
     return ins->second;
+}
+
+void ggml_cuda_cudnn_conv2d_release_handle() {
+    std::lock_guard<std::mutex> lk(g_conv_mtx);
+    g_conv_cache.clear();
+    if (g_cudnn_conv_handle) {
+        if (cudnnDestroy(g_cudnn_conv_handle) != CUDNN_STATUS_SUCCESS) {
+            GGML_ABORT("cudnnDestroy (conv2d) failed");
+        }
+        g_cudnn_conv_handle = nullptr;
+    }
 }
 
 // Reorder + cache the KRSC f16 weight for this source weight tensor.
@@ -262,6 +358,9 @@ bool ggml_cuda_op_conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
     conv_key key{N, IC, IH, IW, OC, KH, KW, SY, SX, PY, PX, DY, DX};
     conv_plan & plan = get_or_build_conv_plan(handle, key);
+    if (!plan.supported) {
+        return false;
+    }
 
     // weight (cached, reordered once)
     half * w_krsc = get_or_build_weight(kernel, stream);
@@ -287,7 +386,26 @@ bool ggml_cuda_op_conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         {W_UID, w_krsc},
         {Y_UID, y_nhwc.get()},
     };
+    size_t free_before_exec = 0;
+    const bool trace_exec = cudnn_conv2d_vram_trace();
+    if (trace_exec) {
+        size_t total_before_exec = 0;
+        cudaStreamSynchronize(stream);
+        cudaMemGetInfo(&free_before_exec, &total_before_exec);
+    }
     if (!plan.graph->execute(handle, vpack, ws_ptr).is_good()) GGML_ABORT("cudnn conv execute failed");
+    if (trace_exec) {
+        cudaStreamSynchronize(stream);
+        size_t free_after_exec = 0, total_after_exec = 0;
+        cudaMemGetInfo(&free_after_exec, &total_after_exec);
+        fprintf(stderr,
+                "[cudnn-conv2d-exec] N=%d C=%d %dx%d->OC=%d k=%dx%d ws=%lld MB free %.1f -> %.1f MB "
+                "(delta %+.1f MB, used %.1f MB)\n",
+                N, IC, IH, IW, OC, KH, KW, (long long)(plan.workspace >> 20),
+                free_before_exec / 1048576.0, free_after_exec / 1048576.0,
+                ((double)free_after_exec - (double)free_before_exec) / 1048576.0,
+                (total_after_exec - free_after_exec) / 1048576.0);
+    }
 
     // Y: NHWC f16 -> NCHW f32 directly into ggml dst, tiled transpose
     {
@@ -303,6 +421,8 @@ bool ggml_cuda_op_conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 #else  // !GGML_CUDNN
 
 bool ggml_cuda_conv2d_cudnn_available() { return false; }
+
+void ggml_cuda_cudnn_conv2d_release_handle() {}
 
 bool ggml_cuda_op_conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED(ctx);

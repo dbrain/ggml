@@ -706,7 +706,26 @@ bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         {W_UID, w_ptr},
         {Y_UID, y_ptr},
     };
+    size_t free_before_exec = 0;
+    const bool trace_exec = cudnn_conv3d_vram_trace();
+    if (trace_exec) {
+        size_t total_before_exec = 0;
+        cudaStreamSynchronize(stream);
+        cudaMemGetInfo(&free_before_exec, &total_before_exec);
+    }
     if (!plan->graph->execute(handle, vpack, ws_ptr).is_good()) GGML_ABORT("cudnn conv3d execute failed");
+    if (trace_exec) {
+        cudaStreamSynchronize(stream);
+        size_t free_after_exec = 0, total_after_exec = 0;
+        cudaMemGetInfo(&free_after_exec, &total_after_exec);
+        fprintf(stderr,
+                "[cudnn-conv3d-exec] N=%d C=%d %dx%dx%d(planD=%d)->OC=%d k=%dx%dx%d ws=%lld MB "
+                "free %.1f -> %.1f MB (delta %+.1f MB, used %.1f MB)\n",
+                n, c, D, H, W, D_plan, oc, KD, KH, KW, (long long)(plan->workspace >> 20),
+                free_before_exec / 1048576.0, free_after_exec / 1048576.0,
+                ((double)free_after_exec - (double)free_before_exec) / 1048576.0,
+                (total_after_exec - free_after_exec) / 1048576.0);
+    }
 
     // Y: NDHWC (cuDNN) -> NCDHW (ggml dst), tiled transpose with S = OD*OH*OW.
     {
