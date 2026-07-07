@@ -192,8 +192,47 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+static bool ggml_cuda_alloc_trace_enabled() {
+    const char * e = getenv("GGML_CUDA_ALLOC_TRACE");
+    return e != nullptr && e[0] != '0';
+}
+
+static size_t ggml_cuda_alloc_trace_min_bytes() {
+    static size_t min_bytes = [] {
+        const char * e = getenv("GGML_CUDA_ALLOC_TRACE_MB");
+        const long mb = e ? atol(e) : 64;
+        return (size_t) (mb > 0 ? mb : 1) << 20;
+    }();
+    return min_bytes;
+}
+
+static void ggml_cuda_mem_get_info_noabort(size_t * free_mem, size_t * total_mem) {
+    *free_mem = 0;
+    *total_mem = 0;
+    (void) cudaMemGetInfo(free_mem, total_mem);
+}
+
+static void ggml_cuda_alloc_trace_event(const char * tag, int device, size_t bytes, const char * detail,
+                                        size_t free_before, size_t free_after, size_t total_after) {
+    if (!ggml_cuda_alloc_trace_enabled() || bytes < ggml_cuda_alloc_trace_min_bytes()) {
+        return;
+    }
+    fprintf(stderr,
+            "[cuda-alloc] %-18s dev=%d size=%.1f MB free %.1f -> %.1f MB (delta %+.1f MB, used %.1f MB)%s%s\n",
+            tag, device, bytes / 1048576.0,
+            free_before / 1048576.0, free_after / 1048576.0,
+            ((double) free_after - (double) free_before) / 1048576.0,
+            (total_after - free_after) / 1048576.0,
+            detail && detail[0] ? " " : "",
+            detail && detail[0] ? detail : "");
+}
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
+    size_t free_before = 0, total_before = 0;
+    if (ggml_cuda_alloc_trace_enabled() && size >= ggml_cuda_alloc_trace_min_bytes()) {
+        ggml_cuda_mem_get_info_noabort(&free_before, &total_before);
+    }
     cudaError_t err;
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
         err = cudaMallocManaged(ptr, size);
@@ -218,6 +257,11 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
 #endif // defined(GGML_USE_HIP)
     } else {
         err = cudaMalloc(ptr, size);
+    }
+    if (err == cudaSuccess && ggml_cuda_alloc_trace_enabled() && size >= ggml_cuda_alloc_trace_min_bytes()) {
+        size_t free_after = 0, total_after = 0;
+        ggml_cuda_mem_get_info_noabort(&free_after, &total_after);
+        ggml_cuda_alloc_trace_event("cudaMalloc", device, size, "", free_before, free_after, total_after);
     }
     return err;
 }
@@ -453,7 +497,16 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer & b = buffer_pool[i];
             if (b.ptr != nullptr) {
+                size_t free_before = 0, total_before = 0;
+                if (ggml_cuda_alloc_trace_enabled() && b.size >= ggml_cuda_alloc_trace_min_bytes()) {
+                    ggml_cuda_mem_get_info_noabort(&free_before, &total_before);
+                }
                 CUDA_CHECK(cudaFree(b.ptr));
+                if (ggml_cuda_alloc_trace_enabled() && b.size >= ggml_cuda_alloc_trace_min_bytes()) {
+                    size_t free_after = 0, total_after = 0;
+                    ggml_cuda_mem_get_info_noabort(&free_after, &total_after);
+                    ggml_cuda_alloc_trace_event("pool-leg-free", device, b.size, "", free_before, free_after, total_after);
+                }
                 pool_size -= b.size;
                 b.ptr  = nullptr;
                 b.size = 0;
@@ -537,7 +590,16 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         }
         GGML_LOG_DEBUG(GGML_CUDA_NAME " buffer pool full, increase MAX_CUDA_BUFFERS\n");
         ggml_cuda_set_device(device);
+        size_t free_before = 0, total_before = 0;
+        if (ggml_cuda_alloc_trace_enabled() && size >= ggml_cuda_alloc_trace_min_bytes()) {
+            ggml_cuda_mem_get_info_noabort(&free_before, &total_before);
+        }
         CUDA_CHECK(cudaFree(ptr));
+        if (ggml_cuda_alloc_trace_enabled() && size >= ggml_cuda_alloc_trace_min_bytes()) {
+            size_t free_after = 0, total_after = 0;
+            ggml_cuda_mem_get_info_noabort(&free_after, &total_after);
+            ggml_cuda_alloc_trace_event("pool-leg-free", device, size, "full", free_before, free_after, total_after);
+        }
         pool_size -= size;
     }
 };
@@ -563,6 +625,11 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
     ~ggml_cuda_pool_vmm() {
         if (pool_addr != 0) {
+            size_t free_before = 0, total_before = 0;
+            if (ggml_cuda_alloc_trace_enabled() && pool_size >= ggml_cuda_alloc_trace_min_bytes()) {
+                ggml_cuda_set_device(device);
+                ggml_cuda_mem_get_info_noabort(&free_before, &total_before);
+            }
 #if defined(GGML_USE_HIP)
             // Workaround for https://github.com/ROCm/ROCR-Runtime/issues/285
             for (std::pair<CUdeviceptr, size_t> & mapping : mappings) {
@@ -572,6 +639,11 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             CU_CHECK(cuMemUnmap(pool_addr, pool_size));
 #endif
             CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
+            if (ggml_cuda_alloc_trace_enabled() && pool_size >= ggml_cuda_alloc_trace_min_bytes()) {
+                size_t free_after = 0, total_after = 0;
+                ggml_cuda_mem_get_info_noabort(&free_after, &total_after);
+                ggml_cuda_alloc_trace_event("vmm-unmap", device, pool_size, "", free_before, free_after, total_after);
+            }
         }
     }
 
@@ -595,6 +667,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = device;
             CUmemGenericAllocationHandle handle;
+            size_t free_before = 0, total_before = 0;
+            if (ggml_cuda_alloc_trace_enabled() && reserve_size >= ggml_cuda_alloc_trace_min_bytes()) {
+                ggml_cuda_mem_get_info_noabort(&free_before, &total_before);
+            }
             CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
 
             // reserve virtual address space (if not already reserved)
@@ -621,6 +697,14 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
             // add to the pool
             pool_size += reserve_size;
+            if (ggml_cuda_alloc_trace_enabled() && reserve_size >= ggml_cuda_alloc_trace_min_bytes()) {
+                size_t free_after = 0, total_after = 0;
+                ggml_cuda_mem_get_info_noabort(&free_after, &total_after);
+                char detail[96];
+                snprintf(detail, sizeof(detail), "pool_size=%.1fMB pool_used=%.1fMB",
+                         pool_size / 1048576.0, pool_used / 1048576.0);
+                ggml_cuda_alloc_trace_event("vmm-map", device, reserve_size, detail, free_before, free_after, total_after);
+            }
 
             //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
             //       device, (unsigned long long) (pool_size/1024/1024),
@@ -695,15 +779,26 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
+    size_t size = 0;
     std::string name;
 
-    ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
-        device(device), dev_ptr(dev_ptr),
+    ggml_backend_cuda_buffer_context(int device, void * dev_ptr, size_t size) :
+        device(device), dev_ptr(dev_ptr), size(size),
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+        size_t free_before = 0, total_before = 0;
+        if (ggml_cuda_alloc_trace_enabled() && size >= ggml_cuda_alloc_trace_min_bytes()) {
+            ggml_cuda_set_device(device);
+            ggml_cuda_mem_get_info_noabort(&free_before, &total_before);
+        }
         CUDA_CHECK(cudaFree(dev_ptr));
+        if (ggml_cuda_alloc_trace_enabled() && size >= ggml_cuda_alloc_trace_min_bytes()) {
+            size_t free_after = 0, total_after = 0;
+            ggml_cuda_mem_get_info_noabort(&free_after, &total_after);
+            ggml_cuda_alloc_trace_event("cudaFree-buffer", device, size, name.c_str(), free_before, free_after, total_after);
+        }
     }
 };
 
@@ -859,7 +954,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
         return nullptr;
     }
 
-    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
+    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr, size);
 
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
