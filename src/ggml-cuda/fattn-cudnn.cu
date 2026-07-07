@@ -18,13 +18,16 @@
 #include <cudnn_frontend.h>
 #include <nvtx3/nvToolsExt.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace fe = cudnn_frontend;
 
@@ -32,6 +35,8 @@ namespace fe = cudnn_frontend;
 #define K_UID 2
 #define V_UID 3
 #define O_UID 4
+#define SEQ_LEN_Q_UID 5
+#define SEQ_LEN_KV_UID 6
 
 bool ggml_cuda_cudnn_available() { return true; }
 
@@ -53,19 +58,20 @@ static int64_t sdpa_ws_cap() {
 // D inner, H next, L next, N outer (BSHD). out[n,l,h,d] = in[n,h,l,d].
 static __global__ void cudnn_o_bhsd_half_to_bshd_f32(
         const half * __restrict__ in, float * __restrict__ out,
-        int N, int H, int L, int D) {
+        int N, int H, int L_out, int L_in, int D) {
     const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    const long tot = (long)N * H * L * D;
+    const long tot = (long)N * H * L_out * D;
     if (idx >= tot) return;
     // decode BHSD index
     int d = idx % D;
     long t = idx / D;
-    int l = t % L; t /= L;
+    int l = t % L_out; t /= L_out;
     int h = t % H; t /= H;
     int n = t;
+    long in_o = (((long)n * H + h) * L_in + l) * D + d;
     // BSHD output offset: ((n*L + l)*H + h)*D + d
-    long o = (((long)n * L + l) * H + h) * D + d;
-    out[o] = __half2float(in[idx]);
+    long o = (((long)n * L_out + l) * H + h) * D + d;
+    out[o] = __half2float(in[in_o]);
 }
 
 // F16-dst variant: keep the cuDNN output F16 (permute only, NO upcast) so the LTX_DIT_F16
@@ -73,48 +79,73 @@ static __global__ void cudnn_o_bhsd_half_to_bshd_f32(
 // keeps to_out on the F16 activation-quant path). Used when the flash node's dst is F16.
 static __global__ void cudnn_o_bhsd_half_to_bshd_f16(
         const half * __restrict__ in, half * __restrict__ out,
-        int N, int H, int L, int D) {
+        int N, int H, int L_out, int L_in, int D) {
     const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    const long tot = (long)N * H * L * D;
+    const long tot = (long)N * H * L_out * D;
     if (idx >= tot) return;
     int d = idx % D;
     long t = idx / D;
-    int l = t % L; t /= L;
+    int l = t % L_out; t /= L_out;
     int h = t % H; t /= H;
     int n = t;
-    long o = (((long)n * L + l) * H + h) * D + d;
-    out[o] = in[idx];
+    long in_o = (((long)n * H + h) * L_in + l) * D + d;
+    long o = (((long)n * L_out + l) * H + h) * D + d;
+    out[o] = in[in_o];
 }
 
 // bf16-IO variants (WAN_ATTN_BF16): the SDPA scratch O is bf16; permute BHSD->BSHD and
 // convert to the ggml dst dtype (F32 upcast, or F16 for the residual stream).
 static __global__ void cudnn_o_bhsd_bf16_to_bshd_f32(
         const nv_bfloat16 * __restrict__ in, float * __restrict__ out,
-        int N, int H, int L, int D) {
+        int N, int H, int L_out, int L_in, int D) {
     const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    const long tot = (long)N * H * L * D;
+    const long tot = (long)N * H * L_out * D;
     if (idx >= tot) return;
     int d = idx % D;
     long t = idx / D;
-    int l = t % L; t /= L;
+    int l = t % L_out; t /= L_out;
     int h = t % H; t /= H;
     int n = t;
-    long o = (((long)n * L + l) * H + h) * D + d;
-    out[o] = __bfloat162float(in[idx]);
+    long in_o = (((long)n * H + h) * L_in + l) * D + d;
+    long o = (((long)n * L_out + l) * H + h) * D + d;
+    out[o] = __bfloat162float(in[in_o]);
 }
 static __global__ void cudnn_o_bhsd_bf16_to_bshd_f16(
         const nv_bfloat16 * __restrict__ in, half * __restrict__ out,
-        int N, int H, int L, int D) {
+        int N, int H, int L_out, int L_in, int D) {
     const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    const long tot = (long)N * H * L * D;
+    const long tot = (long)N * H * L_out * D;
     if (idx >= tot) return;
     int d = idx % D;
     long t = idx / D;
-    int l = t % L; t /= L;
+    int l = t % L_out; t /= L_out;
     int h = t % H; t /= H;
     int n = t;
-    long o = (((long)n * L + l) * H + h) * D + d;
-    out[o] = __float2half(__bfloat162float(in[idx]));
+    long in_o = (((long)n * H + h) * L_in + l) * D + d;
+    long o = (((long)n * L_out + l) * H + h) * D + d;
+    out[o] = __float2half(__bfloat162float(in[in_o]));
+}
+
+template <typename T>
+static __global__ void bhsd_pad_seq_kernel(
+        const T * __restrict__ in, T * __restrict__ out,
+        int N, int H, int L_in, int L_out, int D) {
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long tot = (long)N * H * L_in * D;
+    if (idx >= tot) return;
+    int d = idx % D;
+    long t = idx / D;
+    int l = t % L_in; t /= L_in;
+    int h = t % H; t /= H;
+    int n = t;
+    out[(((long)n * H + h) * L_out + l) * D + d] = in[idx];
+}
+
+static __global__ void fill_seq_len_kernel(int32_t * out, int n, int value) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = value;
+    }
 }
 
 // One cuDNN handle per thread (the backend runs the graph on a single worker thread).
@@ -136,14 +167,16 @@ struct cudnn_sdpa_plan {
 struct sdpa_key {
     int64_t B, H, Lq, Lkv, D;   // Lq==Lkv for self-attn; Lq!=Lkv for cross-attn (LTX-AV a2v/v2a)
     int     io_half;   // 1 == fp16 io, 0 == bf16 (reserved)
+    int     padding_mask;
     bool operator==(const sdpa_key & o) const {
-        return B == o.B && H == o.H && Lq == o.Lq && Lkv == o.Lkv && D == o.D && io_half == o.io_half;
+        return B == o.B && H == o.H && Lq == o.Lq && Lkv == o.Lkv && D == o.D &&
+               io_half == o.io_half && padding_mask == o.padding_mask;
     }
 };
 struct sdpa_key_hash {
     size_t operator()(const sdpa_key & k) const {
         size_t h = 1469598103934665603ull;
-        for (int64_t v : {k.B, k.H, k.Lq, k.Lkv, k.D, (int64_t)k.io_half}) {
+        for (int64_t v : {k.B, k.H, k.Lq, k.Lkv, k.D, (int64_t)k.io_half, (int64_t)k.padding_mask}) {
             h ^= (size_t)v; h *= 1099511628211ull;
         }
         return h;
@@ -163,6 +196,44 @@ static bool cudnn_sdpa_exec_trace() {
 
 static bool cudnn_op_trace() {
     return getenv("GGML_CUDNN_OP_TRACE") || getenv("GGML_CUDNN_TRACE");
+}
+
+static const std::vector<int64_t> & sdpa_buckets() {
+    static std::vector<int64_t> buckets = [] {
+        std::vector<int64_t> out;
+        const char * e = getenv("GGML_CUDNN_ATTN_BUCKETS");
+        if (e != nullptr && e[0] != '\0') {
+            const char * p = e;
+            while (*p) {
+                char * end = nullptr;
+                long long v = strtoll(p, &end, 10);
+                if (v > 0) {
+                    out.push_back((int64_t)v);
+                }
+                if (end == p || *end == '\0') {
+                    break;
+                }
+                p = (*end == ',') ? end + 1 : end;
+            }
+        } else if (getenv("GGML_CUDNN_ATTN_BUCKET") != nullptr) {
+            // LTX continuation defaults from measured kernel-library fanout:
+            // small cross-attn (127/152), text/self 1024, base 8160, hires refine 32640/38760.
+            out = {160, 1024, 8160, 38760};
+        }
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
+    }();
+    return buckets;
+}
+
+static int64_t sdpa_bucket_len(int64_t len) {
+    for (int64_t b : sdpa_buckets()) {
+        if (len <= b) {
+            return b;
+        }
+    }
+    return len;
 }
 
 static uint64_t next_cudnn_sdpa_op_id() {
@@ -229,7 +300,17 @@ static cudnn_sdpa_plan & get_or_build_plan(cudnnHandle_t handle, const sdpa_key 
     auto sdpa_opts = fe::graph::SDPA_attributes().set_name("flash_attention")
                          .set_generate_stats(false)   // inference: no LSE stats
                          .set_attn_scale(scale);
-    // no causal mask, no padding mask -> full bidirectional attention
+    if (key.padding_mask) {
+        auto seq_q = graph->tensor(fe::graph::Tensor_attributes()
+                .set_name("seq_q").set_uid(SEQ_LEN_Q_UID)
+                .set_dim({B, 1, 1, 1}).set_stride({1, 1, 1, 1})
+                .set_data_type(fe::DataType_t::INT32));
+        auto seq_kv = graph->tensor(fe::graph::Tensor_attributes()
+                .set_name("seq_kv").set_uid(SEQ_LEN_KV_UID)
+                .set_dim({B, 1, 1, 1}).set_stride({1, 1, 1, 1})
+                .set_data_type(fe::DataType_t::INT32));
+        sdpa_opts.set_padding_mask(true).set_seq_len_q(seq_q).set_seq_len_kv(seq_kv);
+    }
 
     auto [O, Stats] = graph->sdpa(Q, K, V, sdpa_opts);
     (void) Stats;
@@ -261,10 +342,11 @@ static cudnn_sdpa_plan & get_or_build_plan(cudnnHandle_t handle, const sdpa_key 
         cudaMemGetInfo(&free_after, &total_after);
         fprintf(stderr,
                 "[cudnn-sdpa-plan] build #%zu B=%lld H=%lld Lq=%lld Lkv=%lld D=%lld io=%s ws=%lld MB "
-                "free %.1f -> %.1f MB (delta %+.1f MB, used %.1f MB)\n",
+                "padmask=%d free %.1f -> %.1f MB (delta %+.1f MB, used %.1f MB)\n",
                 g_plan_cache.size(),
                 (long long) B, (long long) H, (long long) Lq, (long long) Lkv, (long long) D,
                 key.io_half ? "f16" : "bf16", (long long) (ws >> 20),
+                key.padding_mask,
                 free_before / 1048576.0, free_after / 1048576.0,
                 ((double) free_after - (double) free_before) / 1048576.0,
                 (total_after - free_after) / 1048576.0);
@@ -403,7 +485,13 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         }
     }
 
-    sdpa_key key{N, H, Lq, Lkv, D, io_half};
+    const int64_t Lq_plan  = sdpa_bucket_len(Lq);
+    const int64_t Lkv_plan = sdpa_bucket_len(Lkv);
+    const bool use_mask    = !sdpa_buckets().empty();
+    const bool pad_q       = Lq_plan != Lq;
+    const bool pad_kv      = Lkv_plan != Lkv;
+
+    sdpa_key key{N, H, Lq_plan, Lkv_plan, D, io_half, use_mask ? 1 : 0};
     cudnn_sdpa_plan & plan = get_or_build_plan(handle, key, scale);
 
     ggml_cuda_pool_alloc<uint8_t> ws(ctx.pool());
@@ -413,32 +501,93 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         ws_ptr = ws.get();
     }
 
-    // SDPA writes O as BHSD (io dtype) into a scratch buffer (O seqlen = Lq).
+    ggml_cuda_pool_alloc<half>        q_pad_h(ctx.pool());
+    ggml_cuda_pool_alloc<half>        k_pad_h(ctx.pool());
+    ggml_cuda_pool_alloc<half>        v_pad_h(ctx.pool());
+    ggml_cuda_pool_alloc<nv_bfloat16> q_pad_b(ctx.pool());
+    ggml_cuda_pool_alloc<nv_bfloat16> k_pad_b(ctx.pool());
+    ggml_cuda_pool_alloc<nv_bfloat16> v_pad_b(ctx.pool());
+    const void * q_exec = q_ptr;
+    const void * k_exec = K->data;
+    const void * v_exec = V->data;
+    if (use_mask && (pad_q || pad_kv)) {
+        const int bs = 256;
+        if (io_half) {
+            if (pad_q) {
+                q_pad_h.alloc((size_t)(N * H * Lq_plan * D));
+                cudaMemsetAsync(q_pad_h.get(), 0, (size_t)(N * H * Lq_plan * D) * sizeof(half), stream);
+                bhsd_pad_seq_kernel<half><<<(int)(((long)N * H * Lq * D + bs - 1) / bs), bs, 0, stream>>>((const half *)q_ptr, q_pad_h.get(), (int)N, (int)H, (int)Lq, (int)Lq_plan, (int)D);
+                q_exec = q_pad_h.get();
+            }
+            if (pad_kv) {
+                k_pad_h.alloc((size_t)(N * H * Lkv_plan * D));
+                v_pad_h.alloc((size_t)(N * H * Lkv_plan * D));
+                cudaMemsetAsync(k_pad_h.get(), 0, (size_t)(N * H * Lkv_plan * D) * sizeof(half), stream);
+                cudaMemsetAsync(v_pad_h.get(), 0, (size_t)(N * H * Lkv_plan * D) * sizeof(half), stream);
+                bhsd_pad_seq_kernel<half><<<(int)(((long)N * H * Lkv * D + bs - 1) / bs), bs, 0, stream>>>((const half *)K->data, k_pad_h.get(), (int)N, (int)H, (int)Lkv, (int)Lkv_plan, (int)D);
+                bhsd_pad_seq_kernel<half><<<(int)(((long)N * H * Lkv * D + bs - 1) / bs), bs, 0, stream>>>((const half *)V->data, v_pad_h.get(), (int)N, (int)H, (int)Lkv, (int)Lkv_plan, (int)D);
+                k_exec = k_pad_h.get();
+                v_exec = v_pad_h.get();
+            }
+        } else {
+            if (pad_q) {
+                q_pad_b.alloc((size_t)(N * H * Lq_plan * D));
+                cudaMemsetAsync(q_pad_b.get(), 0, (size_t)(N * H * Lq_plan * D) * sizeof(nv_bfloat16), stream);
+                bhsd_pad_seq_kernel<nv_bfloat16><<<(int)(((long)N * H * Lq * D + bs - 1) / bs), bs, 0, stream>>>((const nv_bfloat16 *)q_ptr, q_pad_b.get(), (int)N, (int)H, (int)Lq, (int)Lq_plan, (int)D);
+                q_exec = q_pad_b.get();
+            }
+            if (pad_kv) {
+                k_pad_b.alloc((size_t)(N * H * Lkv_plan * D));
+                v_pad_b.alloc((size_t)(N * H * Lkv_plan * D));
+                cudaMemsetAsync(k_pad_b.get(), 0, (size_t)(N * H * Lkv_plan * D) * sizeof(nv_bfloat16), stream);
+                cudaMemsetAsync(v_pad_b.get(), 0, (size_t)(N * H * Lkv_plan * D) * sizeof(nv_bfloat16), stream);
+                bhsd_pad_seq_kernel<nv_bfloat16><<<(int)(((long)N * H * Lkv * D + bs - 1) / bs), bs, 0, stream>>>((const nv_bfloat16 *)K->data, k_pad_b.get(), (int)N, (int)H, (int)Lkv, (int)Lkv_plan, (int)D);
+                bhsd_pad_seq_kernel<nv_bfloat16><<<(int)(((long)N * H * Lkv * D + bs - 1) / bs), bs, 0, stream>>>((const nv_bfloat16 *)V->data, v_pad_b.get(), (int)N, (int)H, (int)Lkv, (int)Lkv_plan, (int)D);
+                k_exec = k_pad_b.get();
+                v_exec = v_pad_b.get();
+            }
+        }
+    }
+
+    // SDPA writes O as BHSD (io dtype) into a scratch buffer (O seqlen = Lq_plan).
     ggml_cuda_pool_alloc<half>        o_bhsd_h(ctx.pool());
     ggml_cuda_pool_alloc<nv_bfloat16> o_bhsd_b(ctx.pool());
     void * o_ptr = nullptr;
-    if (io_half) { o_bhsd_h.alloc((size_t)(N * H * Lq * D)); o_ptr = o_bhsd_h.get(); }
-    else         { o_bhsd_b.alloc((size_t)(N * H * Lq * D)); o_ptr = o_bhsd_b.get(); }
+    if (io_half) { o_bhsd_h.alloc((size_t)(N * H * Lq_plan * D)); o_ptr = o_bhsd_h.get(); }
+    else         { o_bhsd_b.alloc((size_t)(N * H * Lq_plan * D)); o_ptr = o_bhsd_b.get(); }
 
     std::unordered_map<fe::graph::Tensor_attributes::uid_t, void *> vpack = {
-        {Q_UID, const_cast<void *>(q_ptr)},
-        {K_UID, K->data},
-        {V_UID, V->data},
+        {Q_UID, const_cast<void *>(q_exec)},
+        {K_UID, const_cast<void *>(k_exec)},
+        {V_UID, const_cast<void *>(v_exec)},
         {O_UID, o_ptr},
     };
+    ggml_cuda_pool_alloc<int32_t> seq_q(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> seq_kv(ctx.pool());
+    if (use_mask) {
+        seq_q.alloc((size_t)N);
+        seq_kv.alloc((size_t)N);
+        const int bs = 256;
+        fill_seq_len_kernel<<<(int)((N + bs - 1) / bs), bs, 0, stream>>>(seq_q.get(), (int)N, (int)Lq);
+        fill_seq_len_kernel<<<(int)((N + bs - 1) / bs), bs, 0, stream>>>(seq_kv.get(), (int)N, (int)Lkv);
+        vpack[SEQ_LEN_Q_UID]  = seq_q.get();
+        vpack[SEQ_LEN_KV_UID] = seq_kv.get();
+    }
 
     const uint64_t op_id = next_cudnn_sdpa_op_id();
     char op_label[224];
     snprintf(op_label, sizeof(op_label),
-             "cudnn-op id=%llu kind=sdpa B=%lld H=%lld Lq=%lld Lkv=%lld D=%lld io=%s ws=%lldMB",
-             (unsigned long long)op_id, (long long)N, (long long)H, (long long)Lq, (long long)Lkv,
-             (long long)D, io_half ? "f16" : "bf16", (long long)(plan.workspace >> 20));
+             "cudnn-op id=%llu kind=sdpa B=%lld H=%lld Lq=%lld/%lld Lkv=%lld/%lld D=%lld io=%s bucket=%d ws=%lldMB",
+             (unsigned long long)op_id, (long long)N, (long long)H, (long long)Lq, (long long)Lq_plan,
+             (long long)Lkv, (long long)Lkv_plan, (long long)D, io_half ? "f16" : "bf16",
+             (int)use_mask, (long long)(plan.workspace >> 20));
     nvtx_range op_range(op_label);
     if (cudnn_op_trace()) {
         fprintf(stderr,
-                "[cudnn-op-begin] id=%llu kind=sdpa B=%lld H=%lld Lq=%lld Lkv=%lld D=%lld io=%s ws=%lldMB t_us=%lld\n",
-                (unsigned long long)op_id, (long long)N, (long long)H, (long long)Lq, (long long)Lkv,
-                (long long)D, io_half ? "f16" : "bf16", (long long)(plan.workspace >> 20),
+                "[cudnn-op-begin] id=%llu kind=sdpa B=%lld H=%lld Lq=%lld planLq=%lld Lkv=%lld planLkv=%lld D=%lld io=%s bucket=%d ws=%lldMB t_us=%lld\n",
+                (unsigned long long)op_id, (long long)N, (long long)H, (long long)Lq, (long long)Lq_plan,
+                (long long)Lkv, (long long)Lkv_plan, (long long)D, io_half ? "f16" : "bf16",
+                (int)use_mask, (long long)(plan.workspace >> 20),
                 (long long)ggml_time_us());
     }
 
@@ -462,9 +611,10 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         cudaMemGetInfo(&free_after_exec, &total_after_exec);
         fprintf(stderr,
                 "[cudnn-sdpa-exec] B=%lld H=%lld Lq=%lld Lkv=%lld D=%lld io=%s ws=%lld MB "
-                "free %.1f -> %.1f MB (delta %+.1f MB, used %.1f MB)\n",
+                "planLq=%lld planLkv=%lld bucket=%d free %.1f -> %.1f MB (delta %+.1f MB, used %.1f MB)\n",
                 (long long)N, (long long)H, (long long)Lq, (long long)Lkv, (long long)D,
                 io_half ? "f16" : "bf16", (long long)(plan.workspace >> 20),
+                (long long)Lq_plan, (long long)Lkv_plan, (int)use_mask,
                 free_before_exec / 1048576.0, free_after_exec / 1048576.0,
                 ((double)free_after_exec - (double)free_before_exec) / 1048576.0,
                 (total_after_exec - free_after_exec) / 1048576.0);
@@ -478,18 +628,18 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
     if (io_half) {
         if (dst->type == GGML_TYPE_F16) {
             cudnn_o_bhsd_half_to_bshd_f16<<<gs, bs, 0, stream>>>(
-                o_bhsd_h.get(), (half *) dst->data, (int)N, (int)H, (int)Lq, (int)D);
+                o_bhsd_h.get(), (half *) dst->data, (int)N, (int)H, (int)Lq, (int)Lq_plan, (int)D);
         } else {
             cudnn_o_bhsd_half_to_bshd_f32<<<gs, bs, 0, stream>>>(
-                o_bhsd_h.get(), (float *) dst->data, (int)N, (int)H, (int)Lq, (int)D);
+                o_bhsd_h.get(), (float *) dst->data, (int)N, (int)H, (int)Lq, (int)Lq_plan, (int)D);
         }
     } else {
         if (dst->type == GGML_TYPE_F16) {
             cudnn_o_bhsd_bf16_to_bshd_f16<<<gs, bs, 0, stream>>>(
-                o_bhsd_b.get(), (half *) dst->data, (int)N, (int)H, (int)Lq, (int)D);
+                o_bhsd_b.get(), (half *) dst->data, (int)N, (int)H, (int)Lq, (int)Lq_plan, (int)D);
         } else {
             cudnn_o_bhsd_bf16_to_bshd_f32<<<gs, bs, 0, stream>>>(
-                o_bhsd_b.get(), (float *) dst->data, (int)N, (int)H, (int)Lq, (int)D);
+                o_bhsd_b.get(), (float *) dst->data, (int)N, (int)H, (int)Lq, (int)Lq_plan, (int)D);
         }
     }
 }
