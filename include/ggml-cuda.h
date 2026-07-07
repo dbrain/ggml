@@ -87,12 +87,12 @@ GGML_BACKEND_API void ggml_backend_cuda_get_graph_cache_stats(
 // next segment's first large alloc; never touches params/weights buffers.
 GGML_BACKEND_API void ggml_backend_cuda_trim_pools(ggml_backend_t backend);
 
-// Destroy cached cuDNN execution plans (fused SDPA + 3D conv) and the current
-// thread's cuDNN handles. Current cuDNN can keep large internal device
-// reservations attached to cudnnHandle_t even after cudnn-frontend graphs are
-// destroyed; ggml_backend_cuda_trim_pools cannot reach this memory because it
-// lives outside the ggml VMM pool. Call only from the CUDA worker thread, at a
-// boundary with nothing in flight; handles/plans rebuild lazily on next use.
+// Destroy cached cuDNN execution plans (fused SDPA + 3D conv), the current
+// thread's cuDNN handles, and trim CUDA async mempools. Current cuDNN can return
+// freed internal allocations to CUDA's default/current mempool instead of the
+// driver; ggml_backend_cuda_trim_pools cannot reach that memory because it lives
+// outside the ggml VMM pool. Call only from the CUDA worker thread, at a boundary
+// with nothing in flight; handles/plans/pool pages rebuild lazily on next use.
 // No-op on non-CUDA / non-cuDNN builds.
 GGML_BACKEND_API void ggml_backend_cuda_release_cudnn_plans(void);
 

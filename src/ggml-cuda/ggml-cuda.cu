@@ -5857,14 +5857,40 @@ void ggml_backend_cuda_trim_pools(ggml_backend_t backend) {
     }
 }
 
+static void ggml_cuda_trim_async_mempools() {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11020
+    int saved_device = 0;
+    CUDA_CHECK(cudaGetDevice(&saved_device));
+
+    int device_count = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&device_count));
+    for (int dev = 0; dev < device_count; ++dev) {
+        CUDA_CHECK(cudaSetDevice(dev));
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        cudaMemPool_t default_pool = nullptr;
+        CUDA_CHECK(cudaDeviceGetDefaultMemPool(&default_pool, dev));
+        CUDA_CHECK(cudaMemPoolTrimTo(default_pool, 0));
+
+        cudaMemPool_t current_pool = nullptr;
+        CUDA_CHECK(cudaDeviceGetMemPool(&current_pool, dev));
+        if (current_pool && current_pool != default_pool) {
+            CUDA_CHECK(cudaMemPoolTrimTo(current_pool, 0));
+        }
+    }
+
+    CUDA_CHECK(cudaSetDevice(saved_device));
+#endif
+}
+
 void ggml_backend_cuda_release_cudnn_plans(void) {
     // The cuDNN SDPA + conv3d plan caches are file-scope statics keyed by shape,
-    // guarded by their own mutexes, and hold cuDNN-backend state that
-    // ggml_backend_cuda_trim_pools cannot reach (outside the ggml VMM pool). In
-    // practice, clearing cudnn-frontend Graph objects is not enough on current
-    // cuDNN: the large device reservation appears to stay attached to the
-    // thread-local cudnnHandle_t. Destroy this thread's handles as well; the next
-    // SDPA/conv3d op recreates them lazily and rebuilds only the needed plans.
+    // guarded by their own mutexes, and use cuDNN/CUDA allocator state that
+    // ggml_backend_cuda_trim_pools cannot reach (outside the ggml VMM pool).
+    // Clearing cudnn-frontend Graph objects and destroying cudnnHandle_t can still
+    // return device allocations only to CUDA's async mempool, not to the driver.
+    // Trim those mempools too; the next SDPA/conv3d op recreates handles/plans
+    // lazily and the CUDA pool recommits pages on demand.
     //
     // This must run on the same CUDA worker thread that created the thread_local
     // handles, at a phase/segment boundary. Synchronize before teardown so no
@@ -5877,14 +5903,24 @@ void ggml_backend_cuda_release_cudnn_plans(void) {
     CUDA_CHECK(cudaDeviceSynchronize());
     ggml_cuda_cudnn_sdpa_release_handle();
     ggml_cuda_cudnn_conv3d_release_handle();
+    size_t free_after_handles = 0, total_after_handles = 0;
     if (trace) {
         CUDA_CHECK(cudaDeviceSynchronize());
-        size_t free_after = 0, total_after = 0;
-        CUDA_CHECK(cudaMemGetInfo(&free_after, &total_after));
-        fprintf(stderr, "[cudnn-reset] handle reset free %.1f -> %.1f MB (delta %+.1f MB, total %.1f MB)\n",
-                free_before / 1048576.0, free_after / 1048576.0,
-                ((double) free_after - (double) free_before) / 1048576.0,
-                total_after / 1048576.0);
+        CUDA_CHECK(cudaMemGetInfo(&free_after_handles, &total_after_handles));
+    }
+    ggml_cuda_trim_async_mempools();
+    if (trace) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        size_t free_after_trim = 0, total_after_trim = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_after_trim, &total_after_trim));
+        fprintf(stderr,
+                "[cudnn-reset] free start %.1f MB -> handles %.1f MB (%+.1f) -> mempool %.1f MB (%+.1f, total %.1f MB)\n",
+                free_before / 1048576.0,
+                free_after_handles / 1048576.0,
+                ((double) free_after_handles - (double) free_before) / 1048576.0,
+                free_after_trim / 1048576.0,
+                ((double) free_after_trim - (double) free_after_handles) / 1048576.0,
+                total_after_trim / 1048576.0);
     }
 }
 
