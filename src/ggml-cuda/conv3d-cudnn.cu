@@ -18,7 +18,9 @@
 #include <cuda_fp16.h>
 #include <cudnn.h>
 #include <cudnn_frontend.h>
+#include <nvtx3/nvToolsExt.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -352,6 +354,24 @@ static std::unordered_map<conv3d_key, conv3d_plan, conv3d_key_hash> g_conv3d_cac
 static bool cudnn_conv3d_vram_trace() {
     return getenv("LONGCAT_VRAM_BREAKDOWN") || getenv("GGML_CUDNN_TRACE") || getenv("GGML_CONV3D_DBG");
 }
+
+static bool cudnn_conv3d_exec_trace() {
+    return getenv("GGML_CUDNN_EXEC_TRACE") || getenv("GGML_CONV3D_EXEC_TRACE");
+}
+
+static bool cudnn_op_trace() {
+    return getenv("GGML_CUDNN_OP_TRACE") || getenv("GGML_CUDNN_TRACE");
+}
+
+static uint64_t next_cudnn_conv3d_op_id() {
+    static std::atomic<uint64_t> id{1};
+    return id.fetch_add(1, std::memory_order_relaxed);
+}
+
+struct nvtx_range {
+    explicit nvtx_range(const std::string & label) { nvtxRangePushA(label.c_str()); }
+    ~nvtx_range() { nvtxRangePop(); }
+};
 
 // Drop every cached 3D-conv plan. Only the plan cache is cleared here; the
 // g_weight3d_cache / g_weight3d_f32_cache raw-cudaMalloc reorder buffers (keyed
@@ -706,14 +726,31 @@ bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         {W_UID, w_ptr},
         {Y_UID, y_ptr},
     };
+    const uint64_t op_id = next_cudnn_conv3d_op_id();
+    char op_label[256];
+    snprintf(op_label, sizeof(op_label),
+             "cudnn-op id=%llu kind=conv3d N=%d C=%d D=%d H=%d W=%d planD=%d OC=%d K=%dx%dx%d S=%d,%d,%d P=%d,%d,%d HP=%d ws=%lldMB",
+             (unsigned long long)op_id, n, c, D, H, W, D_plan, oc, KD, KH, KW, SD, SH, SW, PD, PH, PW,
+             (int)hi_prec, (long long)(plan->workspace >> 20));
+    nvtx_range op_range(op_label);
+    if (cudnn_op_trace()) {
+        fprintf(stderr,
+                "[cudnn-op-begin] id=%llu kind=conv3d N=%d C=%d D=%d H=%d W=%d planD=%d OC=%d K=%dx%dx%d S=%d,%d,%d P=%d,%d,%d HP=%d ws=%lldMB t_us=%lld\n",
+                (unsigned long long)op_id, n, c, D, H, W, D_plan, oc, KD, KH, KW, SD, SH, SW, PD, PH, PW,
+                (int)hi_prec, (long long)(plan->workspace >> 20), (long long)ggml_time_us());
+    }
     size_t free_before_exec = 0;
-    const bool trace_exec = cudnn_conv3d_vram_trace();
+    const bool trace_exec = cudnn_conv3d_exec_trace();
     if (trace_exec) {
         size_t total_before_exec = 0;
         cudaStreamSynchronize(stream);
         cudaMemGetInfo(&free_before_exec, &total_before_exec);
     }
     if (!plan->graph->execute(handle, vpack, ws_ptr).is_good()) GGML_ABORT("cudnn conv3d execute failed");
+    if (cudnn_op_trace()) {
+        fprintf(stderr, "[cudnn-op-end] id=%llu kind=conv3d t_us=%lld\n",
+                (unsigned long long)op_id, (long long)ggml_time_us());
+    }
     if (trace_exec) {
         cudaStreamSynchronize(stream);
         size_t free_after_exec = 0, total_after_exec = 0;

@@ -16,11 +16,14 @@
 
 #include <cudnn.h>
 #include <cudnn_frontend.h>
+#include <nvtx3/nvToolsExt.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 
 namespace fe = cudnn_frontend;
@@ -153,6 +156,24 @@ static std::unordered_map<sdpa_key, cudnn_sdpa_plan, sdpa_key_hash> g_plan_cache
 static bool cudnn_sdpa_vram_trace() {
     return getenv("LONGCAT_VRAM_BREAKDOWN") || getenv("GGML_CUDNN_TRACE");
 }
+
+static bool cudnn_sdpa_exec_trace() {
+    return getenv("GGML_CUDNN_EXEC_TRACE") || getenv("GGML_CUDNN_ATTN_EXEC_TRACE");
+}
+
+static bool cudnn_op_trace() {
+    return getenv("GGML_CUDNN_OP_TRACE") || getenv("GGML_CUDNN_TRACE");
+}
+
+static uint64_t next_cudnn_sdpa_op_id() {
+    static std::atomic<uint64_t> id{1};
+    return id.fetch_add(1, std::memory_order_relaxed);
+}
+
+struct nvtx_range {
+    explicit nvtx_range(const std::string & label) { nvtxRangePushA(label.c_str()); }
+    ~nvtx_range() { nvtxRangePop(); }
+};
 
 // Drop every cached SDPA plan. Some cuDNN-internal device reservations appear to
 // be handle-owned rather than graph-owned, so ggml_cuda_cudnn_sdpa_release_handle
@@ -406,8 +427,23 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         {O_UID, o_ptr},
     };
 
+    const uint64_t op_id = next_cudnn_sdpa_op_id();
+    char op_label[224];
+    snprintf(op_label, sizeof(op_label),
+             "cudnn-op id=%llu kind=sdpa B=%lld H=%lld Lq=%lld Lkv=%lld D=%lld io=%s ws=%lldMB",
+             (unsigned long long)op_id, (long long)N, (long long)H, (long long)Lq, (long long)Lkv,
+             (long long)D, io_half ? "f16" : "bf16", (long long)(plan.workspace >> 20));
+    nvtx_range op_range(op_label);
+    if (cudnn_op_trace()) {
+        fprintf(stderr,
+                "[cudnn-op-begin] id=%llu kind=sdpa B=%lld H=%lld Lq=%lld Lkv=%lld D=%lld io=%s ws=%lldMB t_us=%lld\n",
+                (unsigned long long)op_id, (long long)N, (long long)H, (long long)Lq, (long long)Lkv,
+                (long long)D, io_half ? "f16" : "bf16", (long long)(plan.workspace >> 20),
+                (long long)ggml_time_us());
+    }
+
     size_t free_before_exec = 0;
-    const bool trace_exec = cudnn_sdpa_vram_trace();
+    const bool trace_exec = cudnn_sdpa_exec_trace();
     if (trace_exec) {
         size_t total_before_exec = 0;
         cudaStreamSynchronize(stream);
@@ -415,6 +451,10 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
     }
     if (!plan.graph->execute(handle, vpack, ws_ptr).is_good()) {
         GGML_ABORT("cudnn sdpa execute failed");
+    }
+    if (cudnn_op_trace()) {
+        fprintf(stderr, "[cudnn-op-end] id=%llu kind=sdpa t_us=%lld\n",
+                (unsigned long long)op_id, (long long)ggml_time_us());
     }
     if (trace_exec) {
         cudaStreamSynchronize(stream);
