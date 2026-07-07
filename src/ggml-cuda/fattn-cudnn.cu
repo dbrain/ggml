@@ -32,6 +32,19 @@ namespace fe = cudnn_frontend;
 
 bool ggml_cuda_cudnn_available() { return true; }
 
+// Optional pre-build workspace cap for cuDNN SDPA engine selection. This filters
+// candidate engine configs before build_plans(), unlike checking get_workspace_size
+// afterward, so it can prevent cuDNN from selecting/building a plan that triggers
+// large context-level reservations.
+static int64_t sdpa_ws_cap() {
+    static int64_t c = -1;
+    if (c < 0) {
+        const char * e = getenv("GGML_CUDNN_ATTN_WS_MB");
+        c = (e && atoll(e) > 0) ? ((int64_t) atoll(e) << 20) : 0;
+    }
+    return c;
+}
+
 // Permute+convert cuDNN's BHSD F16 output -> ggml's BSHD F32 dst.
 // in : [N,H,L,D] contiguous (BHSD), half. out: ggml dst ne=[D,H,L,N], i.e. memory
 // D inner, H next, L next, N outer (BSHD). out[n,l,h,d] = in[n,h,l,d].
@@ -208,6 +221,9 @@ static cudnn_sdpa_plan & get_or_build_plan(cudnnHandle_t handle, const sdpa_key 
     if (!graph->validate().is_good())                                 { GGML_ABORT("cudnn sdpa validate failed"); }
     if (!graph->build_operation_graph(handle).is_good())              { GGML_ABORT("cudnn sdpa build_operation_graph failed"); }
     if (!graph->create_execution_plans({fe::HeurMode_t::A}).is_good()){ GGML_ABORT("cudnn sdpa create_execution_plans failed"); }
+    if (sdpa_ws_cap() > 0) {
+        graph->deselect_workspace_greater_than(sdpa_ws_cap());
+    }
     if (!graph->check_support(handle).is_good())                      { GGML_ABORT("cudnn sdpa check_support failed (no SDPA engine for this arch?)"); }
     if (!graph->build_plans(handle).is_good())                        { GGML_ABORT("cudnn sdpa build_plans failed"); }
 

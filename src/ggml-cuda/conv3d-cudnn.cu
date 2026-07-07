@@ -363,6 +363,9 @@ static conv3d_plan build_conv3d_plan_once(cudnnHandle_t handle, const conv3d_key
     const bool v_ok  = graph->validate().is_good();
     const bool b_ok  = v_ok && graph->build_operation_graph(handle).is_good();
     const bool p_ok  = b_ok && graph->create_execution_plans(heur).is_good();
+    if (p_ok) {
+        graph->deselect_workspace_greater_than(conv3d_ws_cap());
+    }
     // Filter the candidate engine configs before check_support selects one: drop Winograd (and its
     // tile variants) + reduced-precision reduction. deselect_numeric_notes filters graph.plans in
     // place; if it empties the list, check_support fails -> the wrapper retries without deselect.
