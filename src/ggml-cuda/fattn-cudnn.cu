@@ -27,6 +27,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace fe = cudnn_frontend;
@@ -227,10 +228,33 @@ static const std::vector<int64_t> & sdpa_buckets() {
     return buckets;
 }
 
+// Round a real seq len UP to the smallest bucket B >= len. buckets is sorted
+// ascending, so the first B with len <= B is the tightest cover: this catches BOTH
+// sub-min lengths (127/152 -> 160) AND in-between lengths (9690/32640 -> 38760), not
+// just exact-bucket hits. Applied independently to Lq and Lkv (cross-attn has Lq!=Lkv;
+// both dims fork cuDNN kernel variants, so both must land on a bucket). When bucketing
+// is OFF (empty list) the loop is a no-op and len passes through unchanged (byte-identical).
 static int64_t sdpa_bucket_len(int64_t len) {
-    for (int64_t b : sdpa_buckets()) {
+    const std::vector<int64_t> & bk = sdpa_buckets();
+    for (int64_t b : bk) {
         if (len <= b) {
             return b;
+        }
+    }
+    // len exceeds the largest bucket: there is no bucket to pad UP to (padding DOWN would
+    // drop real tokens), so this shape runs un-bucketed with its own kernel set. Warn once
+    // per distinct uncovered length so a still-fanned-out shape is visible in the trace ->
+    // add a covering value via GGML_CUDNN_ATTN_BUCKETS to collapse it. (Silent when bucketing
+    // is OFF: bk is empty, so we never reach here for the default byte-identical path.)
+    if (!bk.empty()) {
+        static std::mutex warn_mtx;
+        static std::unordered_set<int64_t> warned;
+        std::lock_guard<std::mutex> lk(warn_mtx);
+        if (warned.insert(len).second) {
+            fprintf(stderr,
+                    "[cudnn-sdpa-bucket] seq len %lld exceeds largest bucket %lld -- running "
+                    "un-bucketed (own kernel set); add a covering value to GGML_CUDNN_ATTN_BUCKETS.\n",
+                    (long long) len, (long long) bk.back());
         }
     }
     return len;
