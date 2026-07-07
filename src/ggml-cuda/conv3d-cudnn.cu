@@ -260,6 +260,10 @@ struct conv3d_key_hash {
 static std::mutex g_conv3d_mtx;
 static std::unordered_map<conv3d_key, conv3d_plan, conv3d_key_hash> g_conv3d_cache;
 
+static bool cudnn_conv3d_vram_trace() {
+    return getenv("LONGCAT_VRAM_BREAKDOWN") || getenv("GGML_CUDNN_TRACE") || getenv("GGML_CONV3D_DBG");
+}
+
 // Drop every cached 3D-conv plan. Only the plan cache is cleared here; the
 // g_weight3d_cache / g_weight3d_f32_cache raw-cudaMalloc reorder buffers (keyed
 // by the persistent weight ptr) are deliberately kept. Some cuDNN-internal
@@ -313,6 +317,12 @@ static conv3d_plan build_conv3d_plan_once(cudnnHandle_t handle, const conv3d_key
     const int64_t OW = (W + 2*k.PW - k.DW*(KW-1) - 1)/k.SW + 1;
 
     conv3d_plan plan;
+    size_t free_before = 0;
+    const bool trace_vram = cudnn_conv3d_vram_trace();
+    if (trace_vram) {
+        size_t total_before = 0;
+        cudaMemGetInfo(&free_before, &total_before);
+    }
 
     auto graph = std::make_shared<fe::graph::Graph>();
     // hi-precision (k.HP, WAN_VAE_HEAD_F32 head.2): full F32 IO (X/W/Y all fp32) so cuDNN never
@@ -384,6 +394,19 @@ static conv3d_plan build_conv3d_plan_once(cudnnHandle_t handle, const conv3d_key
                 (long long)k.KD,(long long)k.KH,(long long)k.KW,(long long)k.SD,(long long)k.SH,(long long)k.SW,(int)k.HP,(int)apply_deselect,
                 v_ok,b_ok,p_ok,s_ok,bp_ok,(long long)(ws>>20),(long long)(conv3d_ws_cap()>>20),
                 plan.supported ? "CUDNN" : "FALLBACK(im2col)");
+    }
+    if (trace_vram) {
+        size_t free_after = 0, total_after = 0;
+        cudaMemGetInfo(&free_after, &total_after);
+        fprintf(stderr,
+                "[cudnn-conv3d-plan] build N=%lld C=%lld %lldx%lldx%lld->OC=%lld k=%lldx%lldx%lld "
+                "hp=%d nowino=%d supported=%d ws=%lld MB free %.1f -> %.1f MB (delta %+.1f MB, used %.1f MB)\n",
+                (long long) k.N, (long long) k.C, (long long) k.D, (long long) k.H, (long long) k.W,
+                (long long) k.Cout, (long long) k.KD, (long long) k.KH, (long long) k.KW,
+                (int) k.HP, (int) apply_deselect, (int) plan.supported, (long long) (ws >> 20),
+                free_before / 1048576.0, free_after / 1048576.0,
+                ((double) free_after - (double) free_before) / 1048576.0,
+                (total_after - free_after) / 1048576.0);
     }
     return plan;
 }

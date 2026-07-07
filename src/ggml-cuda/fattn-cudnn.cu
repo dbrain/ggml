@@ -17,6 +17,7 @@
 #include <cudnn.h>
 #include <cudnn_frontend.h>
 
+#include <cstdio>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -136,6 +137,10 @@ struct sdpa_key_hash {
 static std::mutex g_plan_mtx;
 static std::unordered_map<sdpa_key, cudnn_sdpa_plan, sdpa_key_hash> g_plan_cache;
 
+static bool cudnn_sdpa_vram_trace() {
+    return getenv("LONGCAT_VRAM_BREAKDOWN") || getenv("GGML_CUDNN_TRACE");
+}
+
 // Drop every cached SDPA plan. Some cuDNN-internal device reservations appear to
 // be handle-owned rather than graph-owned, so ggml_cuda_cudnn_sdpa_release_handle
 // is the stronger boundary reset used by the public API.
@@ -162,6 +167,12 @@ static cudnn_sdpa_plan & get_or_build_plan(cudnnHandle_t handle, const sdpa_key 
     }
 
     const int64_t B = key.B, H = key.H, Lq = key.Lq, Lkv = key.Lkv, D = key.D;
+    size_t free_before = 0;
+    const bool trace_vram = cudnn_sdpa_vram_trace();
+    if (trace_vram) {
+        size_t total_before = 0;
+        cudaMemGetInfo(&free_before, &total_before);
+    }
 
     // io_half==1 => fp16 IO (prod). io_half==0 => bf16 IO (WAN_ATTN_BF16): run the SDPA in
     // bf16 to avoid the documented FP16 repeated-key attention divergence (the reference's
@@ -208,6 +219,19 @@ static cudnn_sdpa_plan & get_or_build_plan(cudnnHandle_t handle, const sdpa_key 
     plan.workspace = ws;
     auto [ins, ok] = g_plan_cache.emplace(key, std::move(plan));
     GGML_UNUSED(ok);
+    if (trace_vram) {
+        size_t free_after = 0, total_after = 0;
+        cudaMemGetInfo(&free_after, &total_after);
+        fprintf(stderr,
+                "[cudnn-sdpa-plan] build #%zu B=%lld H=%lld Lq=%lld Lkv=%lld D=%lld io=%s ws=%lld MB "
+                "free %.1f -> %.1f MB (delta %+.1f MB, used %.1f MB)\n",
+                g_plan_cache.size(),
+                (long long) B, (long long) H, (long long) Lq, (long long) Lkv, (long long) D,
+                key.io_half ? "f16" : "bf16", (long long) (ws >> 20),
+                free_before / 1048576.0, free_after / 1048576.0,
+                ((double) free_after - (double) free_before) / 1048576.0,
+                (total_after - free_after) / 1048576.0);
+    }
     return ins->second;
 }
 
