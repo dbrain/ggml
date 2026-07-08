@@ -6021,6 +6021,14 @@ void ggml_backend_cuda_release_cudnn_plans(void) {
     }
 }
 
+void ggml_backend_cuda_release_cudnn_conv3d_weights(void) {
+    // Free the raw-cudaMalloc'd conv3d reorder-weight buffers that leak per segment when
+    // LTXAV_VAE_LAZY re-offloads the VAE params (new device address -> orphaned buffers).
+    // Sync so no queued conv3d op still references them, then free + clear the caches.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    ggml_cuda_cudnn_conv3d_release_weights();
+}
+
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
     if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
         return false;

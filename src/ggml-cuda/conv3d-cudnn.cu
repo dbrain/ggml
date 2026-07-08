@@ -401,6 +401,21 @@ static std::unordered_map<const void *, weight3d_buf> g_weight3d_cache;
 struct weight3d_buf_f32 { float * d = nullptr; size_t n = 0; };
 static std::unordered_map<const void *, weight3d_buf_f32> g_weight3d_f32_cache;
 
+// Free the raw-cudaMalloc'd reordered conv-weight buffers and drop the caches. These are
+// keyed by the weight DEVICE pointer; LTXAV_VAE_LAZY re-offloads the VAE params every
+// segment, so on a continuation the weights land at a fresh device address each segment
+// (100% cache miss across segments) and the prior buffers are orphaned -> ~1.4 GB leaked
+// per segment. Call at a segment boundary right after the VAE params are released (their
+// pointers are now stale). Zero perf cost: the reorder is already recomputed every
+// segment. Caller must ensure no conv3d op is in flight (the public wrapper syncs first).
+void ggml_cuda_cudnn_conv3d_release_weights() {
+    std::lock_guard<std::mutex> lk(g_conv3d_mtx);
+    for (auto & kv : g_weight3d_cache)     cudaFree(kv.second.d);
+    for (auto & kv : g_weight3d_f32_cache) cudaFree(kv.second.d);
+    g_weight3d_cache.clear();
+    g_weight3d_f32_cache.clear();
+}
+
 // WAN_VAE_CONV3D_NO_WINOGRAD (default ON; =0 restores Winograd): exclude Winograd and
 // reduced-precision-reduction engine configs from EVERY cuDNN conv3d plan (encode + decode),
 // forcing implicit-GEMM with an fp32 reduction. Winograd's input/output transforms + fp16 tiling
@@ -789,6 +804,7 @@ bool ggml_cuda_conv3d_cudnn_available() { return false; }
 
 void ggml_cuda_cudnn_conv3d_release_plans() {}
 void ggml_cuda_cudnn_conv3d_release_handle() {}
+void ggml_cuda_cudnn_conv3d_release_weights() {}
 
 bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED(ctx);

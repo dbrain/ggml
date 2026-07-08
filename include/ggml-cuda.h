@@ -96,6 +96,12 @@ GGML_BACKEND_API void ggml_backend_cuda_trim_pools(ggml_backend_t backend);
 // No-op on non-CUDA / non-cuDNN builds.
 GGML_BACKEND_API void ggml_backend_cuda_release_cudnn_plans(void);
 
+// Free the cuDNN conv3d reordered-weight buffers (raw cudaMalloc, keyed by weight ptr).
+// Call at a segment boundary after VAE params are re-offloaded (their pointers are
+// invalidated) to reclaim the ~1.4 GB/segment continuation leak. Synchronizes first.
+// No-op on non-CUDA / non-cuDNN builds.
+GGML_BACKEND_API void ggml_backend_cuda_release_cudnn_conv3d_weights(void);
+
 // Register a per-tensor NVFP4 weight global scale (ModelOpt weight_scale_2), keyed by
 // tensor name. The FP4 cuBLASLt GEMM folds it into the matmul alpha so the stored
 // per-block ue4m3 scales can keep their well-conditioned range (UNFOLDED import)

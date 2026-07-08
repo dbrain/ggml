@@ -50,3 +50,11 @@ void ggml_cuda_cudnn_conv3d_release_plans();
 // reservations to the driver. Must be called from the CUDA worker thread that
 // created the handle, at a boundary with no in-flight cuDNN op.
 void ggml_cuda_cudnn_conv3d_release_handle();
+
+// Free the raw-cudaMalloc'd reordered conv-weight buffers (g_weight3d_cache /
+// g_weight3d_f32_cache) and clear the caches. Required on a continuation because
+// LTXAV_VAE_LAZY re-offloads the VAE params each segment -> weights get a fresh device
+// address -> old reorder buffers orphaned (~1.4 GB/segment leak). Call at a segment
+// boundary after the VAE params are released, with no conv3d op in flight. No-op stub
+// when built without GGML_CUDNN.
+void ggml_cuda_cudnn_conv3d_release_weights();
