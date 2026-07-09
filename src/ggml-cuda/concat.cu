@@ -1,5 +1,13 @@
 #include "concat.cuh"
 
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
 // contiguous kernels — value-copy only, dtype is just a width.
 template <typename T, int dim>
 static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_T_cont(const T * x,
@@ -94,6 +102,161 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_T_cont_4
             dst[i] = (j < src0_slice) ? xb[j] : yb[j - src0_slice];
         }
     }
+}
+
+struct concat_profile_key {
+    int     type;
+    int32_t dim;
+    bool    contiguous;
+    int64_t src0_ne[4];
+    int64_t src1_ne[4];
+    int64_t dst_ne[4];
+
+    bool operator==(const concat_profile_key & other) const {
+        if (type != other.type || dim != other.dim || contiguous != other.contiguous) {
+            return false;
+        }
+        for (int i = 0; i < 4; ++i) {
+            if (src0_ne[i] != other.src0_ne[i] || src1_ne[i] != other.src1_ne[i] || dst_ne[i] != other.dst_ne[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+struct concat_profile_key_hash {
+    size_t operator()(const concat_profile_key & k) const {
+        size_t h = 1469598103934665603ull;
+        auto mix = [&](int64_t v) {
+            h ^= (uint64_t) v;
+            h *= 1099511628211ull;
+        };
+        mix(k.type);
+        mix(k.dim);
+        mix(k.contiguous ? 1 : 0);
+        for (int i = 0; i < 4; ++i) {
+            mix(k.src0_ne[i]);
+            mix(k.src1_ne[i]);
+            mix(k.dst_ne[i]);
+        }
+        return h;
+    }
+};
+
+struct concat_profile_stats {
+    uint64_t calls     = 0;
+    uint64_t dst_bytes = 0;
+};
+
+static std::unordered_map<concat_profile_key, concat_profile_stats, concat_profile_key_hash> & concat_profile_map() {
+    static auto * map = new std::unordered_map<concat_profile_key, concat_profile_stats, concat_profile_key_hash>();
+    return *map;
+}
+
+static std::mutex & concat_profile_mutex() {
+    static auto * mutex = new std::mutex();
+    return *mutex;
+}
+
+static bool concat_env_enabled(const char * name) {
+    const char * value = getenv(name);
+    return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static void concat_profile_dump() {
+    std::vector<std::pair<concat_profile_key, concat_profile_stats>> rows;
+    uint64_t total_calls = 0;
+    uint64_t total_bytes = 0;
+    {
+        std::lock_guard<std::mutex> lock(concat_profile_mutex());
+        rows.reserve(concat_profile_map().size());
+        for (const auto & item : concat_profile_map()) {
+            rows.push_back(item);
+            total_calls += item.second.calls;
+            total_bytes += item.second.dst_bytes;
+        }
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) {
+        if (a.second.dst_bytes != b.second.dst_bytes) {
+            return a.second.dst_bytes > b.second.dst_bytes;
+        }
+        return a.second.calls > b.second.calls;
+    });
+
+    int top = 48;
+    if (const char * env = getenv("LONGCAT_CONCAT_PROFILE_TOP")) {
+        const int parsed = atoi(env);
+        if (parsed > 0) {
+            top = parsed;
+        }
+    }
+
+    fprintf(stderr,
+            "[concat-profile] keys=%zu calls=%llu dst_mb=%.2f\n",
+            rows.size(),
+            (unsigned long long) total_calls,
+            (double) total_bytes / (1024.0 * 1024.0));
+    for (int i = 0; i < (int) rows.size() && i < top; ++i) {
+        const auto & k = rows[i].first;
+        const auto & s = rows[i].second;
+        fprintf(stderr,
+                "[concat-profile] #%02d calls=%llu dst_mb=%.2f avg_kb=%.1f type=%s dim=%d contig=%d "
+                "src0=[%lld,%lld,%lld,%lld] src1=[%lld,%lld,%lld,%lld] dst=[%lld,%lld,%lld,%lld]\n",
+                i + 1,
+                (unsigned long long) s.calls,
+                (double) s.dst_bytes / (1024.0 * 1024.0),
+                s.calls == 0 ? 0.0 : (double) s.dst_bytes / (double) s.calls / 1024.0,
+                ggml_type_name((ggml_type) k.type),
+                k.dim,
+                k.contiguous ? 1 : 0,
+                (long long) k.src0_ne[0],
+                (long long) k.src0_ne[1],
+                (long long) k.src0_ne[2],
+                (long long) k.src0_ne[3],
+                (long long) k.src1_ne[0],
+                (long long) k.src1_ne[1],
+                (long long) k.src1_ne[2],
+                (long long) k.src1_ne[3],
+                (long long) k.dst_ne[0],
+                (long long) k.dst_ne[1],
+                (long long) k.dst_ne[2],
+                (long long) k.dst_ne[3]);
+    }
+}
+
+static bool concat_profile_enabled() {
+    static bool enabled = [] {
+        const bool on = concat_env_enabled("LONGCAT_CONCAT_PROFILE");
+        if (on) {
+            atexit(concat_profile_dump);
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+static void concat_profile_note(const ggml_tensor * dst, int32_t dim, bool contiguous) {
+    if (!concat_profile_enabled()) {
+        return;
+    }
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    concat_profile_key  key  = {};
+    key.type                 = src0->type;
+    key.dim                  = dim;
+    key.contiguous           = contiguous;
+    for (int i = 0; i < 4; ++i) {
+        key.src0_ne[i] = src0->ne[i];
+        key.src1_ne[i] = src1->ne[i];
+        key.dst_ne[i]  = dst->ne[i];
+    }
+
+    std::lock_guard<std::mutex> lock(concat_profile_mutex());
+    concat_profile_stats & stats = concat_profile_map()[key];
+    stats.calls += 1;
+    stats.dst_bytes += ggml_nbytes(dst);
 }
 
 template <typename T>
@@ -195,8 +358,11 @@ static void concat_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     cudaStream_t stream = ctx.stream();
     const int32_t dim = ((int32_t *) dst->op_params)[0];
+    const bool contiguous = ggml_is_contiguous(src0) && ggml_is_contiguous(src1);
 
-    if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+    concat_profile_note(dst, dim, contiguous);
+
+    if (contiguous) {
         const T * src0_d = (const T *)src0->data;
         const T * src1_d = (const T *)src1->data;
         T * dst_d = (T *)dst->data;

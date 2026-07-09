@@ -196,7 +196,11 @@ static bool cudnn_sdpa_exec_trace() {
 }
 
 static bool cudnn_op_trace() {
-    return getenv("GGML_CUDNN_OP_TRACE") || getenv("GGML_CUDNN_TRACE");
+    auto enabled = [](const char * name) {
+        const char * value = getenv(name);
+        return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+    };
+    return enabled("GGML_CUDNN_OP_TRACE") || enabled("GGML_CUDNN_TRACE");
 }
 
 static const std::vector<int64_t> & sdpa_buckets() {
