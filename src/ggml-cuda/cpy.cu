@@ -539,12 +539,15 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     bool perm_ok   = false;  // dim0 strided  ⇒ tiled transpose (cpy_perm_transpose)
     bool coal_ok   = false;  // dim0 contiguous ⇒ batched coalesced copy (cpy_perm_coalesced)
     static const bool lc_no_transp = getenv("LONGCAT_CONT_NOTRANSP") != nullptr;
-    if (!lc_no_transp && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+    const bool layout_copy_type =
+        (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) ||
+        (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16);
+    if (!lc_no_transp && layout_copy_type &&
         ggml_is_contiguous(src1) && !contiguous_srcs) {
         if (nb00 != elsz) {
             int n_unit = 0;
             for (int a = 1; a < 4; ++a) {
-                if (src0->nb[a] == elsz && src0->ne[a] > 1) { perm_f = a; n_unit++; }
+                if ((int64_t)src0->nb[a] == elsz && src0->ne[a] > 1) { perm_f = a; n_unit++; }
             }
             // exactly one genuine (ne>1) unit-stride axis off dim0 ⇒ a clean 2D transpose.
             // The two non-transpose axes map to grid.z (hard CUDA limit 65535) — guard it.
@@ -673,7 +676,31 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         ggml_cpy_q5_1_f32_cuda
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16) {
-        if (can_be_transposed) {
+        if (perm_ok) {
+            int ax_b[2], nb_i = 0;
+            for (int a = 1; a < 4; ++a) { if (a != perm_f) ax_b[nb_i++] = a; }
+            const int p = ax_b[0], q = ax_b[1];
+            const int64_t cs[4] = { 1,
+                                    (int64_t)src0->ne[0],
+                                    (int64_t)src0->ne[0]*src0->ne[1],
+                                    (int64_t)src0->ne[0]*src0->ne[1]*src0->ne[2] };
+            ggml_cpy_perm_transpose_cuda<half>(
+                src0_ddc, src1_ddc,
+                (int)src0->ne[0], (int)src0->ne[perm_f], (int)src0->ne[p], (int)src0->ne[q],
+                src0->nb[0]/elsz, src0->nb[perm_f]/elsz, src0->nb[p]/elsz, src0->nb[q]/elsz,
+                cs[0], cs[perm_f], cs[p], cs[q],
+                main_stream);
+        } else if (coal_ok) {
+            const int64_t dd1 = (int64_t)src0->ne[0];
+            const int64_t dd2 = dd1 * (int64_t)src0->ne[1];
+            const int64_t dd3 = dd2 * (int64_t)src0->ne[2];
+            ggml_cpy_perm_coalesced_cuda<half>(
+                src0_ddc, src1_ddc,
+                (int)src0->ne[0], (int)src0->ne[1], (int)src0->ne[2], (int)src0->ne[3],
+                src0->nb[1]/elsz, src0->nb[2]/elsz, src0->nb[3]/elsz,
+                dd1, dd2, dd3,
+                main_stream);
+        } else if (can_be_transposed) {
             ggml_cpy_scalar_cuda<half, half, true>
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
         } else {
@@ -752,7 +779,7 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     // [CONT_VERIFY] byte-compare the perm-transpose result against the reference
     // strided scalar path (run into a temp buffer). GPU-cheap, no render needed.
     static const bool lc_cont_verify = getenv("LONGCAT_CONT_VERIFY") != nullptr;
-    if (lc_cont_verify && (perm_ok || coal_ok)) {
+    if (lc_cont_verify && (perm_ok || coal_ok) && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         const size_t nb_dst = ggml_nbytes(src1);
         char * ref = nullptr;
         CUDA_CHECK(cudaMallocAsync(&ref, nb_dst, main_stream));
