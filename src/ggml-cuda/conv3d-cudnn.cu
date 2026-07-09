@@ -258,6 +258,47 @@ static __global__ void ncdhw_to_ndhwc_f32_tiled_pad_d(const Tin * __restrict__ i
     }
 }
 
+// NCDHW view (possibly sliced/non-contiguous on W/H/D) -> NDHWC. The ggml view's
+// data pointer already includes the slice offset; strides are in elements.
+template <typename Tin, typename Tout>
+static __global__ void ncdhw_to_ndhwc_tiled_strided(const Tin * __restrict__ in, Tout * __restrict__ out,
+                                                    int N, int C, int D, int H, int W, int D_plan,
+                                                    int64_t stride_n, int64_t stride_c,
+                                                    int64_t stride_d, int64_t stride_h, int64_t stride_w) {
+    __shared__ float tile[CV_TILE][CV_TILE + 1];
+    int n = blockIdx.z;
+    const int wh     = H * W;
+    const int S_plan = D_plan * wh;
+    Tout * outb = out + (long)n * S_plan * C;
+
+    int c0 = blockIdx.y * CV_TILE;
+    int s0 = blockIdx.x * CV_TILE;
+    for (int j = 0; j < CV_TILE; j += CV_BR) {
+        int c = c0 + threadIdx.y + j;
+        int s = s0 + threadIdx.x;
+        float v = 0.0f;
+        if (c < C && s < S_plan) {
+            const int d   = s / wh;
+            const int rem = s - d * wh;
+            const int h   = rem / W;
+            const int w   = rem - h * W;
+            if (d < D) {
+                const long off = (long)n * stride_n + (long)c * stride_c +
+                                 (long)d * stride_d + (long)h * stride_h + (long)w * stride_w;
+                v = cv3d_to_f32(in[off]);
+            }
+        }
+        tile[threadIdx.y + j][threadIdx.x] = v;
+    }
+    __syncthreads();
+    int sT = s0 + threadIdx.y;
+    int cT = c0 + threadIdx.x;
+    for (int j = 0; j < CV_TILE; j += CV_BR) {
+        int s = sT + j;
+        if (cT < C && s < S_plan) cv3d_store(&outb[(long)s * C + cT], tile[threadIdx.x][threadIdx.y + j]);
+    }
+}
+
 // hi-precision weight reorder: ggml KCRS-3d -> KRSC-3d f32 (no fp16 down-convert), for the
 // full-F32-IO head.2 plan. Source may be f16 or f32.
 template <typename T>
@@ -629,7 +670,7 @@ bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             input->type, dst->type, kernel->type, \
             ggml_is_contiguous(kernel), ggml_is_contiguous(input)); \
         return false; } while (0)
-    if (!ggml_is_contiguous(kernel) || !ggml_is_contiguous(input)) CONV3D_REJECT("noncontig");
+    if (!ggml_is_contiguous(kernel)) CONV3D_REJECT("noncontig-weight");
     if (kernel->type != GGML_TYPE_F16 && kernel->type != GGML_TYPE_F32) CONV3D_REJECT("wtype");
     // Activations may be F32 (legacy) or F16 (WAN_VAE_F16 F16-activation decode). cuDNN runs
     // HALF internally either way; the layout transposes below cast in/out per the ggml dtype.
@@ -695,6 +736,13 @@ bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     // X: NCDHW (ggml) -> NDHWC (cuDNN), tiled transpose with S = D*H*W. fp32 for hi_prec, else fp16.
     const int S_in = D * H * W;
     const int S_in_plan = D_plan * H * W;
+    const bool input_contig = ggml_is_contiguous(input);
+    const int64_t es = (int64_t)ggml_element_size(input);
+    const int64_t stride_w = (int64_t)input->nb[0] / es;
+    const int64_t stride_h = (int64_t)input->nb[1] / es;
+    const int64_t stride_d = (int64_t)input->nb[2] / es;
+    const int64_t stride_c = (int64_t)input->nb[3] / es;
+    const int64_t stride_n = (int64_t)c * stride_c;
     ggml_cuda_pool_alloc<half>  x_half(ctx.pool());
     ggml_cuda_pool_alloc<float> x_f32 (ctx.pool());
     void * x_ptr = nullptr;
@@ -704,20 +752,20 @@ bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         if (hi_prec) {
             x_f32.alloc((size_t)n * c * S_in_plan);  x_ptr = x_f32.get();
             if (input->type == GGML_TYPE_F16) {
-                if (bucket_d) ncdhw_to_ndhwc_f32_tiled_pad_d<half><<<grd, blk, 0, stream>>>((const half *)input->data, x_f32.get(), n, c, D, H, W, D_plan);
-                else          ncdhw_to_ndhwc_f32_tiled<half><<<grd, blk, 0, stream>>>((const half *)input->data, x_f32.get(), n, c, S_in);
+                if (!input_contig || bucket_d) ncdhw_to_ndhwc_tiled_strided<half, float><<<grd, blk, 0, stream>>>((const half *)input->data, x_f32.get(), n, c, D, H, W, D_plan, stride_n, stride_c, stride_d, stride_h, stride_w);
+                else                           ncdhw_to_ndhwc_f32_tiled<half><<<grd, blk, 0, stream>>>((const half *)input->data, x_f32.get(), n, c, S_in);
             } else {
-                if (bucket_d) ncdhw_to_ndhwc_f32_tiled_pad_d<float><<<grd, blk, 0, stream>>>((const float *)input->data, x_f32.get(), n, c, D, H, W, D_plan);
-                else          ncdhw_to_ndhwc_f32_tiled<float><<<grd, blk, 0, stream>>>((const float *)input->data, x_f32.get(), n, c, S_in);
+                if (!input_contig || bucket_d) ncdhw_to_ndhwc_tiled_strided<float, float><<<grd, blk, 0, stream>>>((const float *)input->data, x_f32.get(), n, c, D, H, W, D_plan, stride_n, stride_c, stride_d, stride_h, stride_w);
+                else                           ncdhw_to_ndhwc_f32_tiled<float><<<grd, blk, 0, stream>>>((const float *)input->data, x_f32.get(), n, c, S_in);
             }
         } else {
             x_half.alloc((size_t)n * c * S_in_plan); x_ptr = x_half.get();
             if (input->type == GGML_TYPE_F16) {
-                if (bucket_d) ncdhw_to_ndhwc_f16_tiled_pad_d<half><<<grd, blk, 0, stream>>>((const half *)input->data, x_half.get(), n, c, D, H, W, D_plan);
-                else          ncdhw_to_ndhwc_f16_tiled<half><<<grd, blk, 0, stream>>>((const half *)input->data, x_half.get(), n, c, S_in);
+                if (!input_contig || bucket_d) ncdhw_to_ndhwc_tiled_strided<half, half><<<grd, blk, 0, stream>>>((const half *)input->data, x_half.get(), n, c, D, H, W, D_plan, stride_n, stride_c, stride_d, stride_h, stride_w);
+                else                           ncdhw_to_ndhwc_f16_tiled<half><<<grd, blk, 0, stream>>>((const half *)input->data, x_half.get(), n, c, S_in);
             } else {
-                if (bucket_d) ncdhw_to_ndhwc_f16_tiled_pad_d<float><<<grd, blk, 0, stream>>>((const float *)input->data, x_half.get(), n, c, D, H, W, D_plan);
-                else          ncdhw_to_ndhwc_f16_tiled<float><<<grd, blk, 0, stream>>>((const float *)input->data, x_half.get(), n, c, S_in);
+                if (!input_contig || bucket_d) ncdhw_to_ndhwc_tiled_strided<float, half><<<grd, blk, 0, stream>>>((const float *)input->data, x_half.get(), n, c, D, H, W, D_plan, stride_n, stride_c, stride_d, stride_h, stride_w);
+                else                           ncdhw_to_ndhwc_f16_tiled<float><<<grd, blk, 0, stream>>>((const float *)input->data, x_half.get(), n, c, S_in);
             }
         }
     }
