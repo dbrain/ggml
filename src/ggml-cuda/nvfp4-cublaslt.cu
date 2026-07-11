@@ -1256,6 +1256,17 @@ static size_t ggml_cuda_fp8_weight_cache_budget_bytes() {
     return b;
 }
 
+// Profiling-only CUDA-event timing of the native FP8 GEMM. This deliberately
+// synchronizes each call; use it to attribute work, never for headline timings.
+static bool ggml_cuda_fp8_gemm_profile_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * e = getenv("GGML_FP8_GEMM_PROFILE");
+        enabled = e && atoi(e) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
 extern "C" void ggml_cuda_fp8_weight_cache_clear(void) {
     std::lock_guard<std::mutex> lk(g_fp8_wcache_mtx);
     for (auto & kv : g_fp8_wcache) {
@@ -1690,10 +1701,15 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
         cublasLtMatmulPreference_t pref=nullptr;
         cublasLtMatmulPreferenceCreate(&pref);
         cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsz, sizeof(wsz));
-        cublasLtMatmulHeuristicResult_t hr={}; int got=0;
-        cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(lt, op, Ad, Bd, Cd, Dd, pref, 1, &hr, &got);
+        cublasLtMatmulHeuristicResult_t hr[1] = {};
+        int got=0;
+        cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(lt, op, Ad, Bd, Cd, Dd, pref, 1, hr, &got);
         if (pref) cublasLtMatmulPreferenceDestroy(pref);
-        if (hs == CUBLAS_STATUS_SUCCESS && got > 0) { algo = hr.algo; have_algo = true; if (!s_nocache) g_fp8_algo_cache[key] = algo; }
+        if (hs == CUBLAS_STATUS_SUCCESS && got > 0) {
+            algo = hr[0].algo;
+            have_algo = true;
+            if (!s_nocache) g_fp8_algo_cache[key] = algo;
+        }
     }
 
     // fix #3: if the bias epilogue has no algo for this shape, record it (fail fast next
@@ -1717,11 +1733,29 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
         (void)cudaGetLastError();
     bool ok = have_algo;
     cublasStatus_t ms = CUBLAS_STATUS_SUCCESS;
+    cudaEvent_t profile_start = nullptr;
+    cudaEvent_t profile_end   = nullptr;
+    const bool profile_gemm = ok && ggml_cuda_fp8_gemm_profile_enabled();
+    if (profile_gemm) {
+        cudaEventCreateWithFlags(&profile_start, cudaEventDefault);
+        cudaEventCreateWithFlags(&profile_end, cudaEventDefault);
+        cudaEventRecord(profile_start, stream);
+    }
     if (ok) {
         ms = cublasLtMatmul(lt, op, &alpha_h, w_fp8_ptr, Ad, a_fp8_ptr, Bd,
                                            &beta_h, gemm_out, Cd, gemm_out, Dd,
                                            &algo, ws_ptr, wsz, stream);
         ok = (ms == CUBLAS_STATUS_SUCCESS);
+    }
+    if (profile_gemm) {
+        cudaEventRecord(profile_end, stream);
+        cudaEventSynchronize(profile_end);
+        float ms_elapsed = 0.0f;
+        cudaEventElapsedTime(&ms_elapsed, profile_start, profile_end);
+        fprintf(stderr, "[FP8_GEMM_PROFILE] ms=%.3f M=%d K=%d N=%d name=%s\n",
+                ms_elapsed, M, K, N, src0->name[0] ? src0->name : "?");
+        cudaEventDestroy(profile_start);
+        cudaEventDestroy(profile_end);
     }
     // GGML_F8_DBG: per-GEMM matmul outcome — pins whether a bailed GEMM lost the algo
     // (have_algo=0) or the matmul returned non-success (ms!=0). w_global==1.0 => wglobal miss.

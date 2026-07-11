@@ -54,6 +54,51 @@ static int64_t sdpa_ws_cap() {
     return c;
 }
 
+static int sdpa_timing_limit() {
+    static int limit = -1;
+    if (limit < 0) {
+        const char * e = getenv("GGML_CUDNN_ATTN_TIMING");
+        limit = e ? std::max(0, atoi(e)) : 0;
+    }
+    return limit;
+}
+
+static int sdpa_timing_skip() {
+    static int skip = -1;
+    if (skip < 0) {
+        const char * e = getenv("GGML_CUDNN_ATTN_TIMING_SKIP");
+        skip = e ? std::max(0, atoi(e)) : 0;
+    }
+    return skip;
+}
+
+static int64_t sdpa_timing_min_lq() {
+    static int64_t min_lq = -1;
+    if (min_lq < 0) {
+        const char * e = getenv("GGML_CUDNN_ATTN_TIMING_MIN_LQ");
+        min_lq = e ? std::max<int64_t>(0, atoll(e)) : 0;
+    }
+    return min_lq;
+}
+
+static int64_t sdpa_ncu_hot_min_lq() {
+    static int64_t min_lq = -1;
+    if (min_lq < 0) {
+        const char * e = getenv("GGML_CUDNN_NCU_HOT_MIN_LQ");
+        min_lq = e ? std::max<int64_t>(0, atoll(e)) : 0;
+    }
+    return min_lq;
+}
+
+static bool sdpa_build_all_plans() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * e = getenv("GGML_CUDNN_ATTN_BUILD_ALL_PLANS");
+        enabled = e && atoi(e) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
 // Permute+convert cuDNN's BHSD F16 output -> ggml's BSHD F32 dst.
 // in : [N,H,L,D] contiguous (BHSD), half. out: ggml dst ne=[D,H,L,N], i.e. memory
 // D inner, H next, L next, N outer (BSHD). out[n,l,h,d] = in[n,h,l,d].
@@ -163,6 +208,7 @@ static cudnnHandle_t get_cudnn_handle() {
 struct cudnn_sdpa_plan {
     std::shared_ptr<fe::graph::Graph> graph;
     int64_t workspace = 0;
+    int plan_index = -1;
 };
 
 struct sdpa_key {
@@ -183,6 +229,18 @@ struct sdpa_key_hash {
         return h;
     }
 };
+
+static int sdpa_plan_index_for(const sdpa_key & key) {
+    static int requested = -2;
+    static int64_t min_lq = -1;
+    if (requested == -2) {
+        const char * e = getenv("GGML_CUDNN_ATTN_PLAN_INDEX");
+        requested = e ? atoi(e) : -1;
+        const char * min_e = getenv("GGML_CUDNN_ATTN_PLAN_MIN_LQ");
+        min_lq = min_e ? std::max<int64_t>(0, atoll(min_e)) : 0;
+    }
+    return requested >= 0 && key.Lq >= min_lq ? requested : -1;
+}
 
 static std::mutex g_plan_mtx;
 static std::unordered_map<sdpa_key, cudnn_sdpa_plan, sdpa_key_hash> g_plan_cache;
@@ -355,7 +413,11 @@ static cudnn_sdpa_plan & get_or_build_plan(cudnnHandle_t handle, const sdpa_key 
         graph->deselect_workspace_greater_than(sdpa_ws_cap());
     }
     if (!graph->check_support(handle).is_good())                      { GGML_ABORT("cudnn sdpa check_support failed (no SDPA engine for this arch?)"); }
-    if (!graph->build_plans(handle).is_good())                        { GGML_ABORT("cudnn sdpa build_plans failed"); }
+    const int plan_index = sdpa_plan_index_for(key);
+    const auto build_policy = sdpa_build_all_plans() || plan_index >= 0
+        ? fe::BuildPlanPolicy_t::ALL
+        : fe::BuildPlanPolicy_t::HEURISTICS_CHOICE;
+    if (!graph->build_plans(handle, build_policy).is_good())          { GGML_ABORT("cudnn sdpa build_plans failed"); }
 
     int64_t ws = 0;
     if (!graph->get_workspace_size(ws).is_good()) { GGML_ABORT("cudnn sdpa get_workspace_size failed"); }
@@ -363,6 +425,7 @@ static cudnn_sdpa_plan & get_or_build_plan(cudnnHandle_t handle, const sdpa_key 
     cudnn_sdpa_plan plan;
     plan.graph     = graph;
     plan.workspace = ws;
+    plan.plan_index = plan_index;
     auto [ins, ok] = g_plan_cache.emplace(key, std::move(plan));
     GGML_UNUSED(ok);
     if (trace_vram) {
@@ -463,6 +526,24 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         GGML_ABORT("cudnnSetStream failed");
     }
 
+    static int sdpa_timing_count = 0;
+    static int sdpa_timing_recorded = 0;
+    const int sdpa_timing_id = sdpa_timing_count++;
+    const bool time_sdpa_window = sdpa_timing_id >= sdpa_timing_skip()
+        && sdpa_timing_id < sdpa_timing_skip() + sdpa_timing_limit();
+    const int64_t timing_min_lq = sdpa_timing_min_lq();
+    const bool time_sdpa_shape = (timing_min_lq > 0
+            ? sdpa_timing_recorded < sdpa_timing_limit()
+            : time_sdpa_window)
+        && Lq >= timing_min_lq;
+    cudaEvent_t timing_events[4] = {};
+    if (time_sdpa_shape) {
+        for (cudaEvent_t & event : timing_events) {
+            CUDA_CHECK(cudaEventCreate(&event));
+        }
+        CUDA_CHECK(cudaEventRecord(timing_events[0], stream));
+    }
+
     // GGML_F8_DBG: report max|Q|/|K|/|V| for the first few SDPA calls. Q>65504 confirms the
     // F16-cast overflow (Q is unprotected by kv_scale) -> the DiT-NaN root cause.
     {
@@ -511,6 +592,9 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         } else {
             GGML_ASSERT(Q->type == GGML_TYPE_BF16);
         }
+    }
+    if (time_sdpa_shape) {
+        CUDA_CHECK(cudaEventRecord(timing_events[1], stream));
     }
 
     const int64_t Lq_plan  = sdpa_bucket_len(Lq);
@@ -604,11 +688,16 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
 
     const uint64_t op_id = next_cudnn_sdpa_op_id();
     char op_label[224];
-    snprintf(op_label, sizeof(op_label),
-             "cudnn-op id=%llu kind=sdpa B=%lld H=%lld Lq=%lld/%lld Lkv=%lld/%lld D=%lld io=%s bucket=%d ws=%lldMB",
-             (unsigned long long)op_id, (long long)N, (long long)H, (long long)Lq, (long long)Lq_plan,
-             (long long)Lkv, (long long)Lkv_plan, (long long)D, io_half ? "f16" : "bf16",
-             (int)use_mask, (long long)(plan.workspace >> 20));
+    const bool ncu_hot = sdpa_ncu_hot_min_lq() > 0 && Lq >= sdpa_ncu_hot_min_lq();
+    if (ncu_hot) {
+        snprintf(op_label, sizeof(op_label), "cudnn-hot-sdpa");
+    } else {
+        snprintf(op_label, sizeof(op_label),
+                 "cudnn-op id=%llu kind=sdpa B=%lld H=%lld Lq=%lld/%lld Lkv=%lld/%lld D=%lld io=%s bucket=%d ws=%lldMB",
+                 (unsigned long long)op_id, (long long)N, (long long)H, (long long)Lq, (long long)Lq_plan,
+                 (long long)Lkv, (long long)Lkv_plan, (long long)D, io_half ? "f16" : "bf16",
+                 (int)use_mask, (long long)(plan.workspace >> 20));
+    }
     nvtx_range op_range(op_label);
     if (cudnn_op_trace()) {
         fprintf(stderr,
@@ -626,8 +715,14 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         cudaStreamSynchronize(stream);
         cudaMemGetInfo(&free_before_exec, &total_before_exec);
     }
-    if (!plan.graph->execute(handle, vpack, ws_ptr).is_good()) {
+    const auto execute_status = plan.plan_index >= 0
+        ? plan.graph->execute_plan_at_index(handle, vpack, ws_ptr, plan.plan_index)
+        : plan.graph->execute(handle, vpack, ws_ptr);
+    if (!execute_status.is_good()) {
         GGML_ABORT("cudnn sdpa execute failed");
+    }
+    if (time_sdpa_shape) {
+        CUDA_CHECK(cudaEventRecord(timing_events[2], stream));
     }
     if (cudnn_op_trace()) {
         fprintf(stderr, "[cudnn-op-end] id=%llu kind=sdpa t_us=%lld\n",
@@ -669,6 +764,22 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
             cudnn_o_bhsd_bf16_to_bshd_f32<<<gs, bs, 0, stream>>>(
                 o_bhsd_b.get(), (float *) dst->data, (int)N, (int)H, (int)Lq, (int)Lq_plan, (int)D);
         }
+    }
+    if (time_sdpa_shape) {
+        CUDA_CHECK(cudaEventRecord(timing_events[3], stream));
+        CUDA_CHECK(cudaEventSynchronize(timing_events[3]));
+        float q_cast_ms = 0.0f, sdpa_ms = 0.0f, output_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&q_cast_ms, timing_events[0], timing_events[1]));
+        CUDA_CHECK(cudaEventElapsedTime(&sdpa_ms, timing_events[1], timing_events[2]));
+        CUDA_CHECK(cudaEventElapsedTime(&output_ms, timing_events[2], timing_events[3]));
+        fprintf(stderr,
+                "[cudnn-sdpa-timing] B=%lld H=%lld Lq=%lld Lkv=%lld D=%lld q_cast=%.3fms sdpa=%.3fms output=%.3fms total=%.3fms\n",
+                (long long) N, (long long) H, (long long) Lq, (long long) Lkv, (long long) D,
+                q_cast_ms, sdpa_ms, output_ms, q_cast_ms + sdpa_ms + output_ms);
+        for (cudaEvent_t event : timing_events) {
+            CUDA_CHECK(cudaEventDestroy(event));
+        }
+        ++sdpa_timing_recorded;
     }
 }
 

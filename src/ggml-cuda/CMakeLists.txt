@@ -170,6 +170,14 @@ if (CUDAToolkit_FOUND)
         target_link_libraries(ggml-cuda PRIVATE cudnn nvrtc)
     endif()
 
+    option(GGML_SAGEATTENTION3 "ggml: experimental SageAttention3 FP4 attention (Blackwell)" OFF)
+    if (GGML_SAGEATTENTION3)
+        message(STATUS "GGML_SAGEATTENTION3 enabled: experimental FP4 LTX self-attention")
+        add_compile_definitions(GGML_SAGEATTENTION3)
+        target_sources(ggml-cuda PRIVATE fattn-sa3.cu)
+        target_include_directories(ggml-cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../thirdparty/cutlass/include)
+    endif()
+
     if (GGML_STATIC)
         if (WIN32)
             # As of 12.3.1 CUDA Toolkit for Windows does not offer a static cublas library

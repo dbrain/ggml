@@ -2,6 +2,7 @@
 
 #include "fattn-common.cuh"
 #include "fattn-cudnn.cuh"
+#include "fattn-sa3.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
@@ -444,7 +445,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // stream produces F16 Q, which only cuDNN accepts. cuDNN's sm120 native SDPA is D==128-only
     // so D==64 stays on the sm80 wmma engine; that 2.2% is irreducible without an F32-Q cast.
     if (ggml_cuda_cudnn_attn_env() && ggml_cuda_cudnn_available() &&
-        ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL &&
+        // Runtime capability is the relevant property here. A container build
+        // without an attached GPU can otherwise record a conservative arch list
+        // even when the resulting binary is running on Blackwell.
+        cc >= GGML_CUDA_CC_BLACKWELL &&
         mask == nullptr && max_bias == 0.0f) {
         float logit_softcap = 0.0f;
         memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
@@ -677,6 +681,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+#if defined(GGML_SAGEATTENTION3)
+    // SA3 is FP4 approximate attention, not a lossless replacement for every
+    // diffusion model.  In particular, current LTX self-attention supplies
+    // F32 Q while upstream SA3 validates F16/BF16 inputs.  Keep the mature
+    // cuDNN path as the production default; GGML_LTX_SA3=1 is the explicit
+    // opt-in for model-specific quality validation and benchmarking.
+    if (const char * e = getenv("GGML_LTX_SA3"); e && atoi(e) != 0 && ggml_cuda_flash_attn_ext_sa3(ctx, dst)) {
+        return;
+    }
+#endif
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
