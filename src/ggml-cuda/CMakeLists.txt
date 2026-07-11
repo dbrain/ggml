@@ -103,6 +103,13 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
+    option(GGML_SAGEATTENTION3 "ggml: experimental SageAttention3 FP4 attention (Blackwell)" OFF)
+    if (NOT GGML_SAGEATTENTION3)
+        # The adapter uses Blackwell-only FP4/CUTLASS instructions. Keep it out of
+        # normal CUDA builds altogether; the dispatch site below is a no-op unless
+        # the feature is explicitly enabled.
+        list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX ".*/fattn-sa3\\.cu$")
+    endif()
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
@@ -128,6 +135,12 @@ if (CUDAToolkit_FOUND)
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+
+    if (GGML_SAGEATTENTION3)
+        message(STATUS "GGML_SAGEATTENTION3 enabled: experimental FP4 LTX self-attention")
+        target_compile_definitions(ggml-cuda PRIVATE GGML_SAGEATTENTION3)
+        target_include_directories(ggml-cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../thirdparty/cutlass/include)
+    endif()
 
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
