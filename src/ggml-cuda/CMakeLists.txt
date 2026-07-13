@@ -103,6 +103,11 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
+    # fattn-sa3.cu (SageAttention3) uses FP4/FP8 PTX (sm89+) + the CUTLASS submodule;
+    # it must NOT be compiled unless GGML_SAGEATTENTION3 is ON, else non-SA3 builds
+    # break on sm86 (ptxas 'cvt.e2m1x2' unsupported) or on the missing cutlass headers.
+    # The GGML_SAGEATTENTION3 block below re-adds it via target_sources when enabled.
+    list(REMOVE_ITEM GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/fattn-sa3.cu")
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
