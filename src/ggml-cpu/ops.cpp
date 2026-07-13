@@ -5997,6 +5997,104 @@ void ggml_compute_forward_rope_back(
     }
 }
 
+// ggml_compute_forward_rope_pe
+//
+// CPU fallback for the longcat-avatar fused RoPE-from-precomputed-pe op
+// (GGML_OP_ROPE_PE). Mirrors ggml-cuda/rope-pe.cu exactly. The op is normally a
+// CUDA-only fused kernel, but the sd.cpp fork's runner computes the whole graph
+// on a single backend (no ggml_backend_sched), so when the runner's runtime
+// backend is CPU (e.g. no CUDA device visible to the forked worker) the op MUST
+// have a CPU path or ggml_get_n_tasks aborts ("op not implemented: ROPE_PE").
+//
+//   a (src0): pre-rope q/k, ne = [d_head, n_head, L, N] (arbitrary strides)
+//   pe(src1): rotation, contiguous ne = [2, 2, d_head/2, L]
+//             cos=pe[0,0,j,t], sin=pe[0,1,j,t]
+//   dst:      contiguous ne = [d_head, L, n_head*N], type == a->type
+//   op_params[0]: 1 = interleaved (GPT-J), 0 = non-interleaved (NeoX)
+template <typename T>
+static void ggml_compute_forward_rope_pe_t(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * a  = dst->src[0];
+    const ggml_tensor * pe = dst->src[1];
+
+    GGML_ASSERT(pe->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(pe));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t d_head = a->ne[0];
+    const int64_t n_head = a->ne[1];
+    const int64_t L      = a->ne[2];
+    const int64_t N      = a->ne[3];
+    const int64_t half   = d_head / 2;
+    const int64_t HN     = n_head * N;
+
+    // element strides of src0 `a`
+    const size_t  esz  = ggml_type_size(a->type);
+    const int64_t a_s0 = a->nb[0] / esz;
+    const int64_t a_s1 = a->nb[1] / esz;
+    const int64_t a_s2 = a->nb[2] / esz;
+    const int64_t a_s3 = a->nb[3] / esz;
+
+    const int interleaved = ((const int32_t *) dst->op_params)[0];
+
+    const T     * a_data  = (const T *)     a->data;
+    const float * pe_data = (const float *) pe->data;
+    T           * dst_data = (T *)          dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // partition over head-rows (HN)
+    for (int64_t h = ith; h < HN; h += nth) {
+        const int64_t head = h % n_head;
+        const int64_t n    = h / n_head;
+        for (int64_t t = 0; t < L; t++) {
+            for (int64_t j = 0; j < half; j++) {
+                const int64_t d_e = interleaved ? (2 * j) : j;
+                const int64_t d_o = interleaved ? (2 * j + 1) : (j + half);
+                const int64_t a_base = d_e * a_s0 + head * a_s1 + t * a_s2 + n * a_s3;
+                const float x_e = type_conversion_table<T>::to_f32(a_data[a_base]);
+                const float x_o = type_conversion_table<T>::to_f32(a_data[a_base + (d_o - d_e) * a_s0]);
+
+                const int64_t pe_base = 4 * j + (int64_t) 2 * d_head * t;
+                const float c = pe_data[pe_base];
+                const float s = pe_data[pe_base + 2];
+
+                const int64_t d_base = d_e + d_head * t + d_head * L * h;
+                dst_data[d_base]               = type_conversion_table<T>::from_f32(x_e * c - x_o * s);
+                dst_data[d_base + (d_o - d_e)] = type_conversion_table<T>::from_f32(x_e * s + x_o * c);
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_rope_pe(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * a = dst->src[0];
+
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
+    GGML_ASSERT(dst->type == a->type);
+
+    switch (a->type) {
+        case GGML_TYPE_F16:
+            {
+                ggml_compute_forward_rope_pe_t<ggml_fp16_t>(params, dst);
+            } break;
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_rope_pe_t<float>(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_conv_transpose_1d
 
 static void ggml_compute_forward_conv_transpose_1d_f16_f32(
