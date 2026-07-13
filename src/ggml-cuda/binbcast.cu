@@ -382,7 +382,14 @@ static void ggml_cuda_op_bin_bcast(
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
 
-    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
+        // F32 residual stream + an F16 operand (e.g. the FLUX.2 residual ADD/MUL
+        // of an F16 attention/Linear output produced under GGML_CUDNN_ATTN_F16_OUT
+        // into the F32 img/txt stream). The kernel reads src1 with its true F16
+        // element size; previously the F32/F32 branch below cast src1_dd to float
+        // and tripped the nb10 % sizeof(float) stride assert.
+        op()(src0, src1, dst, (const float *)src0_dd, (const half *)src1_dd, (float *)dst_dd, stream);
+    } else if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         op()(src0, src1, dst, (const float *)src0_dd, (const float *)src1_dd, (float *)dst_dd, stream);
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
         op()(src0, src1, dst, (const half *) src0_dd, (const half *)src1_dd, (half *) dst_dd, stream);
@@ -424,7 +431,14 @@ static void ggml_cuda_op_fused_binbcast_impl(ggml_backend_cuda_context & ctx, gg
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
+        // F32 stream + F16 operand(s) (GGML_CUDNN_ATTN_F16_OUT F16 island crossing
+        // into the FLUX.2 F32 residual). All fused operands share src1_t, so a
+        // fused group is uniformly F16 here; read them as half.
+        launch_bin_bcast_pack<op, float, half, float>(src0, src1, dst,
+            (const float *) src0->data, (const half *) src1->data, (float *) dst->data,
+            stream, std::make_index_sequence<n_fuse>{});
+    } else if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         launch_bin_bcast_pack<op, float, float, float>(src0, src1, dst,
             (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
             stream, std::make_index_sequence<n_fuse>{});

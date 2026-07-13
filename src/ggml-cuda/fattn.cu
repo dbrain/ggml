@@ -679,19 +679,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
-void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_cuda_set_device(ctx.device);
-#if defined(GGML_SAGEATTENTION3)
-    // SA3 is FP4 approximate attention, not a lossless replacement for every
-    // diffusion model.  In particular, current LTX self-attention supplies
-    // F32 Q while upstream SA3 validates F16/BF16 inputs.  Keep the mature
-    // cuDNN path as the production default; GGML_LTX_SA3=1 is the explicit
-    // opt-in for model-specific quality validation and benchmarking.
-    if (const char * e = getenv("GGML_LTX_SA3"); e && atoi(e) != 0 && ggml_cuda_flash_attn_ext_sa3(ctx, dst)) {
-        return;
-    }
-#endif
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+static void ggml_cuda_flash_attn_ext_dispatch(best_fattn_kernel kernel, ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
@@ -710,6 +699,55 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_cudnn(ctx, dst);
             break;
     }
+}
+
+void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_set_device(ctx.device);
+#if defined(GGML_SAGEATTENTION3)
+    // SA3 is FP4 approximate attention, not a lossless replacement for every
+    // diffusion model.  In particular, current LTX self-attention supplies
+    // F32 Q while upstream SA3 validates F16/BF16 inputs.  Keep the mature
+    // cuDNN path as the production default; GGML_LTX_SA3=1 is the explicit
+    // opt-in for model-specific quality validation and benchmarking.
+    if (const char * e = getenv("GGML_LTX_SA3"); e && atoi(e) != 0 && ggml_cuda_flash_attn_ext_sa3(ctx, dst)) {
+        return;
+    }
+#endif
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+
+    // The native (non-cuDNN) flash-attn kernels hard-require an F32 output tensor
+    // (fattn-common.cuh: GGML_ASSERT(KQV->type == GGML_TYPE_F32)). The
+    // GGML_CUDNN_ATTN_F16_OUT optimization retypes the attention output to F16 so
+    // the cuDNN SDPA can store it directly — but cuDNN is only selected on
+    // Blackwell (cc >= GGML_CUDA_CC_BLACKWELL). On every other GPU (e.g. the RTX
+    // 3060, sm86) a native kernel runs instead and would abort on the F16 dst
+    // (this is the "fp4 concat" crash's second layer: with the concat healed, the
+    // FLUX.2 single-stream F16 attention output reaches the native kernel). Honor
+    // the F16 request by running the kernel into an F32 scratch buffer and
+    // down-casting into the real F16 dst, so the F16_OUT graph works on all GPUs.
+    if (kernel != BEST_FATTN_KERNEL_NONE && kernel != BEST_FATTN_KERNEL_CUDNN &&
+        dst->type != GGML_TYPE_F32) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_is_contiguous(dst));
+
+        ggml_cuda_pool_alloc<float> dst_f32_buf(ctx.pool(), ggml_nelements(dst));
+
+        ggml_tensor dst_f32 = *dst;
+        dst_f32.type  = GGML_TYPE_F32;
+        dst_f32.data  = dst_f32_buf.ptr;
+        dst_f32.nb[0] = ggml_type_size(GGML_TYPE_F32);
+        dst_f32.nb[1] = dst_f32.nb[0] * dst_f32.ne[0];
+        dst_f32.nb[2] = dst_f32.nb[1] * dst_f32.ne[1];
+        dst_f32.nb[3] = dst_f32.nb[2] * dst_f32.ne[2];
+
+        ggml_cuda_flash_attn_ext_dispatch(kernel, ctx, &dst_f32);
+
+        to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+        to_fp16(dst_f32_buf.ptr, (half *) dst->data, ggml_nelements(dst), ctx.stream());
+        return;
+    }
+
+    ggml_cuda_flash_attn_ext_dispatch(kernel, ctx, dst);
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {

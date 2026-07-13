@@ -2683,6 +2683,47 @@ struct ggml_tensor * ggml_concat_n(
     enum ggml_type type = tensors[0]->type;
     GGML_ASSERT(tensors[0]->nb[0] == ggml_type_size(type));
 
+    // Heal a mismatched floating-point input type. The F16 attention-output
+    // optimization (GGML_CUDNN_ATTN_F16_OUT) can hand an F16 activation into a
+    // concat whose sibling operand is still F32 — e.g. the FLUX.2 single-stream
+    // block concatenates the (now F16) attention output with its F32 MLP branch
+    // before the output projection. Without this the strict same-type assert
+    // below aborts ("fp4 concat bug"). We promote every float operand to the
+    // WIDEST float type present (F32 wins over F16/BF16): this is lossless (it
+    // only up-casts) and avoids any F16-overflow on the promoted branch, exactly
+    // reproducing the pre-optimization numerics. Only float<->float mismatches
+    // are healed (via a cast/CPY node); a quantized or integer type mismatch is a
+    // real graph bug and still asserts below.
+    struct ggml_tensor * srcs[GGML_MAX_SRC];
+    for (int i = 0; i < n_tensors; ++i) {
+        srcs[i] = tensors[i];
+    }
+    {
+        #define GGML_CONCAT_IS_FLOAT(t) ((t) == GGML_TYPE_F32 || (t) == GGML_TYPE_F16 || (t) == GGML_TYPE_BF16)
+        bool all_float  = GGML_CONCAT_IS_FLOAT(type);
+        bool mismatched = false;
+        for (int i = 1; i < n_tensors && all_float; ++i) {
+            all_float  = all_float && GGML_CONCAT_IS_FLOAT(srcs[i]->type);
+            mismatched = mismatched || (srcs[i]->type != type);
+        }
+        if (all_float && mismatched) {
+            // widest float wins (F32 > F16/BF16), else keep the first tensor's type
+            enum ggml_type target = type;
+            for (int i = 0; i < n_tensors; ++i) {
+                if (srcs[i]->type == GGML_TYPE_F32) { target = GGML_TYPE_F32; break; }
+            }
+            for (int i = 0; i < n_tensors; ++i) {
+                if (srcs[i]->type != target) {
+                    srcs[i] = ggml_cast(ctx, srcs[i], target);
+                }
+            }
+            type = target;
+        }
+        #undef GGML_CONCAT_IS_FLOAT
+    }
+    tensors = srcs;
+    GGML_ASSERT(tensors[0]->nb[0] == ggml_type_size(type));
+
     int64_t ne[GGML_MAX_DIMS];
     memcpy(ne, tensors[0]->ne, sizeof(ne));
 
