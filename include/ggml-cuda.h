@@ -56,6 +56,14 @@ GGML_BACKEND_API int  ggml_backend_cuda_get_device_count(void);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_description(int device, char * description, size_t description_size);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
 
+// True when `device` has Blackwell-class MMA (the same predicate the mul_mat /
+// flash-attn dispatch uses to enable the FP4 cuBLASLt GEMM + cuDNN SDPA paths).
+// Model graph builders call this to gate Blackwell-only optimizations at RUNTIME
+// (e.g. the GGML_CUDNN_ATTN_F16_OUT F16 residual stream) so ONE binary renders
+// correctly on both Blackwell and older GPUs (sm86 falls back instead of emitting
+// an F16 island the native kernels can't consume -> solid-white output).
+GGML_BACKEND_API bool ggml_backend_cuda_device_has_blackwell_mma(int device);
+
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 

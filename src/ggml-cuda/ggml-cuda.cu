@@ -5907,6 +5907,13 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
     CUDA_CHECK(cudaMemGetInfo(free, total));
 }
 
+bool ggml_backend_cuda_device_has_blackwell_mma(int device) {
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+        return false;
+    }
+    return blackwell_mma_available(ggml_cuda_info().devices[device].cc);
+}
+
 void ggml_backend_cuda_get_graph_cache_stats(ggml_backend_t backend,
                                              int *    out_graph_count,
                                              size_t * out_total_node_count) {
@@ -6355,8 +6362,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     // F8_E4M3 weights likewise accept an F16 activation via the cuBLASLt
                     // FP8 GEMM (activation quantized to e4m3); keep the dit_f16 stream on the
                     // fast path. Default-on gate, so an fp8 gguf works without an env flag.
-                    if (!((a->type == GGML_TYPE_NVFP4 && ggml_cuda_nvfp4_cublaslt_enabled()) ||
-                          (a->type == GGML_TYPE_F8_E4M3 && ggml_cuda_f8_gemm_enabled()))) {
+                    // DEVICE-GATED: the cuBLASLt FP4/FP8 GEMMs are Blackwell-only
+                    // (ggml_cuda_mul_mat requires blackwell_mma_available too). On non-Blackwell
+                    // (e.g. sm86/3060) the runtime can't consume an F16 activation with an
+                    // NVFP4/F8 weight, so we must reject here and let the scheduler cast to F32
+                    // (-> the standard MMVQ/MMQ dequant path). Without this gate supports_op
+                    // advertised a path the execute path skips -> solid-white output on sm86.
+                    if (!(((a->type == GGML_TYPE_NVFP4 && ggml_cuda_nvfp4_cublaslt_enabled()) ||
+                           (a->type == GGML_TYPE_F8_E4M3 && ggml_cuda_f8_gemm_enabled()))
+                          && blackwell_mma_available(ggml_cuda_info().devices[dev_ctx->device].cc))) {
                         return false;
                     }
                 }
@@ -6370,14 +6384,19 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     }
                     // NVFP4 weight with an F16 activation+dst goes through the cuBLASLt
                     // FP4 path (F32 accum, F16 store) — the dit_f16 residual stream.
+                    // DEVICE-GATED (Blackwell-only, mirrors ggml_cuda_mul_mat) — on sm86
+                    // this falls through to the F32-dst dispatch instead of a path the
+                    // runtime skips (which produced solid-white output).
                     if (a->type == GGML_TYPE_NVFP4 && b->type == GGML_TYPE_F16 &&
-                        ggml_cuda_nvfp4_cublaslt_enabled()) {
+                        ggml_cuda_nvfp4_cublaslt_enabled() &&
+                        blackwell_mma_available(ggml_cuda_info().devices[dev_ctx->device].cc)) {
                         return true;
                     }
                     // F8_E4M3 weight + F16 activation + F16 dst: cuBLASLt FP8 GEMM (F32 accum,
-                    // F16 store) — the dit_f16 residual stream. Default-on gate.
+                    // F16 store) — the dit_f16 residual stream. Default-on gate, Blackwell-only.
                     if (a->type == GGML_TYPE_F8_E4M3 && b->type == GGML_TYPE_F16 &&
-                        ggml_cuda_f8_gemm_enabled()) {
+                        ggml_cuda_f8_gemm_enabled() &&
+                        blackwell_mma_available(ggml_cuda_info().devices[dev_ctx->device].cc)) {
                         return true;
                     }
                     if (!((a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_F32) &&
