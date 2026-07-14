@@ -113,6 +113,12 @@ __global__ void sa3_center_q(const half * in, const half * mean, half * out, siz
 
 inline __device__ uint32_t sa3_fp32_to_e2m1(float2 * x) {
     uint32_t v;
+    // The FP4 pack PTX (cvt.e2m1x2) is Blackwell-only (sm_100+); ptxas rejects it for
+    // sm_86. Arch-gate so the SA3 sources COMPILE for sm86 (as a no-op) and one binary
+    // builds for 86;120 — SA3 is only ever dispatched on Blackwell at runtime
+    // (ggml_cuda_flash_attn_ext_sa3 is gated by GGML_LTX_SA3 + cc), so the sm86 stub is
+    // never executed. (Same >= 1000 gate style as sageattention3/fp4_quantization_4d.cu.)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     asm volatile(
         "{ .reg .b8 a,b,c,d;"
         "cvt.rn.satfinite.e2m1x2.f32 a,%2,%1;"
@@ -122,6 +128,10 @@ inline __device__ uint32_t sa3_fp32_to_e2m1(float2 * x) {
         "mov.b32 %0,{a,b,c,d}; }"
         : "=r"(v) : "f"(x[0].x), "f"(x[0].y), "f"(x[1].x), "f"(x[1].y),
           "f"(x[2].x), "f"(x[2].y), "f"(x[3].x), "f"(x[3].y));
+#else
+    (void) x;
+    v = 0u;  // sm86 stub: SA3 never runs on non-Blackwell (runtime cc-gated)
+#endif
     return v;
 }
 

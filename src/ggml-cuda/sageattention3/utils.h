@@ -201,6 +201,10 @@ packed_float_to_ue4m3(
   float const &f0, float const &f1, float const &f2, float const &f3,
   uint32_t &out
 ) {
+  // FP8/FP4 pack PTX below is Blackwell-only (sm_100+); ptxas rejects it for sm_86.
+  // Arch-gate so the SA3 sources COMPILE for 86;120 as ONE binary — SA3 is only ever
+  // dispatched on Blackwell at runtime (GGML_LTX_SA3 + cc), so the sm86 stub never runs.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   asm volatile( \
     "{\n" \
     ".reg .b16 lo;\n" \
@@ -210,6 +214,9 @@ packed_float_to_ue4m3(
     "mov.b32 %0, {lo, hi};\n" \
     "}" \
     : "=r"(out) : "f"(f0), "f"(f1), "f"(f2), "f"(f3));
+#else
+  (void) f0; (void) f1; (void) f2; (void) f3; out = 0u;  // sm86 stub (never executed)
+#endif
 }
 
 CUTLASS_DEVICE void 
@@ -219,6 +226,7 @@ packed_float_to_e2m1(
   uint32_t &out
 ) {
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     asm volatile( \
     "{\n" \
     ".reg .b8 byte0;\n" \
@@ -233,6 +241,10 @@ packed_float_to_e2m1(
     "}" \
     : "=r"(out) : "f"(f0), "f"(f1), "f"(f2), "f"(f3),
                   "f"(f4), "f"(f5), "f"(f6), "f"(f7));
+#else
+    (void) f0; (void) f1; (void) f2; (void) f3;
+    (void) f4; (void) f5; (void) f6; (void) f7; out = 0u;  // sm86 stub (never executed)
+#endif
 
 }
 
@@ -241,20 +253,29 @@ add(float2      & c,
     float2 const& a, 
     float2 const& b) 
 {
+// add.f32x2 (packed-float2 SIMD) is Blackwell-only; scalar fallback for sm86 (never runs).
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 asm volatile("add.f32x2 %0, %1, %2;\n"
   : "=l"(reinterpret_cast<uint64_t      &>(c))
   :  "l"(reinterpret_cast<uint64_t const&>(a)),
       "l"(reinterpret_cast<uint64_t const&>(b)));
+#else
+c.x = a.x + b.x; c.y = a.y + b.y;
+#endif
 }
 
 CUTLASS_DEVICE void 
 add_inplace(float2 &a, 
             float2 const& b) 
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   asm volatile("add.f32x2 %0, %0, %1;\n"
     : "+l"(reinterpret_cast<uint64_t &>(a))     // a: input/output
     :  "l"(reinterpret_cast<uint64_t const&>(b)) // b: input
   );
+#else
+  a.x += b.x; a.y += b.y;
+#endif
 }
 
 
@@ -263,20 +284,28 @@ sub(float2      & c,
     float2 const& a, 
     float2 const& b) 
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 asm volatile("sub.f32x2 %0, %1, %2;\n"
   : "=l"(reinterpret_cast<uint64_t      &>(c))
   :  "l"(reinterpret_cast<uint64_t const&>(a)),
       "l"(reinterpret_cast<uint64_t const&>(b)));
+#else
+c.x = a.x - b.x; c.y = a.y - b.y;
+#endif
 }
 
 CUTLASS_DEVICE void 
 sub_inplace(float2 &a, 
             float2 const& b) 
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   asm volatile("sub.f32x2 %0, %0, %1;\n"
     : "+l"(reinterpret_cast<uint64_t &>(a))     // a: input/output
     :  "l"(reinterpret_cast<uint64_t const&>(b)) // b: input
   );
+#else
+  a.x -= b.x; a.y -= b.y;
+#endif
 }
 
 
@@ -285,10 +314,14 @@ mul(float2      & c,
     float2 const& a, 
     float2 const& b) 
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   asm volatile("mul.f32x2 %0, %1, %2;\n"
     : "=l"(reinterpret_cast<uint64_t      &>(c))
     :  "l"(reinterpret_cast<uint64_t const&>(a)),
        "l"(reinterpret_cast<uint64_t const&>(b)));
+#else
+  c.x = a.x * b.x; c.y = a.y * b.y;
+#endif
 }
 
 CUTLASS_DEVICE void 
@@ -297,11 +330,15 @@ fma(float2      & d,
     float2 const& b, 
     float2 const& c) 
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   asm volatile("fma.rn.f32x2 %0, %1, %2, %3;\n"
     : "=l"(reinterpret_cast<uint64_t      &>(d))
     :  "l"(reinterpret_cast<uint64_t const&>(a)),
        "l"(reinterpret_cast<uint64_t const&>(b)),
        "l"(reinterpret_cast<uint64_t const&>(c)));
+#else
+  d.x = a.x * b.x + c.x; d.y = a.y * b.y + c.y;
+#endif
 }
 
 CUTLASS_DEVICE void 
@@ -309,10 +346,14 @@ fma_inplace(float2 &a,
             float2 const& b, 
             float2 const& c) 
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   asm volatile("fma.rn.f32x2 %0, %0, %1, %2;\n"
     : "+l"(reinterpret_cast<uint64_t      &>(a))
     :  "l"(reinterpret_cast<uint64_t const&>(b)),
        "l"(reinterpret_cast<uint64_t const&>(c)));
+#else
+  a.x = a.x * b.x + c.x; a.y = a.y * b.y + c.y;
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
