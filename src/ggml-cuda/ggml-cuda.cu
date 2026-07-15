@@ -701,8 +701,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             if (ggml_cuda_alloc_trace_enabled() && reserve_size >= ggml_cuda_alloc_trace_min_bytes()) {
                 size_t free_after = 0, total_after = 0;
                 ggml_cuda_mem_get_info_noabort(&free_after, &total_after);
-                char detail[96];
-                snprintf(detail, sizeof(detail), "pool_size=%.1fMB pool_used=%.1fMB",
+                char detail[160];
+                snprintf(detail, sizeof(detail),
+                         "request=%.1fMB avail=%.1fMB pool_size=%.1fMB pool_used=%.1fMB",
+                         size / 1048576.0, avail / 1048576.0,
                          pool_size / 1048576.0, pool_used / 1048576.0);
                 ggml_cuda_alloc_trace_event("vmm-map", device, reserve_size, detail, free_before, free_after, total_after);
             }
