@@ -151,6 +151,10 @@ GGML_BACKEND_API void ggml_cuda_set_longcat_fa_bsa_n_heads(int n_heads);
 // itself is GGML_FP8_ACT_QUANT_CACHE=0 (default on).
 GGML_BACKEND_API void ggml_cuda_fp8_act_cache_new_generation(void);
 
+// Emit the owned FP8 activation-quant cache allocation for VRAM accounting.
+// This is diagnostic-only; callers should gate it with their own trace env.
+GGML_BACKEND_API void ggml_cuda_fp8_act_cache_log_stats(const char * phase);
+
 // FP8 FFN e4m3 WEIGHT cache (GGML_FP8_WEIGHT_QUANT_CACHE=1, budget
 // GGML_FP8_WEIGHT_CACHE_MB): frees all cached e4m3 weight buffers. Optional —
 // the cache otherwise persists until process exit. Call at render/model teardown

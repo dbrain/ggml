@@ -1180,6 +1180,17 @@ extern "C" void ggml_cuda_fp8_act_cache_new_generation(void) {
     g_fp8_act_cache_gen.fetch_add(1, std::memory_order_relaxed);
 }
 
+extern "C" void ggml_cuda_fp8_act_cache_log_stats(const char * phase) {
+    const fp8_act_quant_cache & C = g_fp8_act_cache;
+    fprintf(stderr,
+            "[VRAM-LEDGER fp8-act-cache] phase=%s enabled=%d device=%d cap=%.2f MiB data=%p scale=%p generation=%llu cached_generation=%llu\\n",
+            phase != nullptr ? phase : "(unknown)",
+            ggml_cuda_fp8_act_cache_enabled(), C.device,
+            (double) C.cap / 1048576.0, (void *) C.d_fp8, (void *) C.d_scale,
+            (unsigned long long) g_fp8_act_cache_gen.load(std::memory_order_relaxed),
+            (unsigned long long) C.gen);
+}
+
 // ---------------------------------------------------------------------------
 // FP8 GEMM bias epilogue (fix #3): fold the Linear bias-add into the cuBLASLt
 // epilogue (CUBLASLT_EPILOGUE_BIAS) instead of a separate op_add kernel. Only
