@@ -194,6 +194,22 @@ static __global__ void fill_seq_len_kernel(int32_t * out, int n, int value) {
     }
 }
 
+// Gather a query-row range from ggml's full BHSD tensor into a compact BHSD
+// tile.  Q rows for distinct heads are separated by the full sequence stride,
+// so a direct pointer offset is not sufficient.
+static __global__ void cudnn_q_f32_to_f16_tile(
+        const float * __restrict__ in, half * __restrict__ out,
+        int H, int L_full, int L_tile, int row_offset, int D) {
+    const long idx = (long) blockIdx.x * blockDim.x + threadIdx.x;
+    const long total = (long) H * L_tile * D;
+    if (idx >= total) return;
+    const int d = idx % D;
+    long t = idx / D;
+    const int l = t % L_tile;
+    const int h = t / L_tile;
+    out[idx] = __float2half(in[((long) h * L_full + row_offset + l) * D + d]);
+}
+
 // One cuDNN handle per thread (the backend runs the graph on a single worker thread).
 static thread_local cudnnHandle_t g_cudnn_handle = nullptr;
 static cudnnHandle_t get_cudnn_handle() {
@@ -474,6 +490,60 @@ static float f8dbg_amax_dev(const void * d, bool is_f16, size_t n, cudaStream_t 
     cudaStreamSynchronize(stream); float f; memcpy(&f, &bits, sizeof(float)); return f;
 }
 
+// Backend-level Q tiling for the precise LTX cuDNN step.  Unlike graph-level
+// tiling this owns only compact Q/O BHSD tiles and writes each result straight
+// to the final BSHD destination; no ggml concat allocation is introduced.
+static bool cudnn_ltx_qtile(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                             const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * V,
+                             int64_t N, int64_t H, int64_t Lq, int64_t Lkv, int64_t D,
+                             int io_half, float scale, cudnnHandle_t handle) {
+    const char * e = getenv("GGML_CUDNN_LTX_QTILE");
+    const int64_t tile = e ? atoll(e) : 0;
+    if (tile <= 0 || Lq <= tile || N != 1 || Q->type != GGML_TYPE_F32 || io_half != 1 || dst->src[3] != nullptr) return false;
+    const cudaStream_t stream = ctx.stream();
+    const int64_t tile_len = std::min<int64_t>(tile, Lq);
+    ggml_cuda_pool_alloc<half> q_tile(ctx.pool()), o_tile(ctx.pool());
+    q_tile.alloc((size_t) H * tile_len * D);
+    o_tile.alloc((size_t) H * tile_len * D);
+    for (int64_t off = 0; off < Lq; off += tile_len) {
+        const int64_t len = std::min<int64_t>(tile_len, Lq - off);
+        const long total = (long) H * len * D;
+        cudnn_q_f32_to_f16_tile<<<(total + 255) / 256, 256, 0, stream>>>(
+            (const float *) Q->data, q_tile.get(), (int) H, (int) Lq, (int) len, (int) off, (int) D);
+        CUDA_CHECK(cudaGetLastError());
+        // No padding mask or bucket: each query row attends the unchanged full K/V.
+        sdpa_key key{N, H, len, Lkv, D, io_half, 0};
+        cudnn_sdpa_plan & plan = get_or_build_plan(handle, key, scale);
+        ggml_cuda_pool_alloc<uint8_t> ws(ctx.pool());
+        void * ws_ptr = nullptr;
+        if (plan.workspace > 0) { ws.alloc((size_t) plan.workspace); ws_ptr = ws.get(); }
+        std::unordered_map<fe::graph::Tensor_attributes::uid_t, void *> pack = {
+            {Q_UID, q_tile.get()}, {K_UID, const_cast<void *>(K->data)},
+            {V_UID, const_cast<void *>(V->data)}, {O_UID, o_tile.get()},
+        };
+        const auto status = plan.plan_index >= 0
+            ? plan.graph->execute_plan_at_index(handle, pack, ws_ptr, plan.plan_index)
+            : plan.graph->execute(handle, pack, ws_ptr);
+        if (!status.is_good()) GGML_ABORT("cudnn tiled sdpa execute failed");
+        const int gs = (int) ((total + 255) / 256);
+        // N==1 makes the destination's row-offset a contiguous BSHD suffix.
+        if (dst->type == GGML_TYPE_F16) {
+            cudnn_o_bhsd_half_to_bshd_f16<<<gs, 256, 0, stream>>>(o_tile.get(),
+                (half *) dst->data + off * H * D, 1, (int) H, (int) len, (int) len, (int) D);
+        } else {
+            cudnn_o_bhsd_half_to_bshd_f32<<<gs, 256, 0, stream>>>(o_tile.get(),
+                (float *) dst->data + off * H * D, 1, (int) H, (int) len, (int) len, (int) D);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+    static int traced = 0;
+    if (traced++ < 4) {
+        fprintf(stderr, "[cudnn-ltx-qtile] Lq=%lld tile=%lld H=%lld\n",
+                (long long) Lq, (long long) tile_len, (long long) H);
+    }
+    return true;
+}
+
 void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -524,6 +594,10 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
     cudnnHandle_t handle = get_cudnn_handle();
     if (cudnnSetStream(handle, stream) != CUDNN_STATUS_SUCCESS) {
         GGML_ABORT("cudnnSetStream failed");
+    }
+
+    if (cudnn_ltx_qtile(ctx, dst, Q, K, V, N, H, Lq, Lkv, D, io_half, scale, handle)) {
+        return;
     }
 
     static int sdpa_timing_count = 0;
