@@ -18,9 +18,9 @@ __global__ void sa3_cast_q_f32(const float * in, half * out, size_t n) {
     if (i < n) out[i] = __float2half_rn(in[i]);
 }
 
-__global__ void sa3_cast_q_f32_pad(const float * in, half * out, int l, int lr) {
+__global__ void sa3_cast_q_f32_pad(const float * in, half * out, int l, int lr, int heads) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t n = (size_t) 32 * lr * kHeadDim;
+    const size_t n = (size_t) heads * lr * kHeadDim;
     if (i < n) {
         const int d = i % kHeadDim;
         const size_t token = i / kHeadDim;
@@ -30,9 +30,9 @@ __global__ void sa3_cast_q_f32_pad(const float * in, half * out, int l, int lr) 
     }
 }
 
-__global__ void sa3_pad_f16(const half * in, half * out, int l, int lr) {
+__global__ void sa3_pad_f16(const half * in, half * out, int l, int lr, int heads) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t n = (size_t) 32 * lr * kHeadDim;
+    const size_t n = (size_t) heads * lr * kHeadDim;
     if (i < n) {
         const int d = i % kHeadDim;
         const size_t token = i / kHeadDim;
@@ -68,9 +68,9 @@ __global__ void sa3_center_k(const half * in, const float * mean, half * out, si
     }
 }
 
-__global__ void sa3_center_k_pad(const half * in, const float * mean, half * out, int l, int lr) {
+__global__ void sa3_center_k_pad(const half * in, const float * mean, half * out, int l, int lr, int heads) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t n = (size_t) 32 * lr * kHeadDim;
+    const size_t n = (size_t) heads * lr * kHeadDim;
     if (i < n) {
         const int d = i % kHeadDim;
         const size_t token = i / kHeadDim;
@@ -229,13 +229,13 @@ __global__ void sa3_quant_vt(const half * in, uint8_t * out, uint8_t * sf, int l
        + (col / 4) * 256 + col % 4 + (row / 16) * 4 + (row % 16) * 16] = bits;
 }
 
-__global__ void sa3_o_to_dst(const half * in, void * dst, int l, int lr, bool f32) {
+__global__ void sa3_o_to_dst(const half * in, void * dst, int l, int lr, int heads, int head_start, int total_heads, bool f32) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t n = (size_t) 32 * l * kHeadDim;
+    const size_t n = (size_t) heads * l * kHeadDim;
     if (i < n) {
         const int d = i % kHeadDim; const size_t t = i / kHeadDim;
         const int h = t / l; const int token = t % l;
-        const size_t out_i = ((size_t) token * 32 + h) * kHeadDim + d;
+        const size_t out_i = ((size_t) token * total_heads + head_start + h) * kHeadDim + d;
         const half x = in[((size_t) h * lr + token) * kHeadDim + d];
         if (f32) static_cast<float *>(dst)[out_i] = __half2float(x);
         else static_cast<half *>(dst)[out_i] = x;
@@ -269,9 +269,14 @@ bool ggml_cuda_flash_attn_ext_sa3(ggml_backend_cuda_context & ctx, ggml_tensor *
         return false;
     }
 
-    const int l = q->ne[1], h = 32, lr = ((l + 127) / 128) * 128, blocks = lr / 128;
-    const size_t elems = (size_t) h * l * kHeadDim;
-    const size_t elems_padded = (size_t) h * lr * kHeadDim;
+    const int l = q->ne[1], total_h = 32, lr = ((l + 127) / 128) * 128, blocks = lr / 128;
+    int head_group = total_h;
+    if (const char * e = getenv("GGML_LTX_SA3_HEAD_GROUP")) {
+        const int requested = atoi(e);
+        if (requested > 0 && requested <= total_h && total_h % requested == 0) head_group = requested;
+    }
+    const size_t elems = (size_t) head_group * l * kHeadDim;
+    const size_t elems_padded = (size_t) head_group * lr * kHeadDim;
     const cudaStream_t stream = ctx.stream();
     // The locked singing repro enables the validated F16 storage path. Keep
     // the core runtime opt-in so other callers retain the original FP32 path.
@@ -301,60 +306,66 @@ bool ggml_cuda_flash_attn_ext_sa3(ggml_backend_cuda_context & ctx, ggml_tensor *
     ggml_cuda_pool_alloc<half> delta_f16_buf(ctx.pool());
     ggml_cuda_pool_alloc<float> delta(ctx.pool()), lse(ctx.pool());
     ggml_cuda_pool_alloc<uint8_t> q4(ctx.pool()), k4(ctx.pool()), v4(ctx.pool()), sfq(ctx.pool()), sfk(ctx.pool()), sfv(ctx.pool());
-    scratch.alloc(elems_padded); q_mean.alloc((size_t) h * blocks * kHeadDim);
-    k_mean.alloc((size_t) h * kHeadDim);
-    if (delta_f16) delta_f16_buf.alloc((size_t) h * blocks * lr);
-    else delta.alloc((size_t) h * blocks * lr);
-    lse.alloc((size_t) h * lr);
-    q4.alloc((size_t) h * lr * kHeadDim / 2); k4.alloc((size_t) h * lr * kHeadDim / 2); v4.alloc((size_t) h * kHeadDim * lr / 2);
-    sfq.alloc((size_t) h * lr * kHeadDim / 16); sfk.alloc((size_t) h * lr * kHeadDim / 16); sfv.alloc((size_t) h * kHeadDim * lr / 16);
-    if (q->type == GGML_TYPE_F32) sa3_cast_q_f32_pad<<<(elems_padded + 255) / 256, 256, 0, stream>>>((const float *) q->data, scratch.get(), l, lr);
-    else sa3_pad_f16<<<(elems_padded + 255) / 256, 256, 0, stream>>>((const half *) q->data, scratch.get(), l, lr);
-    check_stage("Q cast");
-    sa3_k_mean<<<dim3(kHeadDim, h), 256, 0, stream>>>((const half *) k->data, k_mean.get(), l);
-    sa3_q_block_mean<<<dim3(kHeadDim, blocks, h), kTokenBlock, 0, stream>>>(scratch.get(), q_mean.get(), lr, blocks);
-    sa3_center_q<<<(elems_padded + 255) / 256, 256, 0, stream>>>(scratch.get(), q_mean.get(), scratch.get(), elems_padded, lr, blocks);
-    check_stage("centering");
-    sa3_quant_qk<false><<<dim3(blocks, 1, h), 1024, 0, stream>>>(scratch.get(), q4.get(), sfq.get(), lr, lr, false);
-    check_stage("Q FP4 quantization");
+    scratch.alloc(elems_padded); q_mean.alloc((size_t) head_group * blocks * kHeadDim);
+    k_mean.alloc((size_t) head_group * kHeadDim);
+    if (delta_f16) delta_f16_buf.alloc((size_t) head_group * blocks * lr);
+    else delta.alloc((size_t) head_group * blocks * lr);
+    lse.alloc((size_t) head_group * lr);
+    q4.alloc((size_t) head_group * lr * kHeadDim / 2); k4.alloc((size_t) head_group * lr * kHeadDim / 2); v4.alloc((size_t) head_group * kHeadDim * lr / 2);
+    sfq.alloc((size_t) head_group * lr * kHeadDim / 16); sfk.alloc((size_t) head_group * lr * kHeadDim / 16); sfv.alloc((size_t) head_group * kHeadDim * lr / 16);
+    for (int head_start = 0; head_start < total_h; head_start += head_group) {
+        const size_t head_offset = (size_t) head_start * l * kHeadDim;
+        const float * q_f32 = static_cast<const float *>(q->data) + head_offset;
+        const half * k_f16 = static_cast<const half *>(k->data) + head_offset;
+        const half * v_f16 = static_cast<const half *>(v->data) + head_offset;
+        if (q->type == GGML_TYPE_F32) sa3_cast_q_f32_pad<<<(elems_padded + 255) / 256, 256, 0, stream>>>(q_f32, scratch.get(), l, lr, head_group);
+        else sa3_pad_f16<<<(elems_padded + 255) / 256, 256, 0, stream>>>((const half *) q->data + head_offset, scratch.get(), l, lr, head_group);
+        check_stage("Q cast");
+        sa3_k_mean<<<dim3(kHeadDim, head_group), 256, 0, stream>>>(k_f16, k_mean.get(), l);
+        sa3_q_block_mean<<<dim3(kHeadDim, blocks, head_group), kTokenBlock, 0, stream>>>(scratch.get(), q_mean.get(), lr, blocks);
+        sa3_center_q<<<(elems_padded + 255) / 256, 256, 0, stream>>>(scratch.get(), q_mean.get(), scratch.get(), elems_padded, lr, blocks);
+        check_stage("centering");
+        sa3_quant_qk<false><<<dim3(blocks, 1, head_group), 1024, 0, stream>>>(scratch.get(), q4.get(), sfq.get(), lr, lr, false);
+        check_stage("Q FP4 quantization");
 
-    // Q is quantized, so its scratch storage can become centered K.
-    sa3_center_k_pad<<<(elems_padded + 255) / 256, 256, 0, stream>>>((const half *) k->data, k_mean.get(), scratch.get(), l, lr);
-    for (int head = 0; head < h; ++head) {
-        const float one = 1.0f, zero = 0.0f;
-        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
-        CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N, lr, blocks, kHeadDim,
-            &one, scratch.get() + (size_t) head * lr * kHeadDim, CUDA_R_16F, kHeadDim,
-            q_mean.get() + (size_t) head * blocks * kHeadDim, CUDA_R_16F, kHeadDim,
-            &zero,
-            delta_f16 ? static_cast<void *>(delta_f16_buf.get() + (size_t) head * blocks * lr)
-                      : static_cast<void *>(delta.get() + (size_t) head * blocks * lr),
-            delta_f16 ? CUDA_R_16F : CUDA_R_32F, lr, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    }
-    check_stage("delta GEMM");
-    sa3_quant_qk<true><<<dim3(blocks, 1, h), 1024, 0, stream>>>(scratch.get(), k4.get(), sfk.get(), lr, lr, false);
-    check_stage("K FP4 quantization");
-    // K is quantized, so the same scratch storage can become padded V.
-    sa3_pad_f16<<<(elems_padded + 255) / 256, 256, 0, stream>>>((const half *) v->data, scratch.get(), l, lr);
-    sa3_quant_vt<<<dim3(blocks, 1, h), 1024, 0, stream>>>(scratch.get(), v4.get(), sfv.get(), lr, lr, false);
-    check_stage("V FP4 quantization");
-    Flash_fwd_params p = {};
-    p.q_ptr=q4.get(); p.k_ptr=k4.get(); p.v_ptr=v4.get(); p.delta_s_ptr=delta_f16 ? static_cast<void *>(delta_f16_buf.get()) : static_cast<void *>(delta.get()); p.sfq_ptr=sfq.get(); p.sfk_ptr=sfk.get(); p.sfv_ptr=sfv.get(); p.o_ptr=scratch.get(); p.softmax_lse_ptr=lse.get();
-    p.b=1; p.h=h; p.h_k=h; p.h_h_k_ratio=1; p.seqlen_q=lr; p.seqlen_k=lr; p.unpadded_seqlen_k=l; p.seqlen_q_rounded=lr; p.seqlen_k_rounded=lr; p.d=kHeadDim; p.d_rounded=kHeadDim; p.head_divmod=cutlass::FastDivmod(h);
+        // Q is quantized, so its scratch storage can become centered K.
+        sa3_center_k_pad<<<(elems_padded + 255) / 256, 256, 0, stream>>>(k_f16, k_mean.get(), scratch.get(), l, lr, head_group);
+        for (int head = 0; head < head_group; ++head) {
+            const float one = 1.0f, zero = 0.0f;
+            CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+            CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N, lr, blocks, kHeadDim,
+                &one, scratch.get() + (size_t) head * lr * kHeadDim, CUDA_R_16F, kHeadDim,
+                q_mean.get() + (size_t) head * blocks * kHeadDim, CUDA_R_16F, kHeadDim,
+                &zero,
+                delta_f16 ? static_cast<void *>(delta_f16_buf.get() + (size_t) head * blocks * lr)
+                          : static_cast<void *>(delta.get() + (size_t) head * blocks * lr),
+                delta_f16 ? CUDA_R_16F : CUDA_R_32F, lr, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
+        check_stage("delta GEMM");
+        sa3_quant_qk<true><<<dim3(blocks, 1, head_group), 1024, 0, stream>>>(scratch.get(), k4.get(), sfk.get(), lr, lr, false);
+        check_stage("K FP4 quantization");
+        // K is quantized, so the same scratch storage can become padded V.
+        sa3_pad_f16<<<(elems_padded + 255) / 256, 256, 0, stream>>>(v_f16, scratch.get(), l, lr, head_group);
+        sa3_quant_vt<<<dim3(blocks, 1, head_group), 1024, 0, stream>>>(scratch.get(), v4.get(), sfv.get(), lr, lr, false);
+        check_stage("V FP4 quantization");
+        Flash_fwd_params p = {};
+        p.q_ptr=q4.get(); p.k_ptr=k4.get(); p.v_ptr=v4.get(); p.delta_s_ptr=delta_f16 ? static_cast<void *>(delta_f16_buf.get()) : static_cast<void *>(delta.get()); p.sfq_ptr=sfq.get(); p.sfk_ptr=sfk.get(); p.sfv_ptr=sfv.get(); p.o_ptr=scratch.get(); p.softmax_lse_ptr=lse.get();
+        p.b=1; p.h=head_group; p.h_k=head_group; p.h_h_k_ratio=1; p.seqlen_q=lr; p.seqlen_k=lr; p.unpadded_seqlen_k=l; p.seqlen_q_rounded=lr; p.seqlen_k_rounded=lr; p.d=kHeadDim; p.d_rounded=kHeadDim; p.head_divmod=cutlass::FastDivmod(head_group);
     // FP4 pointer arithmetic is in nibbles (cutlass::float_e2m1_t), whereas
     // the backing buffers above are byte-addressed.  The upstream adapter
     // therefore multiplies every Q/K/V stride by two.
     p.q_row_stride=kHeadDim; p.k_row_stride=kHeadDim; p.v_row_stride=lr; p.q_head_stride=(int64_t) lr*kHeadDim; p.k_head_stride=(int64_t) lr*kHeadDim; p.v_head_stride=(int64_t) kHeadDim*lr;
-    p.q_batch_stride=(int64_t) h*lr*kHeadDim; p.k_batch_stride=p.q_batch_stride; p.v_batch_stride=(int64_t) h*kHeadDim*lr;
+    p.q_batch_stride=(int64_t) head_group*lr*kHeadDim; p.k_batch_stride=p.q_batch_stride; p.v_batch_stride=(int64_t) head_group*kHeadDim*lr;
     p.sfq_row_stride=kHeadDim/16; p.sfk_row_stride=kHeadDim/16; p.sfv_row_stride=lr/16; p.sfq_head_stride=(int64_t) lr*kHeadDim/16; p.sfk_head_stride=p.sfq_head_stride; p.sfv_head_stride=(int64_t) kHeadDim*lr/16;
-    p.sfq_batch_stride=(int64_t) h*lr*kHeadDim/16; p.sfk_batch_stride=p.sfq_batch_stride; p.sfv_batch_stride=(int64_t) h*kHeadDim*lr/16;
-    p.ds_row_stride=lr; p.ds_head_stride=(int64_t) blocks*lr; p.ds_batch_stride=(int64_t) h*blocks*lr; p.o_row_stride=kHeadDim; p.o_head_stride=(int64_t) lr*kHeadDim; p.o_batch_stride=(int64_t) h*lr*kHeadDim;
+    p.sfq_batch_stride=(int64_t) head_group*lr*kHeadDim/16; p.sfk_batch_stride=p.sfq_batch_stride; p.sfv_batch_stride=(int64_t) head_group*kHeadDim*lr/16;
+    p.ds_row_stride=lr; p.ds_head_stride=(int64_t) blocks*lr; p.ds_batch_stride=(int64_t) head_group*blocks*lr; p.o_row_stride=kHeadDim; p.o_head_stride=(int64_t) lr*kHeadDim; p.o_batch_stride=(int64_t) head_group*lr*kHeadDim;
     p.scale_softmax=scale; p.scale_softmax_log2=scale * M_LOG2E; p.is_causal=false; p.per_block_mean=true; p.seqlen_s=lr; p.is_bf16=false; p.is_seqlens_k_cumulative=true;
     if (timing) CUDA_CHECK(cudaEventRecord(timing_mha, stream));
     if (delta_f16) run_mha_fwd_<cutlass::nv_float4_t<cutlass::float_e2m1_t>, kHeadDim, cutlass::half_t, cutlass::half_t>(p, stream);
     else run_mha_fwd_<cutlass::nv_float4_t<cutlass::float_e2m1_t>, kHeadDim, cutlass::half_t>(p, stream);
-    sa3_o_to_dst<<<(elems + 255) / 256, 256, 0, stream>>>(scratch.get(), dst->data, l, lr, dst->type == GGML_TYPE_F32);
-    CUDA_CHECK(cudaGetLastError());
+        sa3_o_to_dst<<<(elems + 255) / 256, 256, 0, stream>>>(scratch.get(), dst->data, l, lr, head_group, head_start, total_h, dst->type == GGML_TYPE_F32);
+        CUDA_CHECK(cudaGetLastError());
+    }
     if (timing) {
         CUDA_CHECK(cudaEventRecord(timing_end, stream));
         CUDA_CHECK(cudaEventSynchronize(timing_end));
@@ -364,6 +375,6 @@ bool ggml_cuda_flash_attn_ext_sa3(ggml_backend_cuda_context & ctx, ggml_tensor *
         fprintf(stderr, "[sa3-timing] L=%d total=%.3fms prep=%.3fms mha+out=%.3fms\n", l, total_ms, prep_ms, total_ms - prep_ms);
     }
     static int calls = 0;
-    if (calls++ < 4) fprintf(stderr, "[sa3] dispatch B=1 H=32 L=%d D=128 Q=%s delta=%s\n", l, q->type == GGML_TYPE_F32 ? "f32" : "f16", delta_f16 ? "f16" : "f32");
+    if (calls++ < 4) fprintf(stderr, "[sa3] dispatch B=1 H=32 group=%d L=%d D=128 Q=%s delta=%s\n", head_group, l, q->type == GGML_TYPE_F32 ? "f32" : "f16", delta_f16 ? "f16" : "f32");
     return true;
 }
