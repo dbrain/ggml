@@ -4576,6 +4576,37 @@ struct ggml_tensor * ggml_rope_pe_ni(
     return ggml_rope_pe_impl(ctx, a, pe, 0);
 }
 
+struct ggml_tensor * ggml_rope_pe_compact(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * basis,
+        struct ggml_tensor  * token_axis_index,
+        bool                  interleaved) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
+    GGML_ASSERT(basis->type == GGML_TYPE_F32);
+    GGML_ASSERT(token_axis_index->type == GGML_TYPE_I32);
+    GGML_ASSERT(a->ne[0] % 2 == 0);
+    GGML_ASSERT(basis->ne[0] == 2 && basis->ne[1] == 2);
+    GGML_ASSERT(token_axis_index->ne[0] == 3);
+    GGML_ASSERT(a->ne[2] % token_axis_index->ne[1] == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, a->type, a->ne[0], a->ne[2], a->ne[1] * a->ne[3]);
+    ggml_set_op_params_i32(result, 0, interleaved ? 1 : 0);
+    result->op     = GGML_OP_ROPE_PE;
+    result->src[0] = a;
+    result->src[1] = basis;
+    result->src[2] = token_axis_index;
+    return result;
+}
+
+struct ggml_tensor * ggml_rope_pe_ni_compact(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * basis,
+        struct ggml_tensor  * token_axis_index) {
+    return ggml_rope_pe_compact(ctx, a, basis, token_axis_index, false);
+}
+
 // ggml_rms_modulate — longcat-avatar fused AdaLN (comfy adaln.cu equivalent).
 // out = rms_norm(x) * (1 + scale) + shift, normalized over x->ne[0]. CUDA-only.
 // x is F16 or F32; scale/shift broadcast over x and MAY be a different type than x

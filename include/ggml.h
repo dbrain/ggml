@@ -1890,6 +1890,22 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * pe);
 
+    // Compact RoPE for LTX video. `basis` holds exact precomputed rotations
+    // indexed by (axis-coordinate, full-model pair); `token_axis_index` is I32
+    // [3, video_tokens]. This avoids materialising the same rotations for every
+    // token/head while preserving the arithmetic of ggml_rope_pe_ni.
+    GGML_API struct ggml_tensor * ggml_rope_pe_compact(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * basis,
+            struct ggml_tensor  * token_axis_index,
+            bool                  interleaved);
+    GGML_API struct ggml_tensor * ggml_rope_pe_ni_compact(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * basis,
+            struct ggml_tensor  * token_axis_index);
+
     // longcat-avatar: fused AdaLN (comfy adaln.cu equivalent). Computes, in ONE CUDA op:
     //     out = rms_norm(x) * (1 + scale) + shift
     // where rms_norm normalizes over x->ne[0] (the channel/hidden dim) with the given eps.

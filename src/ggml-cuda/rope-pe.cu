@@ -101,9 +101,58 @@ static __global__ void rope_pe_f32(
     rp_st(dst, d_base + (d_o - d_e), __fadd_rn(pe_o, po_o));  // x_e*sin + x_o*cos
 }
 
+template <bool INTERLEAVED, typename T>
+static __global__ void rope_pe_compact_f32(
+        const T * __restrict__ a, const float * __restrict__ basis,
+        const int32_t * __restrict__ token_axis_index, T * __restrict__ dst,
+        const int64_t d_head, const int64_t n_head, const int64_t L, const int64_t N,
+        const int64_t full_half,
+        const int64_t a_s0, const int64_t a_s1, const int64_t a_s2, const int64_t a_s3) {
+    const int64_t half = d_head / 2;
+    const int64_t npair = half * L * n_head * N;
+    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= npair) return;
+    const int64_t j = idx % half;
+    const int64_t t = (idx / half) % L;
+    const int64_t h = idx / (half * L);
+    const int64_t head = h % n_head;
+    const int64_t n = h / n_head;
+    // LTX folds [head, token] into this op's L dimension. The original head is
+    // the low component and the original token is the high component.
+    const int64_t rope_heads = full_half / half;
+    const int64_t rope_head = t % rope_heads;
+    const int64_t token = t / rope_heads;
+    const int64_t global_pair = rope_head * half + j;
+    // The legacy frequency grid begins with `pad` zero-frequency pairs when
+    // full_half is not divisible by the three video axes (4096-wide LTX has
+    // pad=2). They are identity rotations; the T/H/W cycle begins after them.
+    const int64_t pad = full_half % 3;
+    float c = 1.f, s = 0.f;
+    if (global_pair >= pad) {
+        const int axis = (int) ((global_pair - pad) % 3);
+        const int32_t entry = token_axis_index[axis + 3 * token];
+        // basis has ggml shape [2, 2, full_half, entries], so each entry
+        // occupies 4 * full_half F32 values (not 2 * full_half).
+        const int64_t basis_base = 4 * global_pair + 4 * full_half * (int64_t) entry;
+        c = basis[basis_base];
+        s = basis[basis_base + 2];
+    }
+    const int64_t d_e = INTERLEAVED ? 2 * j : j;
+    const int64_t d_o = INTERLEAVED ? 2 * j + 1 : j + half;
+    const int64_t a_base = d_e * a_s0 + head * a_s1 + t * a_s2 + n * a_s3;
+    const float x_e = rp_ld(a, a_base);
+    const float x_o = rp_ld(a, a_base + (d_o - d_e) * a_s0);
+    const int64_t d_base = d_e + d_head * t + d_head * L * h;
+    const float pe_e = __fmul_rn(x_e, c), po_e = __fmul_rn(x_o, s);
+    rp_st(dst, d_base, __fsub_rn(pe_e, po_e));
+    const float pe_o = __fmul_rn(x_e, s), po_o = __fmul_rn(x_o, c);
+    rp_st(dst, d_base + (d_o - d_e), __fadd_rn(pe_o, po_o));
+}
+
 void ggml_cuda_op_rope_pe(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * a  = dst->src[0];
     const ggml_tensor * pe = dst->src[1];
+    const ggml_tensor * compact_index = dst->src[2];
 
     // a/dst may be F32 (prod default) or F16 (the *_DIT_F16 residual stream keeps
     // q/k F16 through RoPE so the two full-size F32 rope tensors leave the compute
@@ -138,6 +187,20 @@ void ggml_cuda_op_rope_pe(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     // op_params[0]: 1 = interleaved (GPT-J), 0 = non-interleaved (NeoX, LTX video).
     const int interleaved = ((const int32_t *) dst->op_params)[0];
+    if (compact_index != nullptr) {
+        GGML_ASSERT(compact_index->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_is_contiguous(compact_index));
+        const int64_t full_half = pe->ne[2];
+        const int32_t * index_d = (const int32_t *) compact_index->data;
+        if (a->type == GGML_TYPE_F16) {
+            if (interleaved) rope_pe_compact_f32<true, __half><<<grid, block, 0, stream>>>((const __half *) a->data, pe_d, index_d, (__half *) dst->data, d_head, n_head, L, N, full_half, a_s0, a_s1, a_s2, a_s3);
+            else             rope_pe_compact_f32<false, __half><<<grid, block, 0, stream>>>((const __half *) a->data, pe_d, index_d, (__half *) dst->data, d_head, n_head, L, N, full_half, a_s0, a_s1, a_s2, a_s3);
+        } else {
+            if (interleaved) rope_pe_compact_f32<true, float><<<grid, block, 0, stream>>>((const float *) a->data, pe_d, index_d, (float *) dst->data, d_head, n_head, L, N, full_half, a_s0, a_s1, a_s2, a_s3);
+            else             rope_pe_compact_f32<false, float><<<grid, block, 0, stream>>>((const float *) a->data, pe_d, index_d, (float *) dst->data, d_head, n_head, L, N, full_half, a_s0, a_s1, a_s2, a_s3);
+        }
+        return;
+    }
     if (a->type == GGML_TYPE_F16) {
         const __half * a_d = (const __half *) a->data;
         __half     * d_d = (__half *) dst->data;

@@ -6018,9 +6018,12 @@ static void ggml_compute_forward_rope_pe_t(
 
     const ggml_tensor * a  = dst->src[0];
     const ggml_tensor * pe = dst->src[1];
+    const ggml_tensor * compact_index = dst->src[2];
 
     GGML_ASSERT(pe->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(pe));
+    GGML_ASSERT(compact_index == nullptr ||
+                (compact_index->type == GGML_TYPE_I32 && compact_index->ne[0] == 3 && ggml_is_contiguous(compact_index)));
     GGML_ASSERT(ggml_is_contiguous(dst));
 
     const int64_t d_head = a->ne[0];
@@ -6041,6 +6044,7 @@ static void ggml_compute_forward_rope_pe_t(
 
     const T     * a_data  = (const T *)     a->data;
     const float * pe_data = (const float *) pe->data;
+    const int32_t * index_data = compact_index != nullptr ? (const int32_t *) compact_index->data : nullptr;
     T           * dst_data = (T *)          dst->data;
 
     const int ith = params->ith;
@@ -6058,9 +6062,26 @@ static void ggml_compute_forward_rope_pe_t(
                 const float x_e = type_conversion_table<T>::to_f32(a_data[a_base]);
                 const float x_o = type_conversion_table<T>::to_f32(a_data[a_base + (d_o - d_e) * a_s0]);
 
-                const int64_t pe_base = 4 * j + (int64_t) 2 * d_head * t;
-                const float c = pe_data[pe_base];
-                const float s = pe_data[pe_base + 2];
+                int64_t pe_base = 4 * j + (int64_t) 2 * d_head * t;
+                float c = pe_data[pe_base];
+                float s = pe_data[pe_base + 2];
+                if (compact_index != nullptr) {
+                    const int64_t rope_heads = pe->ne[2] / half;
+                    const int64_t token = t / rope_heads;
+                    const int64_t global_pair = (t % rope_heads) * half + j;
+                    const int64_t pad = pe->ne[2] % 3;
+                    if (global_pair < pad) {
+                        c = 1.f;
+                        s = 0.f;
+                    } else {
+                        const int axis = (int) ((global_pair - pad) % 3);
+                        const int32_t entry = index_data[axis + 3 * token];
+                        // basis shape is [2, 2, full_half, entries].
+                        pe_base = 4 * global_pair + (int64_t) 4 * pe->ne[2] * entry;
+                        c = pe_data[pe_base];
+                        s = pe_data[pe_base + 2];
+                    }
+                }
 
                 const int64_t d_base = d_e + d_head * t + d_head * L * h;
                 dst_data[d_base]               = type_conversion_table<T>::from_f32(x_e * c - x_o * s);
