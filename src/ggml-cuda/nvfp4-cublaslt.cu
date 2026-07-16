@@ -409,6 +409,18 @@ extern "C" void ggml_cuda_nvfp4_register_weight_global(const char * name, float 
     g_wglobal[name] = g;
 }
 
+// Drop every registered weight global. Required before re-registering for a hot-swapped
+// DiT variant (sd_ctx_swap_diffusion_model): this map is process-global, so swapping an
+// UNFOLDED gguf out for a FOLDED one must not leave the outgoing model's globals behind —
+// a folded gguf already folds its global into the block scale, so a stale entry would
+// scale it a second time. Safe as a blanket clear because the swap path is single-DiT:
+// only the img_gen variant swap calls it, and no server route combines swapping with the
+// MoE high-noise leg (which registers under its own prefix at load).
+extern "C" void ggml_cuda_nvfp4_clear_weight_globals(void) {
+    std::lock_guard<std::mutex> lk(g_wglobal_mtx);
+    g_wglobal.clear();
+}
+
 static float nvfp4_weight_global_for(const char * name) {
     if (!name || !*name) return 1.0f;
     std::lock_guard<std::mutex> lk(g_wglobal_mtx);

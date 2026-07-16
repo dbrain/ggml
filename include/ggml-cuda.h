@@ -117,6 +117,7 @@ GGML_BACKEND_API void ggml_backend_cuda_release_cudnn_conv3d_weights(void);
 // multiplier of 1.0 (legacy FOLDED gguf path stays byte-identical). No-op on
 // non-CUDA / non-FP4 builds.
 GGML_BACKEND_API void ggml_cuda_nvfp4_register_weight_global(const char * name, float g);
+GGML_BACKEND_API void ggml_cuda_nvfp4_clear_weight_globals(void);
 
 // LongCat lap-31.2: CPU-precomputed per-(Q-tile, K-tile) all-deny bitmap for the
 // avatar's BSA self-attn. Set the device pointer + dimensions before issuing FA
