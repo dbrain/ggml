@@ -508,6 +508,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = !per_head_mask && Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
+    // PIXAL3D diag/override: the cc8.6 D=128 mma_f16 kernel NaNs on (nh=12, gqa=1, large n_q) shapes
+    // (Pixal3D slat DiT). The wmma/tile kernels reject only PER-HEAD masks; ours is ne[2]==1, so
+    // routing onto them is legal. Force-select via env to bisect / land a correct FA path.
+    if (!per_head_mask) {
+        if (getenv("PIXAL3D_FA_WMMA")) return BEST_FATTN_KERNEL_WMMA_F16;
+        if (getenv("PIXAL3D_FA_TILE")) return BEST_FATTN_KERNEL_TILE;
+        if (getenv("PIXAL3D_FA_VEC") && can_use_vector_kernel) return BEST_FATTN_KERNEL_VEC;
+    }
+
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {
