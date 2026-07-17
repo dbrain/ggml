@@ -708,11 +708,24 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
     sdpa_key key{N, H, Lq_plan, Lkv_plan, D, io_half, use_mask ? 1 : 0};
     cudnn_sdpa_plan & plan = get_or_build_plan(handle, key, scale);
 
+    // GGML_CUDNN_ZERO_WS: the SDPA workspace comes from the ggml pool, which RECYCLES memory and
+    // does not zero it — so cuDNN is handed whatever the previous tenant of that LIFO offset left
+    // behind (the q/k/v pad buffers below are memset; this was missed). Immediately upstream of
+    // every SDPA sit the attn to_q/k/v Linears, and when those run FP8 they alloc+free a 32MB
+    // cuBLASLt ws + an ~N*K weight buffer PER CALL — so FP8 dictates these bytes. Candidate cause
+    // of: FP8 on attention Linears => nondeterministic, FP8 on FFN Linears => deterministic.
+    // NB GGML_CUDNN_DETERMINISTIC does NOT cover this — it deselects nondeterministic ENGINES,
+    // which is a different bug behind the same name. See LTX-DETERMINISM-TRACKER.md.
     ggml_cuda_pool_alloc<uint8_t> ws(ctx.pool());
     void * ws_ptr = nullptr;
     if (plan.workspace > 0) {
         ws.alloc((size_t) plan.workspace);
         ws_ptr = ws.get();
+        static int s_zero_ws = -1;
+        if (s_zero_ws < 0) { const char * e = getenv("GGML_CUDNN_ZERO_WS"); s_zero_ws = (e && atoi(e)) ? 1 : 0; }
+        if (s_zero_ws) {
+            CUDA_CHECK(cudaMemsetAsync(ws_ptr, 0, (size_t) plan.workspace, stream));
+        }
     }
 
     ggml_cuda_pool_alloc<half>        q_pad_h(ctx.pool());

@@ -1122,15 +1122,28 @@ static bool ggml_cuda_f8_zero_scratch_enabled() {
     return v == 1;
 }
 
-// GGML_F8_CLAMP_OUT: keep the F16 residual stream (no VRAM doubling) but eliminate the
-// F16-output-store overflow. The cuBLASLt FP8 GEMM already accumulates in F32; a deep-block
-// result > 65504 (F16 max) becomes +-inf when stored straight to the F16 dst -> NaN cascade
-// (the fp8-model white). With this on, the GEMM writes an F32 pool temp (one layer's output,
-// ~no VRAM cost) and a tiny kernel clamps to +-65504 while converting F32->F16 into dst.
-// Clamp is IDENTITY for in-range values; only the overflowing outliers are capped. Off by default.
+// Keep the F16 residual stream (no VRAM doubling) but eliminate the F16-output-store overflow.
+// The cuBLASLt FP8 GEMM accumulates in F32; a deep-block result > 65504 (F16 max) becomes +-inf
+// when stored straight to the F16 dst -> NaN cascade (the fp8-model white). So the GEMM writes an
+// F32 pool temp (one layer's output, ~no VRAM cost) and a tiny kernel clamps to +-65504 while
+// converting F32->F16 into dst.
+//
+// DEFAULT ON since 2026-07-17 — this is a CORRECTNESS fix, not a tunable:
+//  - It is the IDENTITY for in-range values. Both paths round the same F32 to F16 with
+//    round-to-nearest, so they are bit-identical unless |x| > 65504. Nothing to opt into.
+//  - MEASURED FREE: prod generate_video 37.43s on / 37.31s off (noise); 237s vs 231s prod-path.
+//  - It was previously gated on `w_is_e4m3`, i.e. on the native-F8_E4M3 weight path, which is
+//    never used — so the guard was DEAD while GGML_FP8_FFN (NVFP4 weights requantized to e4m3,
+//    the path that actually runs) overflowed unprotected. That cost a year of "LTX is
+//    nondeterministic": the +-inf reached RoPE on q/k only (ltxv.hpp:771-773 casts F16->F32 for
+//    rope; v skips it) -> inf*cos - inf*sin = NaN -> softmax's row-max is over QK^T and a
+//    comparison-max with NaN is ORDER-DEPENDENT -> nondeterministic. MEASURED: prod is
+//    bit-identical over n=5 with this on, and diverges 5/5 with it off.
+// Escape hatch GGML_F8_NO_CLAMP_OUT=1 to A/B the old (overflowing) behaviour.
+// See kobbler/LTX-DETERMINISM-TRACKER.md.
 static bool ggml_cuda_f8_clamp_out_enabled() {
     static int v = -1;
-    if (v < 0) { const char * e = getenv("GGML_F8_CLAMP_OUT"); v = (e && atoi(e)) ? 1 : 0; }
+    if (v < 0) { const char * e = getenv("GGML_F8_NO_CLAMP_OUT"); v = (e && atoi(e)) ? 0 : 1; }
     return v == 1;
 }
 
@@ -1325,7 +1338,10 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     // GGML_F8_DBG entry trace: every e4m3 GEMM that ENTERS this fn, with the exact operands the
     // guards below test. Cross-ref against [F8_LOUD] (which only prints post-matmul): a name here
     // but NOT in F8_LOUD => it bailed to the fallback path. Shapes/contig/bias reveal which guard.
-    if (w_is_e4m3 && getenv("GGML_F8_DBG")) {
+    // NB no `w_is_e4m3 &&` here: that gated the FP8 debugger to the native-e4m3 weight path, which
+    // is never used — so GGML_F8_DBG printed NOTHING for GGML_FP8_FFN, the path that actually runs.
+    // The clamp bug below was un-guarded AND un-debuggable for the same reason.
+    if (getenv("GGML_F8_DBG")) {
         static std::atomic<int> s_ent{0}; int e = s_ent.fetch_add(1);
         if (e < 20) fprintf(stderr,
             "[F8_ENTER] #%d %s  s0[%ld,%ld,%ld,%ld] s1[%ld,%ld,%ld,%ld] s1_t=%d dst_t=%d bias=%d contig(s0=%d s1=%d d=%d)\n",
@@ -1691,7 +1707,13 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     // GGML_F8_CLAMP_OUT (native e4m3, plain F16 dst): accumulate into an F32 pool temp, then
     // clamp+downconvert to the F16 dst below — prevents the F16-store overflow -> inf without
     // widening the residual stream. Bias-epilogue GEMMs (never taken for e4m3) keep F16 store.
-    const bool use_f32_temp = ggml_cuda_f8_clamp_out_enabled() && w_is_e4m3 &&
+    // NB the `w_is_e4m3` gate that used to be here made this guard STRUCTURALLY DEAD for the
+    // GGML_FP8_FFN path (which has src0->type == NVFP4 => w_is_e4m3 == false) — i.e. dead for the
+    // exact path that stores an F16 dst from an FP8 GEMM, which is what the guard is FOR.
+    // MEASURED 2026-07-17: FP8 on the RoPE'd Linears (attn to_q/to_k) => nondeterministic; FP8 on
+    // to_v/to_out/ff.net => deterministic. Only q/k are cast F16->F32 and fed to RoPE
+    // (ltxv.hpp:771-773), where an F16 +-inf becomes inf-inf = NaN. Env-gated (default off).
+    const bool use_f32_temp = ggml_cuda_f8_clamp_out_enabled() &&
                               dst->type == GGML_TYPE_F16 && !want_epi;
     ggml_cuda_pool_alloc<float> d_f32(ctx.pool());
     void * gemm_out = dst->data;
@@ -1818,7 +1840,10 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     }
     // GGML_F8_DBG: per-GEMM matmul outcome — pins whether a bailed GEMM lost the algo
     // (have_algo=0) or the matmul returned non-success (ms!=0). w_global==1.0 => wglobal miss.
-    if (w_is_e4m3 && getenv("GGML_F8_DBG")) {
+    // NB no `w_is_e4m3 &&` here: that gated the FP8 debugger to the native-e4m3 weight path, which
+    // is never used — so GGML_F8_DBG printed NOTHING for GGML_FP8_FFN, the path that actually runs.
+    // The clamp bug below was un-guarded AND un-debuggable for the same reason.
+    if (getenv("GGML_F8_DBG")) {
         static std::atomic<int> s_ms{0}; int mi = s_ms.fetch_add(1);
         if (mi < 20) fprintf(stderr, "[F8_MM] #%d %s  ms=%d ok=%d  wsAlign256=%d wsAlign16=%d W16=%d A16=%d  m=%d n=%d k=%d\n",
             mi, src0->name?src0->name:"?", (int)ms, (int)ok,
@@ -1839,7 +1864,7 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     // (should be amax_act/448, STANDARD e4m3 — NOT the two-level amax/2688) and the output
     // magnitude max|D|. max|D| ~ O(1-10) => GEMM is fine, white is DOWNSTREAM; max|D| huge
     // (1e3+) => an operand-scale bug. Reuses fp8_a_amax_kernel for a device-side max-abs.
-    if (ok && w_is_e4m3) {
+    if (ok) {   // (was `ok && w_is_e4m3` — dead for the live GGML_FP8_FFN path; see F8_ENTER above)
         static int s_f8dbg2 = -1;
         if (s_f8dbg2 < 0) { const char * e = getenv("GGML_F8_DBG"); s_f8dbg2 = (e && atoi(e)) ? 1 : 0; }
         if (s_f8dbg2) {
