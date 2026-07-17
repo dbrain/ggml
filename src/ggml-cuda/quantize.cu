@@ -9,6 +9,15 @@ static __global__ void quantize_q8_1(
     ggml_cuda_pdl_lc();
     const int64_t i0 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
 
+    // LOAD-BEARING PAIR with `GGML_ASSERT(ne0 % QK8_1 == 0)` in quantize_row_q8_1_cuda() below.
+    // This early return looks like it can split a warp ahead of the warp_reduce_*<QK8_1> calls
+    // (which use a full 0xffffffff mask and need all 32 lanes) — it cannot, and only because of
+    // that host-side assert. QK8_1 == WARP_SIZE == 32 and CUDA_QUANTIZE_BLOCK_SIZE (256) is a
+    // multiple of 32, so each warp spans 32 consecutive i0; ne0 % 32 == 0 then puts the
+    // `i0 >= ne0` boundary exactly on a warp boundary => a warp returns all-or-nothing.
+    // Weaken the assert (e.g. to allow a ragged ne0) and a straddling warp hangs/UBs HERE, far
+    // from the assert. Lanes past the real row length are handled by the `i0 < ne00` guard on
+    // the load below: they contribute 0.0f and still take part in the reduction.
     if (i0 >= ne0) {
         return;
     }
@@ -34,6 +43,8 @@ static __global__ void quantize_q8_1(
     float amax = fabsf(xi);
     float sum = xi;
 
+    // Full-warp (0xffffffff) shuffles: all 32 lanes must reach these. Guaranteed by the
+    // warp-aligned early return above + the host-side `ne0 % QK8_1 == 0` assert. See note above.
     amax = warp_reduce_max<QK8_1>(amax);
     sum  = warp_reduce_sum<QK8_1>(sum);
 
@@ -375,6 +386,12 @@ void quantize_row_q8_1_cuda(
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     GGML_ASSERT(!ids);
+    // LOAD-BEARING, not a sanity check: this is the only thing keeping quantize_q8_1's
+    // `if (i0 >= ne0) return;` from splitting a warp before its warp_reduce_max/sum<QK8_1>,
+    // which shuffle with a full 0xffffffff mask (all 32 lanes must participate). QK8_1 ==
+    // WARP_SIZE == 32, so ne0 % QK8_1 == 0 <=> the early-return boundary is warp-aligned.
+    // Relaxing this to support a ragged ne0 requires first reworking that kernel's reduction
+    // to a partial-warp mask. See the matching note in quantize_q8_1.
     GGML_ASSERT(ne0 % QK8_1 == 0);
 
     const uint3 ne2_fastdiv = init_fastdiv_values(ne2);

@@ -384,16 +384,6 @@ bool ggml_cuda_nvfp4_cublaslt_enabled() {
     return v == 1;
 }
 
-struct nvfp4_weight_repacked {
-    uint8_t * data   = nullptr;   // consecutive E2M1   (in-place: offset 0 of src0->data)
-    uint8_t * scales = nullptr;   // swizzled UE4M3      (in-place: offset data_bytes)
-    bool      in_place = false;   // true => data/scales alias the ggml-owned src0 buffer
-                                  //         (teardown must NOT cudaFree them)
-};
-
-static std::mutex                                   g_repack_mtx;
-static std::unordered_map<const void*, nvfp4_weight_repacked> g_repack_cache;
-
 // Per-tensor weight global (ModelOpt weight_scale_2), keyed by tensor NAME (not data
 // pointer: layer-offload twin-swaps src0->data per segment but preserves src0->name).
 // Folded into the GEMM alpha (alpha = A_global * W_global) so the stored per-block
@@ -428,88 +418,10 @@ static float nvfp4_weight_global_for(const char * name) {
     return it == g_wglobal.end() ? 1.0f : it->second;
 }
 
-// in-place repack default-ON; escape hatch GGML_NVFP4_CUBLASLT_INPLACE=0 forces the
-// old out-of-place (duplicate-buffer) path for debugging / fallback.
-static bool nvfp4_inplace_enabled() {
-    static int v = -1;
-    if (v < 0) { const char* e = getenv("GGML_NVFP4_CUBLASLT_INPLACE"); v = (e && atoi(e)==0) ? 0 : 1; }
-    return v == 1;
-}
-
 static thread_local cublasLtHandle_t g_lt = nullptr;
 static cublasLtHandle_t get_lt() {
     if (!g_lt) { if (cublasLtCreate(&g_lt) != CUBLAS_STATUS_SUCCESS) return nullptr; }
     return g_lt;
-}
-
-// per-tensor weight repack (cached). Returns false on failure.
-static bool get_repacked_weight(const ggml_tensor * src0, int N, int K, cudaStream_t stream,
-                                nvfp4_weight_repacked & out) {
-    const void * key = src0->data;
-    // Hold the lock across the whole (one-time, warmup) repack: the in-place path overwrites
-    // src0->data, so two threads repacking the SAME key concurrently would corrupt each other.
-    // Cached entries (the hot per-step path) return early in the caller-visible fast path below.
-    std::lock_guard<std::mutex> lk(g_repack_mtx);
-    {
-        auto it = g_repack_cache.find(key);
-        if (it != g_repack_cache.end()) { out = it->second; return true; }
-    }
-    const int nsub = K/16;
-    const size_t data_bytes  = (size_t)N*(K/2);
-    const size_t rb_p = ((size_t)(N+127)/128)*128;
-    const size_t cb_p = ((size_t)(nsub+3)/4)*4;
-    const size_t scale_bytes = rb_p*cb_p;
-    const size_t repack_bytes = data_bytes + scale_bytes;
-
-    // The DiT runs 100% on cuBLASLt (no MMQ fallback), so once a weight is repacked its
-    // original block_nvfp4 layout is never read again -> the repacked bytes can live in the
-    // ggml-owned buffer, eliminating the duplicate. Repack is a re-layout of the SAME values,
-    // so data+scales should fit in ggml_nbytes(src0); VERIFY at runtime per-weight.
-    const size_t orig_bytes = ggml_nbytes(src0);
-    const bool   fits = (repack_bytes <= orig_bytes);
-    const bool   want_inplace = nvfp4_inplace_enabled() && fits;
-
-    nvfp4_weight_repacked rp;
-    const int threads = 256;
-    const int total   = N*nsub;
-
-    if (want_inplace) {
-        // read-after-write hazard (repack permutes both nibbles & scales) forces a transient
-        // scratch: original -> scratch, then scratch -> src0->data in-place. The scratch is
-        // freed immediately (never accumulates), so net VRAM cost over baseline is ~0.
-        uint8_t * scratch = nullptr;
-        if (cudaMalloc(&scratch, repack_bytes) != cudaSuccess) return false; // OOM: caller falls back
-        uint8_t * s_data   = scratch;
-        uint8_t * s_scales = scratch + data_bytes;
-        cudaMemsetAsync(s_scales, 0, scale_bytes, stream);
-        repack_weight_kernel<<<(total+threads-1)/threads, threads, 0, stream>>>(
-            (const block_nvfp4*)src0->data, s_data, s_scales, N, K);
-        if (cudaPeekAtLastError() != cudaSuccess) { cudaFree(scratch); return false; }
-        // copy repacked bytes back into the ORIGINAL ggml buffer (data@0, scales@data_bytes).
-        cudaMemcpyAsync(src0->data, scratch, repack_bytes, cudaMemcpyDeviceToDevice, stream);
-        cudaStreamSynchronize(stream);   // must finish before scratch is freed
-        cudaFree(scratch);
-        rp.data     = (uint8_t*)src0->data;
-        rp.scales   = (uint8_t*)src0->data + data_bytes;
-        rp.in_place = true;
-    } else {
-        // out-of-place fallback (env-forced, or repack doesn't fit the original buffer):
-        // hold a duplicate persistent buffer for this weight.
-        if (cudaMalloc(&rp.data, data_bytes)   != cudaSuccess) return false;
-        if (cudaMalloc(&rp.scales, scale_bytes)!= cudaSuccess) { cudaFree(rp.data); return false; }
-        cudaMemsetAsync(rp.scales, 0, scale_bytes, stream);
-        repack_weight_kernel<<<(total+threads-1)/threads, threads, 0, stream>>>(
-            (const block_nvfp4*)src0->data, rp.data, rp.scales, N, K);
-        if (cudaPeekAtLastError() != cudaSuccess) { cudaFree(rp.data); cudaFree(rp.scales); return false; }
-        cudaStreamSynchronize(stream);
-        rp.in_place = false;
-        if (getenv("GGML_NVFP4_CUBLASLT_TRACE"))
-            fprintf(stderr, "[NVFP4_CUBLASLT] out-of-place weight N=%d K=%d (repack %zu > orig %zu, "
-                            "or inplace disabled)\n", N, K, repack_bytes, orig_bytes);
-    }
-    g_repack_cache[key] = rp;   // lock held for the whole function (see top)
-    out = rp;
-    return true;
 }
 
 bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
@@ -1713,6 +1625,16 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     // MEASURED 2026-07-17: FP8 on the RoPE'd Linears (attn to_q/to_k) => nondeterministic; FP8 on
     // to_v/to_out/ff.net => deterministic. Only q/k are cast F16->F32 and fed to RoPE
     // (ltxv.hpp:771-773), where an F16 +-inf becomes inf-inf = NaN. Env-gated (default off).
+    // 🔴 `!want_epi` RE-ARMS THE OVERFLOW BUG when GGML_FP8_GEMM_EPILOGUE=1 (default OFF).
+    // The epilogue matcher (ggml-cuda.cu:4265-4270) fires on `w->type == NVFP4 &&
+    // fp8_ffn_enabled() && name_match && blackwell && node->type == F16` — i.e. EXACTLY the live
+    // config that overflowed. So flipping that perf knob silently disables the clamp and brings
+    // back the nondeterminism (inf -> RoPE -> NaN -> order-dependent softmax max).
+    // It is excluded here because cuBLASLt's bias epilogue adds bias INSIDE the GEMM before the
+    // store, so a post-hoc clamp is not a drop-in. The real fix is to give the epilogue path an
+    // F32 out_dt + F32 bias and clamp on the downconvert (needs the bias-dtype branch below
+    // reworked) — until then, DO NOT enable GGML_FP8_GEMM_EPILOGUE with an F16 dst.
+    // See kobbler/LTX-DETERMINISM-TRACKER.md.
     const bool use_f32_temp = ggml_cuda_f8_clamp_out_enabled() &&
                               dst->type == GGML_TYPE_F16 && !want_epi;
     ggml_cuda_pool_alloc<float> d_f32(ctx.pool());

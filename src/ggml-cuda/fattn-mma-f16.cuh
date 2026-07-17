@@ -1842,6 +1842,29 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 }
             }
         }
+        // Trailing barrier for the k00 loop. NOT merely an np>1 optimization — read before editing.
+        //
+        // The loop body writes tile_Q (above), __syncthreads()es, then reads tile_Q here; a warp
+        // reads columns other warps wrote, so without a barrier at the END of the body the NEXT
+        // iteration's writes can clobber this iteration's reads (cross-warp WAR). When np > 1 the
+        // barrier below closes that. When np == 1 it is skipped, so np == 1 is only safe if the
+        // loop never takes a second iteration, i.e. nbatch_combine == DV/2.
+        //
+        // That invariant (np > 1 || nbatch_combine == DV/2) holds for EVERY entry of the ampere
+        // config table, but it holds by accident, not by construction — every np==1 ampere entry
+        // (e.g. 128/128/ncols=64, the LongCat hot shape) just happens to set nbatch_combine==DV/2.
+        // The turing table VIOLATES it: (DKQ=256, DV=256, ncols=64) has nbatch_combine=64 vs
+        // DV/2=128 (two iterations) with np = nwarps*cols_per_warp/ncols = 4*16/64 = 1, so this
+        // kernel is racy on sm75. Moot in practice (no sm75 hardware here), which is why it stays.
+        //
+        // This deliberately is NOT a static_assert: the device config is chosen at COMPILE time
+        // (#if AMPERE_MMA_AVAILABLE / #elif TURING_MMA_AVAILABLE), 75-virtual is in the default
+        // CMAKE_CUDA_ARCHITECTURES, and DKQ=DV=256 with ncols1*ncols2==64 IS instantiated — so
+        // asserting the invariant would hard-fail the compute_75 pass rather than document it.
+        //
+        // If you add/retune a config entry: an np==1 entry with nbatch_combine != DV/2 is a silent
+        // data race here, NOT a perf knob. Do not "simplify" this to an unconditional
+        // __syncthreads() either — that costs a barrier per iteration on the hot np==1 path.
         if (np > 1) {
             __syncthreads();
         }
