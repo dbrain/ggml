@@ -368,7 +368,13 @@ static __global__ void __launch_bounds__(FP8_ATTN_NW * 32, (BC <= 32 ? 3 : 2)) f
     }
 
     // Finalize O /= rowsum (=2 also rescales by sV/448) and scatter to dst (BSHD).
-    const float o_scale = FP8_PV ? (sV[head_idx] * (1.0f / 448.0f)) : 1.0f;
+    // sV is only WRITTEN on the full_fp8 path but is passed in on both, so the load must never be
+    // emitted when !FP8_PV. `if constexpr` guarantees that; a plain `?:` only got away with it
+    // because the untaken operand is unevaluated.
+    float o_scale = 1.0f;
+    if constexpr (FP8_PV) {
+        o_scale = sV[head_idx] * (1.0f / 448.0f);
+    }
     float inv_l[2];
     inv_l[0] = (l_run[0] > 0.0f) ? o_scale / l_run[0] : 0.0f;
     inv_l[1] = (l_run[1] > 0.0f) ? o_scale / l_run[1] : 0.0f;

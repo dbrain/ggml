@@ -707,7 +707,7 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     // FOLDED gguf registers nothing -> w_global=1.0 -> byte-identical to before.
     const float w_global = nvfp4_weight_global_for(src0->name);
     float alpha_h = (a_per_tensor > 0.f ? a_per_tensor : 1.0f) * w_global;
-    static float beta_h = 0.0f;
+    const float beta_h = 0.0f;   // host pointer-mode scalar; was a shared mutable static
 
     cublasLtMatmulDesc_t op = nullptr;
     if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS) return false;
@@ -731,19 +731,32 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     cublasLtMatrixLayoutCreate(&Cd, out_dt, m, n, m);
     cublasLtMatrixLayoutCreate(&Dd, out_dt, m, n, m);
 
-    ggml_cuda_pool_alloc<uint8_t> ws(ctx.pool(), 32*1024*1024);
+    // cuBLASLt REQUIRES a 256-byte-aligned matmul workspace, but the ggml pool aligns to 128
+    // (ggml-cuda.cu `const size_t alignment = 128;`), so the pointer is 256-aligned only by the
+    // parity of preceding allocs. Misaligned -> cublasLtMatmul returns INVALID_VALUE(7) -> ok=false
+    // -> this function returns false -> ggml_cuda_mul_mat silently falls through to MMQ, dropping
+    // w_global (only applied here) => wrong output on an unfolded-import gguf, no error surfaced.
+    // Same fix as the FP8 path below. Over-allocate +256 and round up.
     size_t wsz = 32*1024*1024;
+    ggml_cuda_pool_alloc<uint8_t> ws(ctx.pool(), wsz + 256);
+    uint8_t * ws_ptr = (uint8_t *)(((uintptr_t)ws.get() + 255) & ~(uintptr_t)255);
 
     // Per-shape ALGO cache (thread_local; g_lt is thread_local and the offload path runs
-    // the GEMM on worker threads, so a per-thread cache needs no lock). The cuBLASLt
-    // heuristic query is the expensive, host-serializing part of each call AND the source
-    // of run-to-run non-determinism (it can return a different algo per call → two
-    // identical configs diverge). The selected algo is a pure function of the problem
-    // (m,n,k,out_dt) + layouts, so caching it and reusing with freshly-created (but
-    // identical) descriptors/layouts — the standard cuBLASLt reuse idiom — removes the
-    // query and pins one algo for determinism. Descriptors stay per-call (cheap; reusing
-    // the desc objects + re-setting scale pointers tripped an illegal access). Escape
-    // hatch GGML_NVFP4_CUBLASLT_NOCACHE forces a fresh heuristic every call.
+    // the GEMM on worker threads, so a per-thread cache needs no lock). This is a PERF
+    // optimization: the heuristic query is the expensive, host-serializing part of each
+    // call, and the selected algo is a pure function of (m,n,k,out_dt) + layouts + the
+    // fixed 32MB wsz, so caching it and reusing with freshly-created (but identical)
+    // descriptors/layouts — the standard cuBLASLt reuse idiom — removes the query.
+    // Descriptors stay per-call (cheap; reusing the desc objects + re-setting scale
+    // pointers tripped an illegal access). Escape hatch GGML_NVFP4_CUBLASLT_NOCACHE
+    // forces a fresh heuristic every call.
+    //
+    // NB this cache buys NO determinism (an earlier comment here claimed it did): pinning
+    // WHICH algo runs cannot make a nondeterministic algo deterministic. It is moot anyway —
+    // MEASURED 2026-07-17 on sm120, this GEMM is bit-identical over 30 identical calls at
+    // every LTX shape (M=64..22000); the heuristic returns reduction scheme NONE or
+    // COMPUTE_TYPE, never INPLACE, and all four cuBLASLt schemes are documented
+    // order-deterministic. The LTX determinism bug is NOT here — see LTX-DETERMINISM-TRACKER.md.
     static int s_nocache = -1;
     if (s_nocache < 0) { const char* e = getenv("GGML_NVFP4_CUBLASLT_NOCACHE"); s_nocache = (e && atoi(e)) ? 1 : 0; }
     static thread_local std::map<std::tuple<int,int,int,int>, cublasLtMatmulAlgo_t> g_algo_cache;
@@ -772,7 +785,7 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     if (ok) {
         cublasStatus_t ms = cublasLtMatmul(lt, op, &alpha_h, w_data.get(), Ad, a_data.get(), Bd,
                                            &beta_h, dst->data, Cd, dst->data, Dd,
-                                           &algo, ws.get(), wsz, stream);
+                                           &algo, ws_ptr, wsz, stream);
         ok = (ms == CUBLAS_STATUS_SUCCESS);
     }
 
@@ -1636,6 +1649,29 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     //    Under GGML_F8_MXFP8, A/B carry per-32-block UE8M0 scales (VEC32) instead.
     const int m=N, n=M, k=K;
     float alpha_h = 1.0f; static float beta_h = 0.0f;
+
+    // GGML_FP8_TRACE: per-call dump of the two scalar scales feeding the GEMM. Both are pure
+    // functions of an amax (act: amax(src1)/448; weight: amax(dequant nvfp4 src0)/448), so diffing
+    // two same-seed runs localises WHERE nondeterminism enters:
+    //   w_scale differs -> the WEIGHT bytes read from src0->data are unstable (layer-offload
+    //                      twin-swaps src0->data per segment — see the note at the top of this file)
+    //   a_scale differs -> the ACTIVATION arriving here is already unstable (upstream)
+    //   both stable but latents differ -> the GEMM itself (contradicts fp8_determinism_probe.cu,
+    //                      which measured this GEMM bit-identical x30 at these shapes)
+    // Costs a sync per call — debug only.
+    static int s_fp8_trace = -1;
+    if (s_fp8_trace < 0) { const char * e = getenv("GGML_FP8_TRACE"); s_fp8_trace = (e && atoi(e)) ? 1 : 0; }
+    if (s_fp8_trace && !mxfp8 && a_scale_ptr && w_scale_ptr) {
+        float as_h = 0.f, ws_h = 0.f;
+        cudaMemcpyAsync(&as_h, a_scale_ptr, sizeof(float), cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(&ws_h, w_scale_ptr, sizeof(float), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        static std::atomic<int> s_tn{0};
+        unsigned int ab, wb; memcpy(&ab, &as_h, 4); memcpy(&wb, &ws_h, 4);
+        fprintf(stderr, "[FP8_TRACE] #%06d M=%-5d K=%-5d N=%-5d a_scale=%08x w_scale=%08x reused=%d %s\n",
+                s_tn.fetch_add(1), M, K, N, ab, wb, (int)act_reused,
+                src0->name ? src0->name : "(null)");
+    }
 
     cublasLtMatmulDesc_t op = nullptr;
     if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS) return false;

@@ -585,7 +585,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // FATTN_VEC_ON_BLACKWELL=1 for A/B. TODO: drop once fattn-vec is fully
     // __syncwarp-hardened.
     static const bool s_vec_on_blackwell = getenv("FATTN_VEC_ON_BLACKWELL") != nullptr;
-    const bool blackwell_no_vec = ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL && !s_vec_on_blackwell;
+    // Runtime capability (raw cc), not highest_compiled_arch: this gates a HARDWARE behaviour
+    // (sm120 lost implicit warp reconvergence), so a build whose arch list happens to omit 120
+    // must still take the safe path when running on Blackwell — same reasoning as :448-451.
+    const bool blackwell_no_vec = cc >= GGML_CUDA_CC_BLACKWELL && !s_vec_on_blackwell;
     const bool can_use_vector_kernel = !blackwell_no_vec && !per_head_mask && Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // If Turing tensor cores are available, use them:

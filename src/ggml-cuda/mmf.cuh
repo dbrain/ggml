@@ -447,6 +447,10 @@ static __global__ void mul_mat_f_ids(
                     gather_tile(itB + 1, vals_buf[next_buf]);
                 }
 
+                // Same Blackwell (sm120+) hazard the A-tile above guards against: the warp no
+                // longer reconverges implicitly between these per-lane shared stores and the
+                // collective ldmatrix read, nor before tile_xy is reused by the next itB.
+                __syncwarp();
 #pragma unroll
                 for (int k0 = 0; k0 < warp_size; k0 += tile_B::J) {
                     tile_B B;
@@ -456,6 +460,7 @@ static __global__ void mul_mat_f_ids(
                         mma(C[itA][itB], A[itA][k0/tile_B::J], B);
                     }
                 }
+                __syncwarp();
 
                 if (itB + 1 < ntB) {
                     curr_buf ^= 1;

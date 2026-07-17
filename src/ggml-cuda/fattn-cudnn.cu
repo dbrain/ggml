@@ -90,6 +90,20 @@ static int64_t sdpa_ncu_hot_min_lq() {
     return min_lq;
 }
 
+// GGML_CUDNN_DETERMINISTIC: drop engine configs cuDNN flags NONDETERMINISTIC (split-k with
+// atomic accumulation => the same plan gives different bits per launch). Nothing else here
+// excludes them, so an identical-seed LTX render can diverge run-to-run. Off by default: it
+// can cost perf and may leave no plan for some shapes (check_support then fails -> we retry
+// without the filter). See LTX-DETERMINISM-TRACKER.md.
+static bool sdpa_deterministic() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * e = getenv("GGML_CUDNN_DETERMINISTIC");
+        enabled = e && atoi(e) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
 static bool sdpa_build_all_plans() {
     static int enabled = -1;
     if (enabled < 0) {
@@ -428,7 +442,21 @@ static cudnn_sdpa_plan & get_or_build_plan(cudnnHandle_t handle, const sdpa_key 
     if (sdpa_ws_cap() > 0) {
         graph->deselect_workspace_greater_than(sdpa_ws_cap());
     }
-    if (!graph->check_support(handle).is_good())                      { GGML_ABORT("cudnn sdpa check_support failed (no SDPA engine for this arch?)"); }
+    // Filter candidate engine configs before check_support picks one. deselect_numeric_notes
+    // filters graph.plans in place; if it empties the list check_support fails, and unlike the
+    // conv3d wrapper this path has no un-deselect retry -- so say which flag to drop.
+    const bool det = sdpa_deterministic();
+    if (det) {
+        graph->deselect_numeric_notes({fe::NumericalNote_t::NONDETERMINISTIC});
+    }
+    if (!graph->check_support(handle).is_good()) {
+        if (det) {
+            GGML_ABORT("cudnn sdpa check_support failed with GGML_CUDNN_DETERMINISTIC=1 "
+                       "(no deterministic SDPA engine for B=%lld H=%lld Lq=%lld Lkv=%lld D=%lld) -- unset it",
+                       (long long) B, (long long) H, (long long) Lq, (long long) Lkv, (long long) D);
+        }
+        GGML_ABORT("cudnn sdpa check_support failed (no SDPA engine for this arch?)");
+    }
     const int plan_index = sdpa_plan_index_for(key);
     const auto build_policy = sdpa_build_all_plans() || plan_index >= 0
         ? fe::BuildPlanPolicy_t::ALL
