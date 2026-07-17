@@ -104,6 +104,14 @@ GGML_BACKEND_API void ggml_backend_cuda_trim_pools(ggml_backend_t backend);
 // No-op on non-CUDA / non-cuDNN builds.
 GGML_BACKEND_API void ggml_backend_cuda_release_cudnn_plans(void);
 
+// Free the cuDNN conv2d reordered-weight buffers (raw cudaMalloc, keyed by weight ptr).
+// Twin of the conv3d call below; live whenever the cuDNN 2D-conv path is enabled
+// (GGML_CUDNN_CONV, or GGML_CUDNN_CONV3D with a conv2d-direct model). Call at a boundary
+// where the params were re-offloaded / freed, else the buffers leak and a recycled weight
+// address can stale-hit and return the WRONG reordered weights. Synchronizes first.
+// No-op on non-CUDA / non-cuDNN builds.
+GGML_BACKEND_API void ggml_backend_cuda_release_cudnn_conv2d_weights(void);
+
 // Free the cuDNN conv3d reordered-weight buffers (raw cudaMalloc, keyed by weight ptr).
 // Call at a segment boundary after VAE params are re-offloaded (their pointers are
 // invalidated) to reclaim the ~1.4 GB/segment continuation leak. Synchronizes first.

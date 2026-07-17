@@ -201,6 +201,20 @@ struct weight_buf {
 };
 static std::unordered_map<const void *, weight_buf> g_weight_cache;
 
+// Free the raw-cudaMalloc'd reordered conv-weight buffers and drop the cache. Mirrors
+// ggml_cuda_cudnn_conv3d_release_weights (see conv3d-cudnn.cu): g_weight_cache is keyed by
+// the weight DEVICE pointer, so any boundary that re-offloads / frees + reloads the VAE
+// params invalidates every key. The old buffers are then orphaned (nothing else frees them
+// — this TU has no other cudaFree) and, worse, a recycled address can produce a STALE HIT
+// that silently returns another tensor's reordered weights. Call at such a boundary right
+// after the params are released. Zero perf cost: the reorder is recomputed on next use.
+// Caller must ensure no conv2d op is in flight (the public wrapper syncs first).
+void ggml_cuda_cudnn_conv2d_release_weights() {
+    std::lock_guard<std::mutex> lk(g_conv_mtx);
+    for (auto & kv : g_weight_cache) cudaFree(kv.second.d);
+    g_weight_cache.clear();
+}
+
 static conv_plan build_conv_plan_once(cudnnHandle_t handle, const conv_key & k, bool apply_filter) {
     const int64_t N=k.N, C=k.C, H=k.H, W=k.W, Cout=k.Cout, R=k.KH, S=k.KW;
     const int64_t OH = (H + 2*k.PY - k.DY*(R-1) - 1)/k.SY + 1;
@@ -460,6 +474,7 @@ bool ggml_cuda_op_conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 bool ggml_cuda_conv2d_cudnn_available() { return false; }
 
 void ggml_cuda_cudnn_conv2d_release_handle() {}
+void ggml_cuda_cudnn_conv2d_release_weights() {}
 
 bool ggml_cuda_op_conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED(ctx);

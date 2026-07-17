@@ -6030,6 +6030,16 @@ void ggml_backend_cuda_release_cudnn_plans(void) {
     }
 }
 
+void ggml_backend_cuda_release_cudnn_conv2d_weights(void) {
+    // Twin of the conv3d call below, for the cuDNN 2D-conv weight-reorder cache (live
+    // whenever GGML_CUDNN_CONV is set, or GGML_CUDNN_CONV3D with a conv2d-direct model —
+    // e.g. the flux2 VAE). Same hazard: the cache is keyed by the weight device pointer,
+    // so once the params move the old buffers are orphaned and a recycled address can
+    // stale-hit. Sync so no queued conv2d op still references them, then free + clear.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    ggml_cuda_cudnn_conv2d_release_weights();
+}
+
 void ggml_backend_cuda_release_cudnn_conv3d_weights(void) {
     // Free the raw-cudaMalloc'd conv3d reorder-weight buffers that leak per segment when
     // LTXAV_VAE_LAZY re-offloads the VAE params (new device address -> orphaned buffers).

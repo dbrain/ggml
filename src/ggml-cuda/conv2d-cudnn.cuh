@@ -29,3 +29,11 @@ bool ggml_cuda_conv2d_cudnn_available();
 // Drop cached conv2d cuDNN frontend plans and destroy the thread-local handle.
 // Must be called from the CUDA worker thread that created the handle.
 void ggml_cuda_cudnn_conv2d_release_handle();
+
+// Free the raw-cudaMalloc'd reordered conv-weight buffers (g_weight_cache) and clear the
+// cache. Twin of ggml_cuda_cudnn_conv3d_release_weights. The cache is keyed by the weight
+// DEVICE pointer, so a boundary that re-offloads or frees+reloads the params invalidates
+// every key: the old buffers leak (nothing else frees them) and a recycled address can
+// stale-hit and return the WRONG weights. Call at such a boundary, with no conv2d op in
+// flight. No-op stub when built without GGML_CUDNN.
+void ggml_cuda_cudnn_conv2d_release_weights();
