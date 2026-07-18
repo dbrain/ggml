@@ -330,6 +330,12 @@ bool ggml_cuda_flash_attn_ext_sa3(ggml_backend_cuda_context & ctx, ggml_tensor *
 
         // Q is quantized, so its scratch storage can become centered K.
         sa3_center_k_pad<<<(elems_padded + 255) / 256, 256, 0, stream>>>(k_f16, k_mean.get(), scratch.get(), l, lr, head_group);
+        // The long-resolution delta GEMM can otherwise select an atomic
+        // reduction algorithm.  Those reductions are order-dependent on
+        // Blackwell, so exclude them for this reproducibility-critical path.
+        cublasAtomicsMode_t previous_atomics_mode;
+        CUBLAS_CHECK(cublasGetAtomicsMode(ctx.cublas_handle(), &previous_atomics_mode));
+        CUBLAS_CHECK(cublasSetAtomicsMode(ctx.cublas_handle(), CUBLAS_ATOMICS_NOT_ALLOWED));
         for (int head = 0; head < head_group; ++head) {
             const float one = 1.0f, zero = 0.0f;
             CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
@@ -341,6 +347,7 @@ bool ggml_cuda_flash_attn_ext_sa3(ggml_backend_cuda_context & ctx, ggml_tensor *
                           : static_cast<void *>(delta.get() + (size_t) head * blocks * lr),
                 delta_f16 ? CUDA_R_16F : CUDA_R_32F, lr, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         }
+        CUBLAS_CHECK(cublasSetAtomicsMode(ctx.cublas_handle(), previous_atomics_mode));
         check_stage("delta GEMM");
         sa3_quant_qk<true><<<dim3(blocks, 1, head_group), 1024, 0, stream>>>(scratch.get(), k4.get(), sfk.get(), lr, lr, false);
         check_stage("K FP4 quantization");
