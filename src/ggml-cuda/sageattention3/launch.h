@@ -85,7 +85,15 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr int ctaSize = Kernel_traits::kNWarps * 32;
     params.m_block_divmod = cutlass::FastDivmod(num_blocks_m);
     params.total_blocks = num_blocks_m * params.h * params.b;
-    dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, 170);
+    // SA3 upstream hard-coded 170 SMs (its development GPU).  The persistent
+    // scheduler uses this value to choose its resident worker grid; on a 5060
+    // Ti that grossly oversubscribes the scheduler and produces intermittent
+    // results.  Match the active CUDA device instead.
+    int device = 0;
+    cudaDeviceProp prop = {};
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+    dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, prop.multiProcessorCount);
     dim3 block_dims(ctaSize);
     dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
     cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size, stream};
