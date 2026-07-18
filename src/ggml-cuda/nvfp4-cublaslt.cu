@@ -378,6 +378,221 @@ static __global__ void quant_act_kernel(const act_t * __restrict__ X,
 
 // ---------------- host glue ----------------
 
+// ---------------------------------------------------------------------------
+// DETERMINISM PROBE 2026-07-17 — cuBLASLt fast-path vs FALLBACK accounting.
+// When ggml_cuda_{nvfp4,fp8}_cublaslt_mul_mat returns false the caller does NOT error: it
+// silently falls through to another path (MMQ / dequant), which computes DIFFERENT NUMBERS.
+// So if the number of bails varies between two BIT-IDENTICAL forwards, the "nondeterminism"
+// is an intermittent PATH FLIP, not a wobbly kernel. The peek-bail sites are the prime
+// suspects: cudaPeekAtLastError() reports an error pending on the THREAD from ANY prior
+// unrelated op, and every one of them runs BEFORE the (void)cudaGetLastError() clear that
+// this file already performs before cublasLtMatmul for exactly that reason.
+static std::atomic<unsigned long long> g_fp8_ok{0};         // returned true (fast path taken)
+static std::atomic<unsigned long long> g_fp8_bail_peek{0};  // bailed on a PENDING (possibly stale) error
+static std::atomic<unsigned long long> g_fp8_bail_other{0}; // bailed for any other late reason
+
+extern "C" void ggml_cuda_fp8_pathstats(unsigned long long * ok,
+                                        unsigned long long * bail_peek,
+                                        unsigned long long * bail_other) {
+    if (ok)         *ok         = g_fp8_ok.load(std::memory_order_relaxed);
+    if (bail_peek)  *bail_peek  = g_fp8_bail_peek.load(std::memory_order_relaxed);
+    if (bail_other) *bail_other = g_fp8_bail_other.load(std::memory_order_relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// DETERMINISM PROBE 2026-07-17 — GEMM *INPUT* stability (GGML_FP8_INHASH=1).
+// The FP8 path is now known to run the SAME 1344 GEMMs per forward with no fallbacks and
+// with deterministic algos (reduction=NONE, splitk=1) — yet the output still varies. So the
+// INPUTS must be moving. This hashes the raw bytes actually fed to each GEMM:
+//   whash = src0->data  (the NVFP4 weight — this is the OFFLOAD-STREAMED buffer)
+//   ahash = a_fp8_ptr   (the quantized activation)
+// accumulated over every GEMM in a forward and read once per forward. The hash is an XOR of
+// per-element mixes => ORDER-INDEPENDENT, so it is deterministic by construction and any
+// change is a real byte change. This is the test `w_scale` could not do: w_scale is an AMAX,
+// a coarse statistic that two different weight byte-sets can share.
+static __device__ unsigned long long g_dev_whash;
+static __device__ unsigned long long g_dev_ahash;
+
+static __global__ void fp8_bytehash_kernel(const uint8_t * __restrict__ p, long n,
+                                           unsigned long long tag, int which) {
+    unsigned long long h = 0;
+    for (long i = (long)blockIdx.x*blockDim.x + threadIdx.x; i < n;
+         i += (long)gridDim.x*blockDim.x) {
+        unsigned long long x = (((unsigned long long)i ^ tag) * 0x9E3779B97F4A7C15ULL) + (unsigned long long)p[i];
+        x ^= x >> 29; x *= 0xbf58476d1ce4e5b9ULL; x ^= x >> 32;
+        h ^= x;   // XOR: commutative => order-independent => deterministic
+    }
+    atomicXor(which == 0 ? &g_dev_whash : &g_dev_ahash, h);
+}
+
+static int ggml_cuda_fp8_inhash_enabled() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_FP8_INHASH"); v = (e && atoi(e)) ? 1 : 0; }
+    return v;
+}
+
+static void fp8_bytehash(const void * p, size_t nbytes, unsigned long long tag, int which, cudaStream_t stream) {
+    if (!p || nbytes == 0) return;
+    const int threads = 256;
+    unsigned int grid = (unsigned int)((nbytes + threads - 1)/threads);
+    if (grid > 1024u) grid = 1024u; if (grid == 0) grid = 1;
+    fp8_bytehash_kernel<<<grid, threads, 0, stream>>>((const uint8_t *)p, (long)nbytes, tag, which);
+}
+
+extern "C" void ggml_cuda_fp8_inhash_read_reset(unsigned long long * whash, unsigned long long * ahash) {
+    unsigned long long w = 0, a = 0, z = 0;
+    cudaDeviceSynchronize();
+    cudaMemcpyFromSymbol(&w, g_dev_whash, sizeof(w));
+    cudaMemcpyFromSymbol(&a, g_dev_ahash, sizeof(a));
+    cudaMemcpyToSymbol(g_dev_whash, &z, sizeof(z));
+    cudaMemcpyToSymbol(g_dev_ahash, &z, sizeof(z));
+    if (whash) *whash = w;
+    if (ahash) *ahash = a;
+}
+
+// ---------------------------------------------------------------------------
+// PER-CALL-INDEX bisection. whash is stable and ahash moves => the divergence is born
+// upstream of, or inside, SOME GEMM — the aggregate can't say which. Record each GEMM's
+// input-activation hash AND its output hash, keyed by call order within the forward. The
+// FIRST index whose INPUT is stable but whose OUTPUT moves is the culprit GEMM. If index 0's
+// input already moves, the bug is upstream of every FP8 GEMM.
+#define FP8_IDX_SLOTS 1400
+static __device__ unsigned long long g_dev_idx_in [FP8_IDX_SLOTS];
+static __device__ unsigned long long g_dev_idx_out[FP8_IDX_SLOTS];
+static std::atomic<int> g_fp8_call_idx{0};
+// Which Linear each slot was. src0->name is a stable char[] inside the tensor, so the pointer
+// stays valid; shape identifies the op when the name is ambiguous.
+static const char * g_slot_name[FP8_IDX_SLOTS] = {nullptr};
+static int          g_slot_M[FP8_IDX_SLOTS]    = {0};
+static int          g_slot_K[FP8_IDX_SLOTS]    = {0};
+static int          g_slot_N[FP8_IDX_SLOTS]    = {0};
+// Slot's per-tensor activation SCALE (device float, copied to host) and a hash of the RAW
+// pre-quant src1. Splits the two remaining possibilities cleanly:
+//   raw src1 MOVES              => the divergence is genuinely upstream of this GEMM
+//   raw src1 STABLE but scale/quant MOVES => the QUANTIZATION itself is nondeterministic
+static __device__ unsigned long long g_dev_idx_raw[FP8_IDX_SLOTS];
+// Scales are staged DEVICE-side (D2D, async) and read once at forward end. An earlier version
+// did a cudaMemcpyAsync+cudaStreamSynchronize PER GEMM to read the scale; that serialized the
+// stream and suppressed the very race we are hunting (a divergent forward showed every probed
+// GEMM stable). Never sync per-GEMM in this probe.
+static __device__ float g_dev_idx_scale[FP8_IDX_SLOTS];
+static float        g_slot_scale[FP8_IDX_SLOTS] = {0.f};
+
+extern "C" const char * ggml_cuda_fp8_idxname(int slot, int * M, int * K, int * N) {
+    if (slot < 0 || slot >= FP8_IDX_SLOTS) return "";
+    if (M) *M = g_slot_M[slot];
+    if (K) *K = g_slot_K[slot];
+    if (N) *N = g_slot_N[slot];
+    return g_slot_name[slot] ? g_slot_name[slot] : "?";
+}
+
+extern "C" float ggml_cuda_fp8_idxscale(int slot) {
+    return (slot < 0 || slot >= FP8_IDX_SLOTS) ? 0.f : g_slot_scale[slot];
+}
+
+extern "C" void ggml_cuda_fp8_idxraw_read_reset(unsigned long long * raw_out, int n) {
+    unsigned long long zi[FP8_IDX_SLOTS] = {0};
+    cudaDeviceSynchronize();
+    if (raw_out) cudaMemcpyFromSymbol(raw_out, g_dev_idx_raw,
+                                      sizeof(unsigned long long)*(n < FP8_IDX_SLOTS ? n : FP8_IDX_SLOTS));
+    cudaMemcpyToSymbol(g_dev_idx_raw, zi, sizeof(zi));
+}
+
+// ---------------------------------------------------------------------------
+// FIRST-DIVERGENT-GEMM detector. Snapshots every GEMM's (raw, qin, out, scale) for a forward
+// and diffs against the PREVIOUS forward. Reports the lowest call index that moved and WHICH
+// field moved first, which distinguishes:
+//   raw moved  => this GEMM's INPUT was already wrong => corruption is upstream of it
+//   raw stable, qin moved => the QUANTIZATION of a stable input is nondeterministic
+//   raw+qin stable, out moved => the GEMM itself is nondeterministic
+// Covers all ~1344 calls, so no window guessing.
+struct fp8_fwd_snapshot {
+    unsigned long long raw[FP8_IDX_SLOTS];
+    unsigned long long qin[FP8_IDX_SLOTS];
+    unsigned long long out[FP8_IDX_SLOTS];
+    float              scl[FP8_IDX_SLOTS];
+    int                n = 0;
+    bool               valid = false;
+};
+static fp8_fwd_snapshot g_prev_fwd;
+
+extern "C" void ggml_cuda_fp8_first_divergent_gemm(int * out_slot, const char ** out_field,
+                                                   int * out_ncalls) {
+    fp8_fwd_snapshot cur;
+    cur.n = g_fp8_call_idx.load(std::memory_order_relaxed);
+    if (cur.n > FP8_IDX_SLOTS) cur.n = FP8_IDX_SLOTS;
+    cudaDeviceSynchronize();
+    cudaMemcpyFromSymbol(cur.raw, g_dev_idx_raw,   sizeof(cur.raw));
+    cudaMemcpyFromSymbol(cur.qin, g_dev_idx_in,    sizeof(cur.qin));
+    cudaMemcpyFromSymbol(cur.out, g_dev_idx_out,   sizeof(cur.out));
+    cudaMemcpyFromSymbol(cur.scl, g_dev_idx_scale, sizeof(cur.scl));
+    cur.valid = true;
+
+    int slot = -1; const char * field = "none";
+    if (g_prev_fwd.valid) {
+        const int n = cur.n < g_prev_fwd.n ? cur.n : g_prev_fwd.n;
+        for (int i = 0; i < n; i++) {
+            if (cur.raw[i] != g_prev_fwd.raw[i]) { slot = i; field = "raw(input)";      break; }
+            if (cur.qin[i] != g_prev_fwd.qin[i]) { slot = i; field = "qin(quantized)";  break; }
+            if (memcmp(&cur.scl[i], &g_prev_fwd.scl[i], sizeof(float)) != 0)
+                                                 { slot = i; field = "scale";           break; }
+            if (cur.out[i] != g_prev_fwd.out[i]) { slot = i; field = "out(gemm)";       break; }
+        }
+    }
+    if (out_slot)   *out_slot   = slot;
+    if (out_field)  *out_field  = field;
+    if (out_ncalls) *out_ncalls = cur.n;
+
+    g_prev_fwd = cur;
+    // Reset accumulators for the next forward.
+    unsigned long long zi[FP8_IDX_SLOTS] = {0};
+    float zf[FP8_IDX_SLOTS] = {0.f};
+    cudaMemcpyToSymbol(g_dev_idx_raw,   zi, sizeof(zi));
+    cudaMemcpyToSymbol(g_dev_idx_in,    zi, sizeof(zi));
+    cudaMemcpyToSymbol(g_dev_idx_out,   zi, sizeof(zi));
+    cudaMemcpyToSymbol(g_dev_idx_scale, zf, sizeof(zf));
+    g_fp8_call_idx.store(0, std::memory_order_relaxed);
+}
+
+static __global__ void fp8_slothash_kernel(const uint8_t * __restrict__ p, long n,
+                                           unsigned long long tag, int slot, int which) {
+    unsigned long long h = 0;
+    for (long i = (long)blockIdx.x*blockDim.x + threadIdx.x; i < n;
+         i += (long)gridDim.x*blockDim.x) {
+        unsigned long long x = (((unsigned long long)i ^ tag) * 0x9E3779B97F4A7C15ULL) + (unsigned long long)p[i];
+        x ^= x >> 29; x *= 0xbf58476d1ce4e5b9ULL; x ^= x >> 32;
+        h ^= x;
+    }
+    atomicXor(which == 0 ? &g_dev_idx_in[slot] : (which == 1 ? &g_dev_idx_out[slot] : &g_dev_idx_raw[slot]), h);
+}
+
+static __global__ void fp8_stage_scale_kernel(const float * __restrict__ src, int slot) {
+    g_dev_idx_scale[slot] = *src;
+}
+
+static void fp8_stage_scale(int slot, const float * d_scale, cudaStream_t stream) {
+    if (!d_scale || slot < 0 || slot >= FP8_IDX_SLOTS) return;
+    fp8_stage_scale_kernel<<<1, 1, 0, stream>>>(d_scale, slot);
+}
+
+static void fp8_slothash(const void * p, size_t nbytes, unsigned long long tag, int slot, int which, cudaStream_t stream) {
+    if (!p || nbytes == 0 || slot < 0 || slot >= FP8_IDX_SLOTS) return;
+    const int threads = 256;
+    unsigned int grid = (unsigned int)((nbytes + threads - 1)/threads);
+    if (grid > 1024u) grid = 1024u; if (grid == 0) grid = 1;
+    fp8_slothash_kernel<<<grid, threads, 0, stream>>>((const uint8_t *)p, (long)nbytes, tag, slot, which);
+}
+
+extern "C" void ggml_cuda_fp8_idxhash_read_reset(unsigned long long * in_out, unsigned long long * out_out, int n) {
+    unsigned long long zi[FP8_IDX_SLOTS] = {0};
+    cudaDeviceSynchronize();
+    if (in_out)  cudaMemcpyFromSymbol(in_out,  g_dev_idx_in,  sizeof(unsigned long long)*(n < FP8_IDX_SLOTS ? n : FP8_IDX_SLOTS));
+    if (out_out) cudaMemcpyFromSymbol(out_out, g_dev_idx_out, sizeof(unsigned long long)*(n < FP8_IDX_SLOTS ? n : FP8_IDX_SLOTS));
+    cudaMemcpyToSymbol(g_dev_idx_in,  zi, sizeof(zi));
+    cudaMemcpyToSymbol(g_dev_idx_out, zi, sizeof(zi));
+    g_fp8_call_idx.store(0, std::memory_order_relaxed);
+}
+
 bool ggml_cuda_nvfp4_cublaslt_enabled() {
     static int v = -1;
     if (v < 0) { const char* e = getenv("GGML_NVFP4_CUBLASLT"); v = (e && atoi(e)) ? 1 : 0; }
@@ -481,7 +696,7 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
         const int total   = N*(K/16);
         repack_weight_kernel<<<(total+threads-1)/threads, threads, 0, stream>>>(
             (const block_nvfp4*)src0->data, w_data.get(), w_scales.get(), N, K);
-        if (cudaPeekAtLastError() != cudaSuccess) return false;
+        if (cudaPeekAtLastError() != cudaSuccess) { g_fp8_bail_peek.fetch_add(1, std::memory_order_relaxed); return false; }
     }
 
     // 2) quantize activation into cuBLASLt layout (pool scratch)
@@ -534,7 +749,7 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
             nvfp4_rotate_kernel<half><<<rgrid, rthreads, shmem, stream>>>((const half*)src1->data, a_rot.get(), had_block, nblocks);
         else
             nvfp4_rotate_kernel<float><<<rgrid, rthreads, shmem, stream>>>((const float*)src1->data, a_rot.get(), had_block, nblocks);
-        if (cudaPeekAtLastError() != cudaSuccess) return false;
+        if (cudaPeekAtLastError() != cudaSuccess) { g_fp8_bail_peek.fetch_add(1, std::memory_order_relaxed); return false; }
         rot_src = a_rot.get();
     }
     // "Four Over Six" activation scale round-up — kills peak-element clip (dimming). Off by default.
@@ -604,7 +819,7 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
             if (s_norefine || pt > 0.f) quant_act_kernel<float,false><<<blocks, threads, 0, stream>>>((const float*)src1->data, a_data.get(), a_scales.get(), M, K, pt, stoch, inkernel_had, scale_ceil, refine_act, scale_div, scale_stoch);
             else                        quant_act_kernel<float,true ><<<blocks, threads, 0, stream>>>((const float*)src1->data, a_data.get(), a_scales.get(), M, K, pt, stoch, inkernel_had, scale_ceil, refine_act, scale_div, scale_stoch);
         }
-        if (cudaPeekAtLastError() != cudaSuccess) return false;
+        if (cudaPeekAtLastError() != cudaSuccess) { g_fp8_bail_peek.fetch_add(1, std::memory_order_relaxed); return false; }
     }
 
     // 3) cuBLASLt FP4 GEMM: D[M,N] (row-major) = A_w[N,K] @ B_a[M,K]^T
@@ -750,6 +965,7 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     if (Cd) cublasLtMatrixLayoutDestroy(Cd);
     if (Dd) cublasLtMatrixLayoutDestroy(Dd);
     if (op) cublasLtMatmulDescDestroy(op);
+    (ok ? g_fp8_ok : g_fp8_bail_other).fetch_add(1, std::memory_order_relaxed);
     return ok;
 }
 
@@ -1353,7 +1569,7 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
         unsigned int grid = (unsigned int)((total + threads - 1)/threads);
         if (grid > 65535u) grid = 65535u; if (grid == 0) grid = 1;
         fp8_w_to_mxfp8_kernel<<<grid, threads, 0, stream>>>((const uint8_t*)src0->data, w_global, w_fp8_ptr, wsc, N, K);
-        if (cudaPeekAtLastError() != cudaSuccess) return false;
+        if (cudaPeekAtLastError() != cudaSuccess) { g_fp8_bail_peek.fetch_add(1, std::memory_order_relaxed); return false; }
         w_scale_ptr = (float*)wsc;   // reinterpreted; the GEMM binds it as a void* block-scale ptr
     } else if (w_is_e4m3) {
         const float wg = nvfp4_weight_global_for(src0->name);
@@ -1533,7 +1749,7 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
                 nvfp4_rotate_kernel<half> <<<rgrid, rthreads, shmem, stream>>>((const half*) src1->data, a_rot.get(), fp8_had_block, nblocks);
             else
                 nvfp4_rotate_kernel<float><<<rgrid, rthreads, shmem, stream>>>((const float*)src1->data, a_rot.get(), fp8_had_block, nblocks);
-            if (cudaPeekAtLastError() != cudaSuccess) return false;
+            if (cudaPeekAtLastError() != cudaSuccess) { g_fp8_bail_peek.fetch_add(1, std::memory_order_relaxed); return false; }
             fp8_rot_src = a_rot.get();
         }
 
@@ -1549,7 +1765,7 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
         if (fp8_rot_src)                      fp8_a_quant_kernel<float><<<qgrid, threads, 0, stream>>>(fp8_rot_src,               a_fp8_ptr, n_act, a_scale_ptr);
         else if (src1->type == GGML_TYPE_F16) fp8_a_quant_kernel<half ><<<qgrid, threads, 0, stream>>>((const half*)src1->data,  a_fp8_ptr, n_act, a_scale_ptr);
         else                                  fp8_a_quant_kernel<float><<<qgrid, threads, 0, stream>>>((const float*)src1->data, a_fp8_ptr, n_act, a_scale_ptr);
-        if (cudaPeekAtLastError() != cudaSuccess) return false;
+        if (cudaPeekAtLastError() != cudaSuccess) { g_fp8_bail_peek.fetch_add(1, std::memory_order_relaxed); return false; }
     }
 
     // MXFP8 activation quant (block-scaled): per-32-block e8m0 into a swizzled scale buffer.
@@ -1568,7 +1784,7 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
             fp8_a_to_mxfp8_kernel<half> <<<grid, threads, 0, stream>>>((const half*) src1->data, a_fp8_ptr, asc, M, K);
         else
             fp8_a_to_mxfp8_kernel<float><<<grid, threads, 0, stream>>>((const float*)src1->data, a_fp8_ptr, asc, M, K);
-        if (cudaPeekAtLastError() != cudaSuccess) return false;
+        if (cudaPeekAtLastError() != cudaSuccess) { g_fp8_bail_peek.fetch_add(1, std::memory_order_relaxed); return false; }
         a_scale_ptr = (float*)asc;   // reinterpreted; bound as a void* block-scale ptr below
     }
 
@@ -1704,6 +1920,17 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
         cublasLtMatmulPreference_t pref=nullptr;
         cublasLtMatmulPreferenceCreate(&pref);
         cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsz, sizeof(wsz));
+        // GGML_CUBLASLT_REDUCTION_MASK: constrain WHICH split-K reduction schemes the heuristic may
+        // return (cublasLtReductionScheme_t: NONE=0 INPLACE=1 COMPUTE_TYPE=2 OUTPUT_TYPE=4, MASK=7).
+        // The cuBLASLt DEFAULT for this preference is MASK (=7, "allows all reduction schemes"), and
+        // this code never set it => split-K algos were always eligible. Unset here == the default
+        // (byte-identical to before). Set to 0 to forbid split-K entirely (NONE only).
+        static const int red_mask = [](){ const char * e = getenv("GGML_CUBLASLT_REDUCTION_MASK");
+                                          return (e && *e) ? atoi(e) : -1; }();
+        if (red_mask >= 0) {
+            const uint32_t rm = (uint32_t) red_mask;
+            cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &rm, sizeof(rm));
+        }
         cublasLtMatmulHeuristicResult_t hr[1] = {};
         int got=0;
         cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(lt, op, Ad, Bd, Cd, Dd, pref, 1, hr, &got);
@@ -1712,6 +1939,27 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
             algo = hr[0].algo;
             have_algo = true;
             if (!s_nocache) g_fp8_algo_cache[key] = algo;
+            // GGML_FP8_ALGO_TRACE: report the SELECTED algo's split-K config, once per distinct
+            // shape (the cache means one line per shape). This is the ground truth for "is a
+            // nondeterministic split-K reduction being chosen for the small-M DiT GEMMs?".
+            // Value-gated (`e && atoi(e)`), NOT presence-gated: an empty "${VAR:-}" from compose must
+            // not arm it. See the fusion gates for why that distinction matters here.
+            static const bool algo_trace = [](){ const char * e = getenv("GGML_FP8_ALGO_TRACE");
+                                                 return e && atoi(e); }();
+            if (algo_trace) {
+                int algo_id = -1, red = -1, splitk = -1, swizzle = -1, cta = -1;
+                size_t sz = 0;
+                cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_ID,               &algo_id, sizeof(algo_id), &sz);
+                cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &red,     sizeof(red),     &sz);
+                cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM,       &splitk,  sizeof(splitk),  &sz);
+                cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING,    &swizzle, sizeof(swizzle), &sz);
+                cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_TILE_ID,          &cta,     sizeof(cta),     &sz);
+                fprintf(stderr,
+                        "[FP8_ALGO] m=%d n=%d k=%d out_dt=%d epi=%d | algo_id=%d reduction=%d splitk=%d swizzle=%d tile=%d | name=%s\n",
+                        m, n, k, (int)out_dt, want_epi ? 1 : 0,
+                        algo_id, red, splitk, swizzle, cta,
+                        src0->name[0] ? src0->name : "?");
+            }
         }
     }
 
@@ -1734,6 +1982,31 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     // dequant fallback -> NaN K/V. (Only clears already-consumed errors; doesn't mask our own.)
     if (getenv("GGML_F8_CLEAR_ERR") == nullptr || atoi(getenv("GGML_F8_CLEAR_ERR")) != 0)
         (void)cudaGetLastError();
+    // GGML_FP8_INHASH: hash the EXACT bytes this GEMM is about to consume. Tag by shape so the
+    // same weight at a different layer can't alias. Stream-ordered, so it sees precisely what
+    // the GEMM sees. src0->data is the offload-streamed NVFP4 weight.
+    // GGML_FP8_INHASH=1 => FULL probe (hash every GEMM; SUPPRESSES the race — Heisenbug).
+    // GGML_FP8_INHASH=2 => MINIMAL probe: only GEMM index 0 gets stream-side hash kernels (2 per
+    // forward vs ~6720). Minimal perturbation, so it should NOT suppress and can honestly answer
+    // "is block-0's first GEMM input already nondeterministic?". Slot bookkeeping still runs for all.
+    int probe_slot = -1;
+    static const int inhash_mode = [](){ const char * e = getenv("GGML_FP8_INHASH"); return e ? atoi(e) : 0; }();
+    if (ggml_cuda_fp8_inhash_enabled()) {
+        probe_slot = g_fp8_call_idx.fetch_add(1, std::memory_order_relaxed);
+        const bool do_hash = (inhash_mode >= 2) ? (probe_slot == 0) : true;
+        const unsigned long long tag = ((unsigned long long)N << 40) ^ ((unsigned long long)K << 16) ^ (unsigned long long)M;
+        if (probe_slot >= 0 && probe_slot < FP8_IDX_SLOTS) {
+            g_slot_name[probe_slot] = src0->name;
+            g_slot_M[probe_slot] = M; g_slot_K[probe_slot] = K; g_slot_N[probe_slot] = N;
+        }
+        if (do_hash) {
+            fp8_bytehash(src0->data, ggml_nbytes(src0), tag, /*which=*/0, stream);
+            fp8_bytehash(a_fp8_ptr,  (size_t)M * (size_t)K, tag, /*which=*/1, stream);
+            fp8_slothash(a_fp8_ptr,  (size_t)M * (size_t)K, tag, probe_slot, /*which=*/0, stream);
+            fp8_slothash(src1->data, ggml_nbytes(src1),     tag, probe_slot, /*which=*/2, stream);
+            fp8_stage_scale(probe_slot, a_scale_ptr, stream);
+        }
+    }
     bool ok = have_algo;
     cublasStatus_t ms = CUBLAS_STATUS_SUCCESS;
     cudaEvent_t profile_start = nullptr;
@@ -1744,6 +2017,13 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
         cudaEventCreateWithFlags(&profile_end, cudaEventDefault);
         cudaEventRecord(profile_start, stream);
     }
+    // DISAMBIGUATOR 2026-07-17: does a BARE per-GEMM stream drain (no value/quant change) fix the
+    // FP8 nondeterminism? The two-level FP4 path incidentally drains here (D2H amax readback) and is
+    // deterministic; FP8 doesn't drain and diverges. GGML_FP8_DRAIN=1 adds ONLY the drain.
+    //   fixes it   => host-pacing/timing race (find producer / accept scheduling race)
+    //   no change  => it's the two-level QUANT VALUES, not the sync.
+    static const bool fp8_drain = [](){ const char * e = getenv("GGML_FP8_DRAIN"); return e && atoi(e); }();
+    if (fp8_drain) CUDA_CHECK(cudaStreamSynchronize(stream));
     if (ok) {
         ms = cublasLtMatmul(lt, op, &alpha_h, w_fp8_ptr, Ad, a_fp8_ptr, Bd,
                                            &beta_h, gemm_out, Cd, gemm_out, Dd,
@@ -1759,6 +2039,13 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
                 ms_elapsed, M, K, N, src0->name[0] ? src0->name : "?");
         cudaEventDestroy(profile_start);
         cudaEventDestroy(profile_end);
+    }
+    // Hash the RAW GEMM output (pre-clamp) into this call's slot. Paired with the input hash
+    // above: input stable + output moving == THIS GEMM is nondeterministic.
+    if (probe_slot >= 0 && ok && (inhash_mode < 2 || probe_slot == 0)) {
+        const unsigned long long tag = ((unsigned long long)N << 40) ^ ((unsigned long long)K << 16) ^ (unsigned long long)M;
+        const size_t out_bytes = (size_t)N * (size_t)M * (use_f32_temp ? 4u : (dst->type == GGML_TYPE_F16 ? 2u : 4u));
+        fp8_slothash(gemm_out, out_bytes, tag, probe_slot, /*which=*/1, stream);
     }
     // GGML_F8_DBG: per-GEMM matmul outcome — pins whether a bailed GEMM lost the algo
     // (have_algo=0) or the matmul returned non-success (ms!=0). w_global==1.0 => wglobal miss.
@@ -1848,5 +2135,6 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     if (Cd) cublasLtMatrixLayoutDestroy(Cd);
     if (Dd) cublasLtMatrixLayoutDestroy(Dd);
     if (op) cublasLtMatmulDescDestroy(op);
+    (ok ? g_fp8_ok : g_fp8_bail_other).fetch_add(1, std::memory_order_relaxed);
     return ok;
 }

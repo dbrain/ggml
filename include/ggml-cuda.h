@@ -160,6 +160,38 @@ GGML_BACKEND_API void ggml_cuda_set_longcat_fa_bsa_n_heads(int n_heads);
 // itself is GGML_FP8_ACT_QUANT_CACHE=0 (default on).
 GGML_BACKEND_API void ggml_cuda_fp8_act_cache_new_generation(void);
 
+// Determinism probe: cuBLASLt fast-path vs silent-fallback counters. A bail means the caller
+// silently computed DIFFERENT MATH via MMQ/dequant, so a count that VARIES across two
+// bit-identical forwards is an intermittent path flip rather than a wobbly kernel.
+GGML_BACKEND_API void ggml_cuda_fp8_pathstats(unsigned long long * ok,
+                                              unsigned long long * bail_peek,
+                                              unsigned long long * bail_other);
+
+// Determinism probe (GGML_FP8_INHASH=1): order-independent hash of the exact weight/activation
+// bytes fed to every cuBLASLt FP8 GEMM in a forward. Read+reset once per forward. If whash
+// moves across bit-identical forwards, the offload is delivering unstable weight bytes.
+GGML_BACKEND_API void ggml_cuda_fp8_inhash_read_reset(unsigned long long * whash,
+                                                      unsigned long long * ahash);
+
+// Per-call-index bisection: input/output hash of the first N FP8 GEMMs of a forward, in call
+// order. The first index whose input is stable but whose output moves is the culprit GEMM.
+GGML_BACKEND_API void ggml_cuda_fp8_idxhash_read_reset(unsigned long long * in_out,
+                                                       unsigned long long * out_out,
+                                                       int n);
+
+// First GEMM (by call order) whose (raw|qin|scale|out) differs from the PREVIOUS forward, and
+// which field moved first. Covers every call, so no window guessing.
+GGML_BACKEND_API void ggml_cuda_fp8_first_divergent_gemm(int * out_slot, const char ** out_field,
+                                                         int * out_ncalls);
+
+// Which Linear (name + M/K/N) a given per-call-index slot corresponds to.
+GGML_BACKEND_API const char * ggml_cuda_fp8_idxname(int slot, int * M, int * K, int * N);
+// The per-tensor activation scale that slot's quant actually used.
+GGML_BACKEND_API float ggml_cuda_fp8_idxscale(int slot);
+// Hash of the RAW (pre-quant) src1 bytes per slot: separates "upstream divergence" from
+// "the quantization itself is nondeterministic".
+GGML_BACKEND_API void ggml_cuda_fp8_idxraw_read_reset(unsigned long long * raw_out, int n);
+
 // Emit the owned FP8 activation-quant cache allocation for VRAM accounting.
 // This is diagnostic-only; callers should gate it with their own trace env.
 GGML_BACKEND_API void ggml_cuda_fp8_act_cache_log_stats(const char * phase);
