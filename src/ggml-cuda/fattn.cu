@@ -401,6 +401,20 @@ static bool ggml_cuda_cudnn_attn_env() {
     return v == 1;
 }
 
+// Optional upper bound for cuDNN SDPA sequence lengths.  A value of zero (the
+// default) leaves the existing dispatcher unchanged.  This is deliberately a
+// sequence-length limit rather than a broad backend switch: both orientations
+// of LTX's long text cross-attention can then take the native, F32-query route
+// while normal F16/cuDNN attention remains available for smaller calls.
+static int64_t ggml_cuda_cudnn_attn_max_seq_env() {
+    static int64_t v = -1;
+    if (v < 0) {
+        const char * e = getenv("GGML_CUDNN_ATTN_MAX_SEQ");
+        v = (e && atoll(e) > 0) ? atoll(e) : 0;
+    }
+    return v;
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -449,7 +463,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // without an attached GPU can otherwise record a conservative arch list
         // even when the resulting binary is running on Blackwell.
         cc >= GGML_CUDA_CC_BLACKWELL &&
-        mask == nullptr && max_bias == 0.0f) {
+        mask == nullptr && max_bias == 0.0f &&
+        (ggml_cuda_cudnn_attn_max_seq_env() == 0 ||
+         (Q->ne[1] <= ggml_cuda_cudnn_attn_max_seq_env() && K->ne[1] <= ggml_cuda_cudnn_attn_max_seq_env()))) {
         float logit_softcap = 0.0f;
         memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
         if (logit_softcap == 0.0f && gqa_ratio == 1 &&
@@ -718,8 +734,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 #endif
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
 
-    // The native (non-cuDNN) flash-attn kernels hard-require an F32 output tensor
-    // (fattn-common.cuh: GGML_ASSERT(KQV->type == GGML_TYPE_F32)). The
+    // The native (non-cuDNN) flash-attn kernels hard-require F32 Q and output
+    // tensors (fattn-common.cuh: GGML_ASSERT(Q->type == GGML_TYPE_F32) and
+    // GGML_ASSERT(KQV->type == GGML_TYPE_F32)). The
     // GGML_CUDNN_ATTN_F16_OUT optimization retypes the attention output to F16 so
     // the cuDNN SDPA can store it directly — but cuDNN is only selected on
     // Blackwell (cc >= GGML_CUDA_CC_BLACKWELL). On every other GPU (e.g. the RTX
@@ -729,24 +746,45 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // the F16 request by running the kernel into an F32 scratch buffer and
     // down-casting into the real F16 dst, so the F16_OUT graph works on all GPUs.
     if (kernel != BEST_FATTN_KERNEL_NONE && kernel != BEST_FATTN_KERNEL_CUDNN &&
-        dst->type != GGML_TYPE_F32) {
-        GGML_ASSERT(dst->type == GGML_TYPE_F16);
-        GGML_ASSERT(ggml_is_contiguous(dst));
+        (dst->type != GGML_TYPE_F32 || dst->src[0]->type != GGML_TYPE_F32)) {
+        GGML_ASSERT((dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16) && ggml_is_contiguous(dst));
+        GGML_ASSERT((dst->src[0]->type == GGML_TYPE_F32 || dst->src[0]->type == GGML_TYPE_F16) &&
+                    ggml_is_contiguous(dst->src[0]));
 
-        ggml_cuda_pool_alloc<float> dst_f32_buf(ctx.pool(), ggml_nelements(dst));
+        ggml_tensor dst_native = *dst;
+        ggml_tensor q_f32 = *dst->src[0];
+        ggml_cuda_pool_alloc<float> q_f32_buf(ctx.pool());
+        ggml_cuda_pool_alloc<float> dst_f32_buf(ctx.pool());
 
-        ggml_tensor dst_f32 = *dst;
-        dst_f32.type  = GGML_TYPE_F32;
-        dst_f32.data  = dst_f32_buf.ptr;
-        dst_f32.nb[0] = ggml_type_size(GGML_TYPE_F32);
-        dst_f32.nb[1] = dst_f32.nb[0] * dst_f32.ne[0];
-        dst_f32.nb[2] = dst_f32.nb[1] * dst_f32.ne[1];
-        dst_f32.nb[3] = dst_f32.nb[2] * dst_f32.ne[2];
+        if (q_f32.type == GGML_TYPE_F16) {
+            q_f32_buf.alloc(ggml_nelements(&q_f32));
+            to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+            to_fp32(q_f32.data, q_f32_buf.ptr, ggml_nelements(&q_f32), ctx.stream());
+            q_f32.type  = GGML_TYPE_F32;
+            q_f32.data  = q_f32_buf.ptr;
+            q_f32.nb[0] = ggml_type_size(GGML_TYPE_F32);
+            q_f32.nb[1] = q_f32.nb[0] * q_f32.ne[0];
+            q_f32.nb[2] = q_f32.nb[1] * q_f32.ne[1];
+            q_f32.nb[3] = q_f32.nb[2] * q_f32.ne[2];
+            dst_native.src[0] = &q_f32;
+        }
 
-        ggml_cuda_flash_attn_ext_dispatch(kernel, ctx, &dst_f32);
+        if (dst_native.type == GGML_TYPE_F16) {
+            dst_f32_buf.alloc(ggml_nelements(dst));
+            dst_native.type  = GGML_TYPE_F32;
+            dst_native.data  = dst_f32_buf.ptr;
+            dst_native.nb[0] = ggml_type_size(GGML_TYPE_F32);
+            dst_native.nb[1] = dst_native.nb[0] * dst_native.ne[0];
+            dst_native.nb[2] = dst_native.nb[1] * dst_native.ne[1];
+            dst_native.nb[3] = dst_native.nb[2] * dst_native.ne[2];
+        }
 
-        to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
-        to_fp16(dst_f32_buf.ptr, (half *) dst->data, ggml_nelements(dst), ctx.stream());
+        ggml_cuda_flash_attn_ext_dispatch(kernel, ctx, &dst_native);
+
+        if (dst->type == GGML_TYPE_F16) {
+            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+            to_fp16(dst_native.data, (half *) dst->data, ggml_nelements(dst), ctx.stream());
+        }
         return;
     }
 

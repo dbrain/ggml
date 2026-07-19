@@ -175,6 +175,13 @@ static __global__ void rms_norm_f32(const T *     x,
                                     const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
                                     const uint3   add_nsamples_packed  = make_uint3(0, 0, 0),
                                     const T_bias * prebias             = nullptr) {
+    // This kernel is launched with Programmatic Stream Serialization. It consumes
+    // x/scale/shift immediately, so it must resolve the dependency from the prior
+    // stream kernel before reading any of them. Triggering our own launch-completion
+    // below only lets the *next* PDL-aware kernel overlap; it does not make this
+    // kernel's inputs visible. Without this wait a preceding SA3/GEMM may still be
+    // flushing its activation when the fused AdaLN starts its reduction.
+    ggml_cuda_pdl_sync();
     ggml_cuda_pdl_lc();
     const int nrows     = gridDim.x;
     const int nchannels = gridDim.y;
