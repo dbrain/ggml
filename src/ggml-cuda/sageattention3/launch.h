@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2025 by SageAttention team.
- * 
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -70,7 +70,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             static_cast<float*>(params.softmax_lse_ptr),
             {_1{}, params.seqlen_q, params.h * params.seqlen_q},  // stride_LSE
         });
-        
+
     int num_blocks_m = cutlass::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
     num_blocks_m = cutlass::ceil_div(num_blocks_m, size<0>(ClusterShape{})) * size<0>(ClusterShape{});
     typename Scheduler::Arguments scheduler_args = {num_blocks_m, params.h, params.b};
@@ -98,7 +98,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
     cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size, stream};
     cutlass::launch_kernel_on_cluster(launch_params, kernel, params, mainloop_params, epilogue_params, scheduler_params);
-    
+
     CUDA_CHECK(cudaGetLastError());
 }
 

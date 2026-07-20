@@ -49,9 +49,9 @@ template<int SFVecSize, UMMA::Major major = UMMA::Major::K>
 struct BlockScaledBasicChunk {
 
   using Blk_MN    = _64;
-  using Blk_SF    =   _4; 
+  using Blk_SF    =   _4;
 
-  using SfAtom  = Layout< Shape< Shape<_16,_4>, Shape<Int<SFVecSize>, _4>>, 
+  using SfAtom  = Layout< Shape< Shape<_16,_4>, Shape<Int<SFVecSize>, _4>>,
                                Stride<Stride<_16,_4>, Stride<           _0, _1>>>;
 };
 
@@ -63,23 +63,23 @@ struct BlockScaledConfig {
   static constexpr int MMA_NSF = 4; // SFVecSize, MMA_NSF
   using BlkScaledChunk = BlockScaledBasicChunk<SFVecSize>;
   using Blk_MN    = _64;
-  using Blk_SF    =   _4; 
+  using Blk_SF    =   _4;
   using mnBasicBlockShape  =  Shape<_16,_4>;
   using mnBasicBlockStride = Stride<_16,_4>;
   using kBasicBlockShape  = Shape<Int<SFVecSize>, Int<MMA_NSF>>; // SFVecSize, MMA_NSF
   using kBasicBlockStride = Stride<_0, _1>;
-  using SfAtom  = Layout< Shape< mnBasicBlockShape, kBasicBlockShape>, 
+  using SfAtom  = Layout< Shape< mnBasicBlockShape, kBasicBlockShape>,
                           Stride<mnBasicBlockStride, kBasicBlockStride>>;
 
-  using LayoutSF = decltype(blocked_product(SfAtom{}, 
+  using LayoutSF = decltype(blocked_product(SfAtom{},
                                 make_layout(
                                     make_shape(int32_t(0), int32_t(0), int32_t(0), int32_t(0)),
                                     make_stride(int32_t(0), _1{}, int32_t(0), int32_t(0)))));
   // A single indivisible block will hold 4 scale factors of 64 rows/columns (A/B matrix).
-  // 4 is chosen to make consecutive 32bits of data to have scale factors for only a single row (col). 32bits corresponds to the TMEM word size 
+  // 4 is chosen to make consecutive 32bits of data to have scale factors for only a single row (col). 32bits corresponds to the TMEM word size
   using Blk_Elems = decltype(Blk_MN{} * Blk_SF{});
   using sSF_strideMN = decltype(prepend(Blk_Elems{},  mnBasicBlockStride{}));
-    
+
 
   // The following function is provided for user fill dynamic problem size to the layout_SFA.
   template < class ProblemShape>
@@ -103,7 +103,7 @@ struct BlockScaledConfig {
   CUTE_HOST_DEVICE
   static constexpr auto
   deduce_smem_layoutSFQ(TiledMma tiled_mma, TileShape_MNK tileshape_mnk) {
-    
+
     using sSFQ_shapeK = decltype(prepend(make_shape(Blk_SF{}/Int<MMA_NSF>{}, size<2>(TileShape_MNK{}) / Int<SFVecSize>{} / Blk_SF{}), kBasicBlockShape{}));
     using sSFQ_shapeM = decltype(prepend(size<0>(TileShape_MNK{}) / Blk_MN{}, mnBasicBlockShape{}));
     using sSFQ_strideM = sSF_strideMN;
@@ -118,7 +118,7 @@ struct BlockScaledConfig {
   CUTE_HOST_DEVICE
   static constexpr auto
   deduce_smem_layoutSFKV(TiledMma tiled_mma, TileShape_MNK tileshape_mnk) {
-  
+
     using sSFK_shapeK = decltype(prepend(make_shape(Blk_SF{}/Int<MMA_NSF>{}, size<2>(TileShape_MNK{}) / Int<SFVecSize>{} / Blk_SF{}), kBasicBlockShape{}));
     using sSFK_shapeN = decltype(prepend(size<1>(TileShape_MNK{}) / Blk_MN{}, mnBasicBlockShape{}));
     using sSFK_strideN = sSF_strideMN;
@@ -133,7 +133,7 @@ struct BlockScaledConfig {
   CUTE_HOST_DEVICE
   static constexpr auto
   deduce_smem_layoutSFVt(TiledMma tiled_mma, TileShape_MNK tileshape_mnk) {
-  
+
     using sSFVt_shapeK = decltype(prepend(make_shape(Blk_SF{}/Int<MMA_NSF>{}, size<2>(TileShape_MNK{}) / Int<SFVecSize>{} / Blk_SF{}), kBasicBlockShape{}));
     using sSFVt_shapeN = decltype(prepend(size<1>(TileShape_MNK{}) / Blk_MN{}, mnBasicBlockShape{}));
     using sSFVt_strideN = sSF_strideMN;

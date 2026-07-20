@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2025 by SageAttention team.
- * 
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -153,7 +153,7 @@ __global__ void scaled_fp4_quant_kernel(
 
   // load input
   const int token_id = token_block_id * BLOCK_SIZE + threadIdx.x / NUM_THREADS_PER_TOKEN;
-  
+
   int load_token_id;
   if constexpr (!permute) {
     load_token_id = token_id;
@@ -162,20 +162,20 @@ __global__ void scaled_fp4_quant_kernel(
     int local_token_id_residue = local_token_id % 32;
     // [0, 1, 8, 9, 16, 17, 24, 25, 2, 3, 10, 11, 18, 19, 26, 27, 4, 5, 12, 13, 20, 21, 28, 29, 6, 7, 14, 15, 22, 23, 30, 31]
     load_token_id = token_block_id * BLOCK_SIZE + (local_token_id / 32) * 32 +
-                    (local_token_id_residue / 8) * 2 + 
+                    (local_token_id_residue / 8) * 2 +
                     ((local_token_id_residue % 8) / 2) * 8 +
                     (local_token_id_residue % 8) % 2;
   }
 
   PackedVec in_vec;
-  
+
   #pragma unroll
   for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
     reinterpret_cast<uint32_t&>(in_vec.elts[i]) = 0;
   }
-  
+
   if (load_token_id < num_tokens) {
-    in_vec = reinterpret_cast<PackedVec const*>(input + 
+    in_vec = reinterpret_cast<PackedVec const*>(input +
                                           batch_id * stride_bz_input + // batch dim
                                           head_id * stride_h_input +   // head dim
                                           load_token_id * stride_seq_input + // seq dim
@@ -226,31 +226,31 @@ __global__ void scaled_fp4_quant_kernel(
 
   // save, do not check range
   if constexpr (CVT_FP4_ELTS_PER_THREAD == 8) {
-    reinterpret_cast<uint32_t*>(output + 
+    reinterpret_cast<uint32_t*>(output +
                                 batch_id * stride_bz_output +
                                 head_id * stride_h_output +
                                 token_id * stride_seq_output +
                                 (threadIdx.x % NUM_THREADS_PER_TOKEN) * CVT_FP4_ELTS_PER_THREAD / 2)[0] = e2m1Vals[0];
   } else {
-    reinterpret_cast<uint64_t*>(output + 
+    reinterpret_cast<uint64_t*>(output +
                                 batch_id * stride_bz_output +
                                 head_id * stride_h_output +
                                 token_id * stride_seq_output +
                                 (threadIdx.x % NUM_THREADS_PER_TOKEN) * CVT_FP4_ELTS_PER_THREAD / 2)[0] = reinterpret_cast<uint64_t*>(e2m1Vals)[0];
   }
-  
+
   uint8_t* output_sf_save_base = output_sf + batch_id * stride_bz_output_sf + head_id * stride_h_output_sf + (token_id / 64) * 64 * stride_seq_output_sf;
   uint32_t token_id_local = token_id % 64;
 
   if constexpr (CVT_FP4_ELTS_PER_THREAD == 16) {
     uint32_t col_id_local = threadIdx.x % NUM_THREADS_PER_TOKEN;
-    uint32_t offset_local = (col_id_local / 4) * 256 + (col_id_local % 4) + 
+    uint32_t offset_local = (col_id_local / 4) * 256 + (col_id_local % 4) +
                             (token_id_local / 16) * 4 + (token_id_local % 16) * 16;
     reinterpret_cast<uint8_t*>(output_sf_save_base + offset_local)[0] = SFValueFP8;
   } else {
     if (threadIdx.x % 2 == 0) {
       uint32_t col_id_local = (threadIdx.x % NUM_THREADS_PER_TOKEN) / 2;
-      uint32_t offset_local = (col_id_local / 4) * 256 + (col_id_local % 4) + 
+      uint32_t offset_local = (col_id_local / 4) * 256 + (col_id_local % 4) +
                             (token_id_local / 16) * 4 + (token_id_local % 16) * 16;
       reinterpret_cast<uint8_t*>(output_sf_save_base + offset_local)[0] = SFValueFP8;
     }
@@ -283,14 +283,14 @@ __global__ void scaled_fp4_quant_trans_kernel(
   const int token_id = token_block_id * BLOCK_SIZE + threadIdx.x / NUM_THREADS_PER_TOKEN;
 
   PackedVec in_vec;
-  
+
   #pragma unroll
   for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
     reinterpret_cast<uint32_t&>(in_vec.elts[i]) = 0;
   }
-  
+
   if (token_id < num_tokens) {
-    in_vec = reinterpret_cast<PackedVec const*>(input + 
+    in_vec = reinterpret_cast<PackedVec const*>(input +
                                           batch_id * stride_bz_input + // batch dim
                                           head_id * stride_h_input +   // head dim
                                           token_id * stride_seq_input + // seq dim
@@ -351,20 +351,20 @@ __global__ void scaled_fp4_quant_trans_kernel(
 
   // save
   if constexpr (CVT_FP4_ELTS_PER_THREAD == 8) {
-    reinterpret_cast<uint32_t*>(output + 
+    reinterpret_cast<uint32_t*>(output +
                                 batch_id * stride_bz_output +
                                 head_id * stride_h_output +
                                 (threadIdx.x / NUM_THREADS_PER_SEQ) * stride_d_output +
                                 (token_block_id * BLOCK_SIZE + (threadIdx.x % NUM_THREADS_PER_SEQ) * CVT_FP4_ELTS_PER_THREAD) / 2)[0] = e2m1Vals[0];
   } else {
-    reinterpret_cast<uint64_t*>(output + 
+    reinterpret_cast<uint64_t*>(output +
                                 batch_id * stride_bz_output +
                                 head_id * stride_h_output +
                                 (threadIdx.x / NUM_THREADS_PER_SEQ) * stride_d_output +
                                 (token_block_id * BLOCK_SIZE + (threadIdx.x % NUM_THREADS_PER_SEQ) * CVT_FP4_ELTS_PER_THREAD) / 2)[0] = reinterpret_cast<uint64_t*>(e2m1Vals)[0];
   }
 
-  uint8_t *output_sf_save_base = output_sf + 
+  uint8_t *output_sf_save_base = output_sf +
                                 batch_id * stride_bz_output_sf +
                                 head_id * stride_h_output_sf +
                                 (threadIdx.x / NUM_THREADS_PER_SEQ / 64) * 64 * stride_d_output_sf;
@@ -372,13 +372,13 @@ __global__ void scaled_fp4_quant_trans_kernel(
 
   if constexpr (CVT_FP4_ELTS_PER_THREAD == 16) {
     uint32_t col_id_local = token_block_id * BLOCK_SIZE / CVT_FP4_ELTS_PER_THREAD + threadIdx.x % NUM_THREADS_PER_SEQ;
-    uint32_t offset_local = (col_id_local / 4) * 256 + (col_id_local % 4) + 
+    uint32_t offset_local = (col_id_local / 4) * 256 + (col_id_local % 4) +
                             (row_id_local / 16) * 4 + (row_id_local % 16) * 16;
     reinterpret_cast<uint8_t*>(output_sf_save_base + offset_local)[0] = SFValueFP8;
   } else {
     if (threadIdx.x % 2 == 0) {
       uint32_t col_id_local = token_block_id * BLOCK_SIZE / CVT_FP4_ELTS_PER_THREAD + (threadIdx.x % NUM_THREADS_PER_SEQ) / 2;
-      uint32_t offset_local = (col_id_local / 4) * 256 + (col_id_local % 4) + 
+      uint32_t offset_local = (col_id_local / 4) * 256 + (col_id_local % 4) +
                               (row_id_local / 16) * 4 + (row_id_local % 16) * 16;
       reinterpret_cast<uint8_t*>(output_sf_save_base + offset_local)[0] = SFValueFP8;
     }
@@ -390,7 +390,7 @@ void scaled_fp4_quant(torch::Tensor const& input,
                             torch::Tensor const& output_sf,
                             int tensor_layout) {
   constexpr int BLOCK_SIZE = 128;
-  
+
   CHECK_CUDA(input);
   CHECK_CUDA(output);
   CHECK_CUDA(output_sf);
@@ -547,7 +547,7 @@ void scaled_fp4_quant_trans(torch::Tensor const& input,
                             torch::Tensor const& output_sf,
                             int tensor_layout) {
   constexpr int BLOCK_SIZE = 128;
-  
+
   CHECK_CUDA(input);
   CHECK_CUDA(output);
   CHECK_CUDA(output_sf);
@@ -571,7 +571,7 @@ void scaled_fp4_quant_trans(torch::Tensor const& input,
   const int stride_bz_output_sf = output_sf.stride(0);
 
   int num_tokens, num_heads;
-  int stride_seq_input; 
+  int stride_seq_input;
   int stride_d_output, stride_d_output_sf;
   int stride_h_input, stride_h_output, stride_h_output_sf;
   if (tensor_layout == 0) {

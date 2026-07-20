@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2025 by SageAttention team.
- * 
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -74,7 +74,7 @@ struct Allreduce {
 
 template<>
 struct Allreduce<2> {
-template<typename T, typename Operator> 
+template<typename T, typename Operator>
 static __device__ __forceinline__ T run(T x, Operator &op) {
     x = op(x, __shfl_xor_sync(uint32_t(-1), x, 1));
     return x;
@@ -219,7 +219,7 @@ packed_float_to_ue4m3(
 #endif
 }
 
-CUTLASS_DEVICE void 
+CUTLASS_DEVICE void
 packed_float_to_e2m1(
   float const &f0, float const &f1, float const &f2, float const& f3,
   float const &f4, float const &f5, float const &f6, float const& f7,
@@ -248,10 +248,10 @@ packed_float_to_e2m1(
 
 }
 
-CUTLASS_DEVICE void 
+CUTLASS_DEVICE void
 add(float2      & c,
-    float2 const& a, 
-    float2 const& b) 
+    float2 const& a,
+    float2 const& b)
 {
 // add.f32x2 (packed-float2 SIMD) is Blackwell-only; scalar fallback for sm86 (never runs).
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -264,9 +264,9 @@ c.x = a.x + b.x; c.y = a.y + b.y;
 #endif
 }
 
-CUTLASS_DEVICE void 
-add_inplace(float2 &a, 
-            float2 const& b) 
+CUTLASS_DEVICE void
+add_inplace(float2 &a,
+            float2 const& b)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   asm volatile("add.f32x2 %0, %0, %1;\n"
@@ -279,10 +279,10 @@ add_inplace(float2 &a,
 }
 
 
-CUTLASS_DEVICE void 
+CUTLASS_DEVICE void
 sub(float2      & c,
-    float2 const& a, 
-    float2 const& b) 
+    float2 const& a,
+    float2 const& b)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 asm volatile("sub.f32x2 %0, %1, %2;\n"
@@ -294,9 +294,9 @@ c.x = a.x - b.x; c.y = a.y - b.y;
 #endif
 }
 
-CUTLASS_DEVICE void 
-sub_inplace(float2 &a, 
-            float2 const& b) 
+CUTLASS_DEVICE void
+sub_inplace(float2 &a,
+            float2 const& b)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   asm volatile("sub.f32x2 %0, %0, %1;\n"
@@ -309,10 +309,10 @@ sub_inplace(float2 &a,
 }
 
 
-CUTLASS_DEVICE void 
+CUTLASS_DEVICE void
 mul(float2      & c,
-    float2 const& a, 
-    float2 const& b) 
+    float2 const& a,
+    float2 const& b)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   asm volatile("mul.f32x2 %0, %1, %2;\n"
@@ -324,11 +324,11 @@ mul(float2      & c,
 #endif
 }
 
-CUTLASS_DEVICE void 
+CUTLASS_DEVICE void
 fma(float2      & d,
-    float2 const& a, 
-    float2 const& b, 
-    float2 const& c) 
+    float2 const& a,
+    float2 const& b,
+    float2 const& c)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   asm volatile("fma.rn.f32x2 %0, %1, %2, %3;\n"
@@ -341,10 +341,10 @@ fma(float2      & d,
 #endif
 }
 
-CUTLASS_DEVICE void 
-fma_inplace(float2 &a, 
-            float2 const& b, 
-            float2 const& c) 
+CUTLASS_DEVICE void
+fma_inplace(float2 &a,
+            float2 const& b,
+            float2 const& c)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   asm volatile("fma.rn.f32x2 %0, %0, %1, %2;\n"
@@ -362,7 +362,7 @@ template <
   class Layout
 >
 CUTLASS_DEVICE constexpr
-auto convert_to_reduction_layout(Layout mma_layout) { 
+auto convert_to_reduction_layout(Layout mma_layout) {
   static_assert(rank(mma_layout) == 3, "Mma Layout should be (MmaAtom, MmaM, MmaN)");
   static_assert(rank(get<0>(shape(mma_layout))) == 2, "MmaAtom should be (AtomN, AtomM)");
 

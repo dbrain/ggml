@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2025 by SageAttention team.
- * 
+ *
  * This code is based on code from FlashAttention3, https://github.com/Dao-AILab/flash-attention
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  * Licensed under the Apache License, Version 2.0 (the "License");

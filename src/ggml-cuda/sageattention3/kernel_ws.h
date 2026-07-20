@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2025 by SageAttention team.
- * 
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -140,21 +140,21 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     if (warp_group_role == WarpGroupRole::Producer) {
         cutlass::arch::warpgroup_reg_dealloc<24>();
         TileScheduler scheduler;
-        
+
         if (producer_warp_role == ProducerWarpRole::Mainloop) {  // Load Q, K, V
             PipelineStateQ smem_pipe_write_q = cutlass::make_producer_start_state<MainloopPipelineQ>();
             PipelineState smem_pipe_write_k = cutlass::make_producer_start_state<MainloopPipeline>();
             PipelineState smem_pipe_write_v = cutlass::make_producer_start_state<MainloopPipeline>();
-            
+
         int work_idx = 0;
             for (auto work_tile_info = scheduler.get_initial_work(); work_tile_info.is_valid(scheduler_params); work_tile_info = scheduler.get_next_work(scheduler_params, work_tile_info)) {
                 int tile_count_semaphore = 0;
-                collective_mainloop.load(mainloop_params, scheduler_params, 
-                                         pipeline_q, pipeline_k, pipeline_v, 
+                collective_mainloop.load(mainloop_params, scheduler_params,
+                                         pipeline_q, pipeline_k, pipeline_v,
                                          smem_pipe_write_q, smem_pipe_write_k, smem_pipe_write_v,
                                          shared_storage, work_tile_info, work_idx, tile_count_semaphore);
             }
-            collective_mainloop.load_tail(pipeline_q, pipeline_k, pipeline_v, 
+            collective_mainloop.load_tail(pipeline_q, pipeline_k, pipeline_v,
                                           smem_pipe_write_q, smem_pipe_write_k, smem_pipe_write_v);
         } else if (producer_warp_role == ProducerWarpRole::Epilogue) {
             for (auto work_tile_info = scheduler.get_initial_work(); work_tile_info.is_valid(scheduler_params); work_tile_info = scheduler.get_next_work(scheduler_params, work_tile_info)) {
@@ -163,7 +163,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 collective_epilogue.store_tail();
                 barrier_o.arrive();
             }
-            
+
         }
     } else if (warp_group_role == WarpGroupRole::Consumer0 || warp_group_role == WarpGroupRole::Consumer1) {
         cutlass::arch::warpgroup_reg_alloc<232>();
@@ -192,7 +192,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             collective_mainloop.mma(mainloop_params, pipeline_q, pipeline_k, pipeline_v, smem_pipe_read_q, smem_pipe_read_k, smem_pipe_read_v,
                                     tOrO, softmax_fused, n_block_max, threadIdx.x - NumCopyThreads, work_idx, m_block, shared_storage);
             barrier_o.wait();
-            collective_epilogue.mma_store(shared_storage, tiled_mma_pv, tOrO, threadIdx.x - NumCopyThreads); 
+            collective_epilogue.mma_store(shared_storage, tiled_mma_pv, tOrO, threadIdx.x - NumCopyThreads);
             barrier_o.arrive();
             ++work_idx;
         }

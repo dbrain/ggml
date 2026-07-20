@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2025 by SageAttention team.
- * 
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -38,14 +38,14 @@ struct SoftmaxFused{
 
     template<bool FirstTile, bool InfCheck = false, typename TensorAcc, typename TensorMax>
     CUTLASS_DEVICE auto online_softmax_with_quant(
-        TensorAcc& acc, 
+        TensorAcc& acc,
         TensorMax& AbsMaxP,
         const float softmax_scale_log2
     ) {
         Tensor acc_reduction_view = make_tensor(acc.data(), flash::convert_to_reduction_layout(acc.layout()));
         Tensor acc_conversion_view = make_tensor(acc.data(), flash::convert_to_conversion_layout(acc.layout()));
         Tensor acc_conversion_flatten = group_modes<1, 5>(group_modes<0, 2>(flatten(acc_conversion_view)));
-        
+
         if constexpr (FirstTile) {
             fill(row_max, -INFINITY);
             clear(row_sum);
@@ -63,7 +63,7 @@ struct SoftmaxFused{
                     AbsMaxP(mi, ni) = fmaxf(AbsMaxP(mi, ni), max_recv);
                     row_max(mi) = fmaxf(row_max(mi), AbsMaxP(mi, ni));
                 }
-                
+
                 float max_recv = __shfl_xor_sync(int32_t(-1), row_max(mi), 2); // exchange max in a quad in a row
                 row_max(mi) = fmaxf(row_max(mi), max_recv);
 
@@ -103,7 +103,7 @@ struct SoftmaxFused{
                     AbsMaxP(mi, ni) = fmaxf(local_max, max_recv);
                     row_max(mi) = fmaxf(row_max(mi), AbsMaxP(mi, ni));
                 }
-                
+
                 float max_recv = __shfl_xor_sync(int32_t(-1), row_max(mi), 2); // exchange max in a quad in a row
                 row_max(mi) = fmaxf(row_max(mi), max_recv);
 
@@ -149,7 +149,7 @@ struct SoftmaxFused{
             float sum = row_sum(mi);
             float inv_sum = (sum == 0.f || sum != sum) ? 0.f : 1 / sum;
             CUTLASS_PRAGMA_UNROLL
-            for (int ni = 0; ni < size<1>(o_store_reduction_view); ++ni) { 
+            for (int ni = 0; ni < size<1>(o_store_reduction_view); ++ni) {
                 o_store_reduction_view(mi, ni) *= inv_sum;
              }
         }
@@ -162,7 +162,7 @@ struct SoftmaxFused{
         CUTLASS_PRAGMA_UNROLL
         for (int mi = 0; mi < size(row_max); ++mi) {
             CUTLASS_PRAGMA_UNROLL
-            for (int ni = 0; ni < size<1>(o_store_reduction_view); ++ni) { 
+            for (int ni = 0; ni < size<1>(o_store_reduction_view); ++ni) {
                 o_store_reduction_view(mi, ni) = o_store_reduction_view(mi, ni) * scores_scale(mi) + o_tmp_reduction_view(mi, ni);
              }
         }
