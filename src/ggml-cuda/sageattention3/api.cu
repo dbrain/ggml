@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2025 by SageAttention team.
- * 
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -75,7 +75,7 @@ void set_params_fprop(Flash_fwd_params &params,
     params.sfq_ptr = sfq.data_ptr();
     params.sfk_ptr = sfk.data_ptr();
     params.sfv_ptr = sfv.data_ptr();
-    
+
     // All stride are in elements, not bytes.
     params.q_row_stride = q.stride(-2) * 2;
     params.k_row_stride = k.stride(-2) * 2;
@@ -86,7 +86,7 @@ void set_params_fprop(Flash_fwd_params &params,
 
     params.ds_row_stride = delta_s.stride(-2);
     params.ds_head_stride = delta_s.stride(-3);
-    
+
     params.sfq_row_stride = sfq.stride(-2);
     params.sfk_row_stride = sfk.stride(-2);
     params.sfv_row_stride = sfv.stride(-2);
@@ -211,7 +211,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
         int unpadded_k,
         c10::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
         const float softmax_scale,
-        bool is_causal, 
+        bool is_causal,
         bool per_block_mean,
         bool is_bf16
     ) {
@@ -232,7 +232,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
     TORCH_CHECK(sfk.dtype() == sfq_dtype, "query and key must have the same dtype");
     TORCH_CHECK(sfv.dtype() == sfq_dtype, "query and value must have the same dtype");
     CHECK_DEVICE(sfq); CHECK_DEVICE(sfk); CHECK_DEVICE(sfv);
-    
+
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -251,7 +251,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
     const int unpacked_head_size = head_size_og * 2;
     const int seqlen_k = k.size(2);
     const int num_heads_k = k.size(1);
-    
+
     TORCH_CHECK(batch_size > 0, "batch size must be postive");
     TORCH_CHECK(unpacked_head_size <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
@@ -267,7 +267,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
     // CHECK_SHAPE(sfk, batch_size, seqlen_k, num_heads_k, unpacked_head_size);
     // CHECK_SHAPE(sfv, batch_size, unpacked_head_size, num_heads_k, seqlen_k);
     TORCH_CHECK(unpacked_head_size % 8 == 0, "head_size must be a multiple of 8");
-    
+
     auto dtype = is_bf16 ? at::ScalarType::BFloat16 : at::ScalarType::Half;
     at::Tensor out = torch::empty({batch_size, num_heads, seqlen_q, unpacked_head_size}, opts.dtype(dtype));
 
@@ -281,7 +281,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
     // Cast to char to avoid compiler warning about narrowing
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
-    
+
 
     auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
     at::Tensor p;
@@ -293,7 +293,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
                      seqlen_q_rounded, seqlen_k_rounded,
                      num_heads, num_heads_k,
                      unpacked_head_size, unpacked_head_size,
-                     q, k, v, delta_s, out, 
+                     q, k, v, delta_s, out,
                      sfq, sfk, sfv,
                      /*cu_seqlens_q_d=*/nullptr,
                      /*cu_seqlens_k_d=*/nullptr,

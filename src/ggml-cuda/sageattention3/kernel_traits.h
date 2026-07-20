@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2025 by SageAttention team.
- * 
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -47,7 +47,7 @@ template <
     typename SmemLayoutSFV
 >
 struct SharedStorageQKVOwithSF : cute::aligned_struct<128, _0>{
-    
+
     alignas(1024) cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
     alignas(1024) cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutK>> smem_k;
     cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFQ>> smem_SFQ;
@@ -56,7 +56,7 @@ struct SharedStorageQKVOwithSF : cute::aligned_struct<128, _0>{
     alignas(1024) cute::ArrayEngine<ElementDS, cute::cosize_v<SmemLayoutDS>> smem_ds;
     alignas(1024) cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutV>> smem_v;
     alignas(1024) cute::ArrayEngine<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
-    
+
     struct {
         alignas(16) typename cutlass::PipelineTmaAsync<1>::SharedStorage pipeline_q;
         alignas(16) typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_k;
@@ -67,13 +67,13 @@ struct SharedStorageQKVOwithSF : cute::aligned_struct<128, _0>{
   };
 
 template <
-    int kHeadDim_, 
-    int kBlockM_, 
-    int kBlockN_, 
-    int kStages_,  
-    int kClusterM_, 
+    int kHeadDim_,
+    int kBlockM_,
+    int kBlockN_,
+    int kStages_,
+    int kClusterM_,
     bool BlockMean_,
-    typename ElementPairType_ = cutlass::nv_float4_t<cutlass::float_e2m1_t>, 
+    typename ElementPairType_ = cutlass::nv_float4_t<cutlass::float_e2m1_t>,
     typename ElementOut_ = cutlass::bfloat16_t,
     typename ElementDS_ = float
 >
@@ -104,7 +104,7 @@ struct Flash_fwd_kernel_traits {
     using PermTileM = decltype(cute::min(size<0>(TileShape_MNK{}), _128{}));
     using PermTileN = _32;
     using PermTileK = Int<kHeadDim>;
-    
+
     using ElementQMma = decltype(cutlass::gemm::collective::detail::sm1xx_kernel_input_element_to_mma_input_element<Element>());
     using ElementKMma = decltype(cutlass::gemm::collective::detail::sm1xx_kernel_input_element_to_mma_input_element<Element>());
 
@@ -117,13 +117,13 @@ struct Flash_fwd_kernel_traits {
         AtomLayoutMNK{},
         Tile<PermTileM, PermTileN, PermTileK>{}
       ));
-    
+
     using TiledMmaPV = decltype(cute::make_tiled_mma(
         cute::SM120::BLOCKSCALED::SM120_16x32x64_TN_VS_NVFP4{},
         AtomLayoutMNK{},
         Tile<PermTileM, _32, PermTileK>{}
       ));
-    
+
     static constexpr int MMA_NSF = size<2>(typename TiledMmaQK::AtomShape_MNK{}) / SFVectorSize;
 
     using GmemTiledCopy = SM90_TMA_LOAD;
@@ -144,7 +144,7 @@ struct Flash_fwd_kernel_traits {
         decltype(tile_to_shape(SmemLayoutAtomVt{},
                  make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{}), Int<kStages>{})));
     using SmemLayoutAtomDS = Layout<Shape<Int<kBlockM>, Int<kBlockN>>, Stride<_0, _1>>;
-    using SmemLayoutDS = 
+    using SmemLayoutDS =
         decltype(tile_to_shape(SmemLayoutAtomDS{},
             make_shape(shape<0>(TileShape_MNK{}), shape<1>(TileShape_MNK{}), Int<kStages>{})));
 
@@ -193,7 +193,7 @@ struct Flash_fwd_kernel_traits {
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
     using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 2>(TileShape_MNK{}), Step<_1, _2>{}));
     using SharedStorage = SharedStorageQKVOwithSF<kStages, EpiStages, Element, ElementDS, ElementSF, ElementOut,
-        SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutDS, 
+        SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutDS,
         SmemLayoutO, SmemLayoutSFQ, SmemLayoutSFK, SmemLayoutSFVt>;
     using MainloopPipeline = typename cutlass::PipelineTmaAsync<kStages>;
     using PipelineState = typename cutlass::PipelineState<kStages>;

@@ -80,4 +80,4 @@
       using kSeqLenTraitsType = VarSeqLenTraits;                               \
       return __VA_ARGS__();                                                    \
     }                                                                          \
-  }() 
+  }()

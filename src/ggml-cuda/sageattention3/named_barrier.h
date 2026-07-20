@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2025 by SageAttention team.
- * 
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -43,7 +43,7 @@ public:
   static constexpr int SequenceLength = SequenceLength_;
   using Barrier = cutlass::arch::ClusterBarrier;
   using SharedStorage = flash::OrderedSequenceBarrierVarGroupSizeSharedStorage<SequenceDepth, SequenceLength>;
-  
+
 
   struct Params {
     uint32_t group_id;
@@ -115,5 +115,5 @@ private:
     return barrier_ptr_[stage_.index() * Length + group_id];
   }
 };
- 
+
  } // flash
