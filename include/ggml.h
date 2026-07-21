@@ -2212,7 +2212,8 @@ extern "C" {
             int                   d2,
             int                   n_channels,
             int                   n_batch,
-            int                   n_channels_out);
+            int                   n_channels_out,
+            int                   hi_prec);
 
     enum ggml_op_pool {
         GGML_OP_POOL_MAX,

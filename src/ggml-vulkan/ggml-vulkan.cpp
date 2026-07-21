@@ -18797,7 +18797,7 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             const int32_t IC = tensor->op_params[9];
             const int32_t N  = tensor->op_params[10];
             const int32_t OC = tensor->op_params[11];
-            tensor_clone = ggml_conv_3d_direct(ggml_ctx, src_clone[0], src_clone[1], s0, s1, s2, p0, p1, p2, d0, d1, d2, IC, N, OC);
+            tensor_clone = ggml_conv_3d_direct(ggml_ctx, src_clone[0], src_clone[1], s0, s1, s2, p0, p1, p2, d0, d1, d2, IC, N, OC, 0);
         } else if (tensor->op == GGML_OP_CONV_2D_DW) {
             const int32_t s0 = tensor->op_params[0];
             const int32_t s1 = tensor->op_params[1];

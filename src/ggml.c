@@ -4919,7 +4919,8 @@ struct ggml_tensor * ggml_conv_3d_direct(
         int                   d2,
         int                   c,
         int                   n,
-        int                   oc) {
+        int                   oc,
+        int                   hi_prec) {
 
     GGML_ASSERT(a->ne[3] == (int64_t) c * oc);
     GGML_ASSERT(b->ne[3] == (int64_t) c * n);
@@ -4930,7 +4931,7 @@ struct ggml_tensor * ggml_conv_3d_direct(
     ne[2] = ggml_calc_conv_output_size(b->ne[2], a->ne[2], s2, p2, d2);
     ne[3] = (int64_t) oc * n;
 
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    struct ggml_tensor * result = ggml_new_tensor(ctx, hi_prec ? GGML_TYPE_F32 : b->type, 4, ne);
 
     ggml_set_op_params_i32(result, 0,  s0);
     ggml_set_op_params_i32(result, 1,  s1);
@@ -4944,6 +4945,7 @@ struct ggml_tensor * ggml_conv_3d_direct(
     ggml_set_op_params_i32(result, 9,  c);
     ggml_set_op_params_i32(result, 10, n);
     ggml_set_op_params_i32(result, 11, oc);
+    ggml_set_op_params_i32(result, 12, hi_prec ? 1 : 0);
 
     result->op = GGML_OP_CONV_3D;
     result->src[0] = a;

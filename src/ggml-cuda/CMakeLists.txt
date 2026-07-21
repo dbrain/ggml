@@ -142,6 +142,20 @@ if (CUDAToolkit_FOUND)
         target_include_directories(ggml-cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../thirdparty/cutlass/include)
     endif()
 
+    # Optional cuDNN frontend paths used by the env-gated fused attention and
+    # direct 3-D convolution implementations.  Keeping the feature build-time
+    # optional preserves upstream CUDA builds without cuDNN installed.
+    option(GGML_CUDNN "ggml: cuDNN fused CUDA operators (Blackwell)" OFF)
+    if (GGML_CUDNN)
+        message(STATUS "GGML_CUDNN enabled: linking cudnn + nvrtc")
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDNN)
+        if (NOT DEFINED GGML_CUDNN_FRONTEND_INCLUDE)
+            set(GGML_CUDNN_FRONTEND_INCLUDE "/opt/cudnn-frontend/include")
+        endif()
+        target_include_directories(ggml-cuda PRIVATE ${GGML_CUDNN_FRONTEND_INCLUDE})
+        target_link_libraries(ggml-cuda PRIVATE cudnn nvrtc)
+    endif()
+
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
     if (GGML_CUDA_GRAPHS)
