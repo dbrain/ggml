@@ -506,6 +506,7 @@ extern "C" {
         GGML_OP_SILU_BACK,
         GGML_OP_NORM, // normalize
         GGML_OP_RMS_NORM,
+        GGML_OP_RMS_NORM_CHANNELS,
         GGML_OP_RMS_NORM_BACK,
         GGML_OP_GROUP_NORM,
         GGML_OP_L2_NORM,
@@ -1386,6 +1387,15 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_rms_norm_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
+            float                 eps);
+
+    // RMS-normalize a channels-last [W, H, T, C] activation over C and apply
+    // its F32 gamma in one CUDA operation. This avoids the two layout copies
+    // otherwise required by Wan VAE's channel RMS path.
+    GGML_API struct ggml_tensor * ggml_rms_norm_channels(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gamma,
             float                 eps);
 
     // group normalize along ne0*ne1*n_groups

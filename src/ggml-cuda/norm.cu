@@ -499,6 +499,51 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     rms_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
 
+template <typename T>
+static __global__ void rms_norm_channels_kernel(const T * __restrict__ x,
+                                                const float * __restrict__ gamma,
+                                                T * __restrict__ dst,
+                                                int64_t positions,
+                                                int channels,
+                                                float eps) {
+    const int64_t position = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (position >= positions) {
+        return;
+    }
+    float sum_squares = 0.0f;
+    for (int channel = 0; channel < channels; ++channel) {
+        const float value = (float) x[position + (int64_t) channel * positions];
+        sum_squares += value * value;
+    }
+    const float scale = rsqrtf(sum_squares / (float) channels + eps);
+    for (int channel = 0; channel < channels; ++channel) {
+        const int64_t index = position + (int64_t) channel * positions;
+        dst[index] = (T) ((float) x[index] * scale * gamma[channel]);
+    }
+}
+
+void ggml_cuda_op_rms_norm_channels(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * gamma = dst->src[1];
+    float eps = 0.0f;
+    memcpy(&eps, dst->op_params, sizeof(eps));
+
+    GGML_ASSERT((x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_F32) && dst->type == x->type);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(dst));
+    GGML_ASSERT(gamma->type == GGML_TYPE_F32 && gamma->ne[0] == x->ne[3]);
+    const int64_t positions = x->ne[0] * x->ne[1] * x->ne[2];
+    const int channels = (int) x->ne[3];
+    const int block_size = 256;
+    const int grid_size = (int) ((positions + block_size - 1) / block_size);
+    if (x->type == GGML_TYPE_F16) {
+        rms_norm_channels_kernel<half><<<grid_size, block_size, 0, ctx.stream()>>>(
+            (const half *) x->data, (const float *) gamma->data, (half *) dst->data, positions, channels, eps);
+    } else {
+        rms_norm_channels_kernel<float><<<grid_size, block_size, 0, ctx.stream()>>>(
+            (const float *) x->data, (const float *) gamma->data, (float *) dst->data, positions, channels, eps);
+    }
+}
+
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;

@@ -1015,6 +1015,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SILU_BACK",
     "NORM",
     "RMS_NORM",
+    "RMS_NORM_CHANNELS",
     "RMS_NORM_BACK",
     "GROUP_NORM",
     "L2_NORM",
@@ -1100,7 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1130,6 +1131,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "silu_back(x)",
     "norm(x)",
     "rms_norm(x)",
+    "rms_norm_channels(x)",
     "rms_norm_back(x)",
     "group_norm(x)",
     "l2_norm(x)",
@@ -1215,7 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3179,6 +3181,21 @@ struct ggml_tensor * ggml_rms_norm_inplace(
         struct ggml_tensor  * a,
         float                 eps) {
     return ggml_rms_norm_impl(ctx, a, eps, true);
+}
+
+struct ggml_tensor * ggml_rms_norm_channels(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * gamma,
+        float                 eps) {
+    GGML_ASSERT(gamma->ne[0] == x->ne[3]);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, x);
+    ggml_set_op_params(result, &eps, sizeof(eps));
+    result->op     = GGML_OP_RMS_NORM_CHANNELS;
+    result->src[0] = x;
+    result->src[1] = gamma;
+    return result;
 }
 
 // ggml_rms_norm_back
