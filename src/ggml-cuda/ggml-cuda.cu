@@ -19,6 +19,7 @@
 #include "ggml-cuda/conv2d-dw.cuh"
 #include "ggml-cuda/conv2d-transpose.cuh"
 #include "ggml-cuda/conv3d.cuh"
+#include "ggml-cuda/conv3d-cudnn.cuh"
 #include "ggml-cuda/convert.cuh"
 #include "ggml-cuda/count-equal.cuh"
 #include "ggml-cuda/cpy.cuh"
@@ -2721,7 +2722,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_conv2d(ctx, dst);
             break;
         case GGML_OP_CONV_3D:
-            ggml_cuda_op_conv3d(ctx, dst);
+            if (!ggml_cuda_op_conv3d_cudnn(ctx, dst)) {
+                ggml_cuda_op_conv3d(ctx, dst);
+            }
             break;
         case GGML_OP_CONV_2D_DW:
             ggml_cuda_op_conv2d_dw(ctx, dst);
@@ -6246,6 +6249,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CONV_2D:
             return (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]));
         case GGML_OP_CONV_3D:
+            if (ggml_cuda_conv3d_cudnn_available() &&
+                (getenv("GGML_CUDNN_CONV3D") || getenv("GGML_CUDNN_CONV")) &&
+                ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
+                (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32) &&
+                (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32)) {
+                return true;
+            }
             return (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
                    op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op);
