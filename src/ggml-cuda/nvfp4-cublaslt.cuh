@@ -13,3 +13,10 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
                                       const ggml_tensor * src0,
                                       const ggml_tensor * src1,
                                       ggml_tensor * dst);
+
+// True iff a per-tensor NVFP4 weight global (ModelOpt weight_scale_2) was registered for
+// `name` via ggml_cuda_nvfp4_register_weight_global (declared in ggml-cuda.h). Used by
+// ggml_cuda_nvfp4_weight_global_folded() to prove to the graph builder that this weight's
+// scalar really is folded into the GEMM alpha, so the redundant full-size ggml_mul can be
+// dropped. Never guess: an unregistered name silently multiplies by 1.0.
+bool ggml_cuda_nvfp4_weight_global_registered(const char * name);
