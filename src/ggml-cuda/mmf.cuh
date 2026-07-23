@@ -182,6 +182,7 @@ static __global__ void mul_mat_f(
             for (int k0 = 0; k0 < warp_size; k0 += tile_A::J) {
                 load_ldmatrix(A[itA][k0/tile_A::J], tile_xy + k0, tile_k_padded);
             }
+            __syncwarp();
         }
 
 #pragma unroll
@@ -226,6 +227,7 @@ static __global__ void mul_mat_f(
                     mma(C[itA][itB], A[itA][k0/tile_B::J], B);
                 }
             }
+            __syncwarp();
         }
     }
 
@@ -401,6 +403,7 @@ static __global__ void mul_mat_f_ids(
             for (int k0 = 0; k0 < warp_size; k0 += tile_A::J) {
                 load_ldmatrix(A[itA][k0/tile_A::J], tile_xy + k0, tile_k_padded);
             }
+            __syncwarp();
         }
 
         if constexpr (std::is_same_v<T, float>) {
@@ -450,6 +453,7 @@ static __global__ void mul_mat_f_ids(
                         mma(C[itA][itB], A[itA][k0/tile_B::J], B);
                     }
                 }
+                __syncwarp();
 
                 if (itB + 1 < ntB) {
                     curr_buf ^= 1;
@@ -506,6 +510,7 @@ static __global__ void mul_mat_f_ids(
                         mma(C[itA][itB], A[itA][k0/tile_B::J], B);
                     }
                 }
+                __syncwarp();
 
                 if (itB + 1 < ntB) {
                     curr_buf ^= 1;
