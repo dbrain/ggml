@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "fattn-cudnn.cuh"
 #if defined(GGML_SAGEATTENTION3)
 #include "fattn-sa3.cuh"
 #endif
@@ -338,7 +339,19 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_VEC      = 100,
     BEST_FATTN_KERNEL_WMMA_F16 = 300,
     BEST_FATTN_KERNEL_MMA_F16  = 400,
+    BEST_FATTN_KERNEL_CUDNN    = 500,
 };
+
+// cuDNN SDPA remains an opt-in because it is a shape-specialized Blackwell
+// fast path.  Reading this once keeps the dispatch branch free of getenv work.
+static bool ggml_cuda_cudnn_attn_env() {
+    static int value = -1;
+    if (value < 0) {
+        const char* env = getenv("GGML_CUDNN_ATTN");
+        value           = env != nullptr && atoi(env) != 0 ? 1 : 0;
+    }
+    return value == 1;
+}
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     switch (type) {
@@ -394,6 +407,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     const int cc = ggml_cuda_info().devices[device].cc;
+
+    // LongCat's full self-attention is exactly the mask-free, F16 K/V,
+    // D=128 Blackwell SDPA geometry.  Keep the upstream kernels as fallback
+    // for every other attention shape and for an unset opt-in flag.
+    if (ggml_cuda_cudnn_attn_env() && ggml_cuda_cudnn_available() &&
+        cc >= GGML_CUDA_CC_BLACKWELL && mask == nullptr && max_bias == 0.0f) {
+        float logit_softcap = 0.0f;
+        memcpy(&logit_softcap, (const float*) KQV->op_params + 2, sizeof(float));
+        if (logit_softcap == 0.0f && gqa_ratio == 1 &&
+            K->ne[0] == V->ne[0] && (K->ne[0] == 64 || K->ne[0] == 128) &&
+            K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
+            return BEST_FATTN_KERNEL_CUDNN;
+        }
+    }
 
     switch (K->ne[0]) {
         case  40:
@@ -460,7 +487,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // On Blackwell the VEC F16 path's partial-warp shuffle reductions can
+    // consume lanes before reconvergence.  Route it to the existing MMA F16
+    // implementation instead; retain an explicit A/B escape hatch.
+    static const bool s_vec_on_blackwell = getenv("FATTN_VEC_ON_BLACKWELL") != nullptr;
+    const bool blackwell_no_vec = cc >= GGML_CUDA_CC_BLACKWELL && !s_vec_on_blackwell;
+    const bool can_use_vector_kernel = !blackwell_no_vec && Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
@@ -571,6 +603,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32;
             need_f16_V = V->type == GGML_TYPE_F32;
             break;
+        case BEST_FATTN_KERNEL_CUDNN:
+            break;
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -605,6 +639,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_CUDNN:
+            ggml_cuda_flash_attn_ext_cudnn(ctx, dst);
             break;
     }
 }

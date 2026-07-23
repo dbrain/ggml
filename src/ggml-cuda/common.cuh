@@ -633,6 +633,10 @@ static __device__ T block_reduce(T val, T * shared_vals) {
         if (lane_id < (static_cast<int>(block_size) / WARP_SIZE)) {
             val = shared_vals[lane_id];
         }
+        // Callers can reuse shared_vals for a second reduction (for example
+        // softmax MAX then SUM).  On Blackwell the next write may otherwise
+        // race lanes still consuming this value.
+        __syncthreads();
         return block_reduce_policy<reduce_method_t, T>::reduce(val);
     }
 
@@ -1149,6 +1153,9 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+    // Release cached physical memory after a request boundary.  Backends that
+    // cannot trim safely keep the default no-op behaviour.
+    virtual void trim() {}
 };
 
 template<typename T>
@@ -1503,6 +1510,16 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    void trim_pools() {
+        for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+            for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+                if (pools[d][s] != nullptr) {
+                    pools[d][s]->trim();
+                }
+            }
+        }
+    }
 };
 
 struct ggml_cuda_mm_fusion_args_host {
@@ -1646,4 +1663,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-

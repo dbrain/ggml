@@ -116,7 +116,10 @@ static __global__ void soft_max_f32(
         vals[col] = val;
     }
 
-    // find the sum of exps in the block
+    // buf_iw is reused from the MAX reduction above.  Explicitly synchronize
+    // before the SUM reduction: Blackwell does not provide the implicit warp
+    // reconvergence older kernels happened to rely on here.
+    __syncthreads();
     tmp = block_reduce<block_reduce_method::SUM, block_size_template>(tmp, buf_iw);
 
     if (sinks) {

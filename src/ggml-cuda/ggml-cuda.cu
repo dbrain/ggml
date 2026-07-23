@@ -681,6 +681,19 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         // all deallocations must be in reverse order of the allocations
         GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
     }
+
+    void trim() override {
+        if (pool_addr == 0 || pool_size == pool_used) {
+            return;
+        }
+        // VMM allocations are a stack.  Once buffers at the top have been
+        // returned, unmap that free suffix so it stops reserving physical VRAM
+        // for a later model/window in the same worker.
+        ggml_cuda_set_device(device);
+        const size_t unused_size = pool_size - pool_used;
+        CU_CHECK(cuMemUnmap((CUdeviceptr) ((char *) pool_addr + pool_used), unused_size));
+        pool_size = pool_used;
+    }
 };
 #endif // defined(GGML_USE_VMM)
 
@@ -4456,6 +4469,22 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
 }
 
+void ggml_backend_cuda_trim_memory(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cuda_ctx->trim_pools();
+}
+
+void ggml_backend_cuda_release_cudnn_conv3d_weights(void) {
+    // The reorder cache owns raw cudaMalloc allocations rather than ggml VMM
+    // pages. Synchronize so no queued convolution can retain one while it is
+    // released; the helper is a no-op in a non-cuDNN build.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    ggml_cuda_cudnn_conv3d_release_weights();
+}
+
 int ggml_backend_cuda_get_device_count() {
     return ggml_cuda_info().device_count;
 }
@@ -5110,7 +5139,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_GROUP_NORM:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_PAD:
-            return true;
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                   op->src[0]->type == op->type;
         case GGML_OP_UPSCALE:
         case GGML_OP_PAD_REFLECT_1D:
         case GGML_OP_ARANGE:
