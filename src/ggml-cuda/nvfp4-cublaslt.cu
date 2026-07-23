@@ -20,6 +20,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <map>
+#include <string>
 #include <tuple>
 
 // SWIZZLE_32_4_4 offset over a (rows x col_length) UE4M3 scale grid (comfy float_utils)
@@ -187,6 +188,53 @@ bool ggml_cuda_nvfp4_cublaslt_enabled() {
     static int v = -1;
     if (v < 0) { const char* e = getenv("GGML_NVFP4_CUBLASLT"); v = (e && atoi(e)) ? 1 : 0; }
     return v == 1;
+}
+
+// Per-tensor weight global (ModelOpt weight_scale_2) of an UNFOLDED NVFP4 import,
+// keyed by tensor NAME (not data pointer: a layer-offload/staging host swaps src0->data
+// and src0->buffer per segment, but preserves src0->name).
+// Folded into the GEMM alpha (alpha = A_global * W_global) so the scalar costs nothing
+// instead of a full-size ggml_mul over every Linear output.
+//
+// A name that was never registered yields 1.0. That is byte-identical for a legacy
+// FOLDED gguf (which has no globals at all), but it would be SILENTLY WRONG for an
+// unfolded one — so the graph-level fallback MUL is only elided when
+// ggml_cuda_nvfp4_weight_global_registered() says the scalar is really here
+// (see ggml_cuda_nvfp4_weight_global_folded() in ggml-cuda.cu).
+//
+// Read concurrently: the layer-offload path runs GEMMs on worker threads, so every
+// access is under g_wglobal_mtx (registration/clear only happen at load/swap, never
+// concurrently with a graph).
+static std::mutex                             g_wglobal_mtx;
+static std::unordered_map<std::string, float> g_wglobal;
+
+extern "C" void ggml_cuda_nvfp4_register_weight_global(const char * name, float g) {
+    if (!name || !*name) return;
+    std::lock_guard<std::mutex> lk(g_wglobal_mtx);
+    g_wglobal[name] = g;
+}
+
+// Drop every registered weight global. Required before re-registering for a hot-swapped
+// DiT variant (sd_ctx_swap_diffusion_model): this map is process-global, so swapping an
+// UNFOLDED gguf out for a FOLDED one (or for a different unfolded one) must not leave the
+// outgoing model's globals behind — a folded gguf already folds its global into the block
+// scale, so a stale entry would scale it a second time.
+extern "C" void ggml_cuda_nvfp4_clear_weight_globals(void) {
+    std::lock_guard<std::mutex> lk(g_wglobal_mtx);
+    g_wglobal.clear();
+}
+
+bool ggml_cuda_nvfp4_weight_global_registered(const char * name) {
+    if (!name || !*name) return false;
+    std::lock_guard<std::mutex> lk(g_wglobal_mtx);
+    return g_wglobal.find(name) != g_wglobal.end();
+}
+
+static float nvfp4_weight_global_for(const char * name) {
+    if (!name || !*name) return 1.0f;
+    std::lock_guard<std::mutex> lk(g_wglobal_mtx);
+    auto it = g_wglobal.find(name);
+    return it == g_wglobal.end() ? 1.0f : it->second;
 }
 
 struct nvfp4_weight_repacked {
@@ -394,10 +442,16 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     // 3) cuBLASLt FP4 GEMM: D[M,N] (row-major) = A_w[N,K] @ B_a[M,K]^T
     // cuBLAS column-major: m=N, n=M, k=K; A=weight (TN), B=activation.
     // alpha = A_per_tensor for the two-level activation quant (carries the per-tensor
-    // global the kernel factored out of the stored block scales); 1.0 otherwise. Weights
-    // already fold their own global into the block scale, so alpha carries only A's.
+    // global the kernel factored out of the stored block scales); 1.0 otherwise.
     const int m=N, n=M, k=K;
-    float alpha_h = a_per_tensor > 0.f ? a_per_tensor : 1.0f;
+    // alpha carries BOTH per-tensor globals: the activation's (from the two-level act
+    // quant) and the weight's (ModelOpt weight_scale_2, registered at load — see
+    // g_wglobal). An UNFOLDED-import gguf stores well-conditioned block scales and
+    // registers its weight global here, which is what lets the graph drop the per-Linear
+    // full-size ggml_mul. A legacy FOLDED gguf registers nothing -> w_global = 1.0 ->
+    // byte-identical to before.
+    const float w_global = nvfp4_weight_global_for(src0->name);
+    float alpha_h = (a_per_tensor > 0.f ? a_per_tensor : 1.0f) * w_global;
     static float beta_h = 0.0f;
 
     cublasLtMatmulDesc_t op = nullptr;

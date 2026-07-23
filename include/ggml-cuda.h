@@ -46,6 +46,27 @@ GGML_BACKEND_API void ggml_backend_cuda_trim_memory(ggml_backend_t backend);
 // away. No-op when ggml-cuda was built without cuDNN.
 GGML_BACKEND_API void ggml_backend_cuda_release_cudnn_conv3d_weights(void);
 
+// Register a per-tensor NVFP4 weight global scale (ModelOpt weight_scale_2) of an
+// UNFOLDED import, keyed by the ggml tensor name of the weight it belongs to. The FP4
+// cuBLASLt GEMM folds it into the matmul alpha, which is free, instead of the graph
+// paying a full-size elementwise multiply per Linear. Names that were never registered
+// multiply by 1.0 (legacy FOLDED gguf path stays byte-identical) — which means an
+// unfolded weight whose scalar was NOT registered produces silently wrong output, so
+// callers must gate any graph-level simplification on ggml_cuda_nvfp4_weight_global_folded().
+GGML_BACKEND_API void ggml_cuda_nvfp4_register_weight_global(const char * name, float g);
+
+// Drop every registered weight global. Must be called before re-registering for a
+// hot-swapped diffusion model: the registry is process-global, so stale entries would
+// either double-scale a folded gguf or mis-scale a different unfolded one.
+GGML_BACKEND_API void ggml_cuda_nvfp4_clear_weight_globals(void);
+
+// True iff a mul_mat of the NVFP4 weight named `name` on `backend` is GUARANTEED to be
+// served by the cuBLASLt FP4 path AND that path will apply the registered weight global
+// through the GEMM alpha. Only then may a caller elide its own compensating multiply.
+// False whenever anything is unproven (non-CUDA backend, FP4 cuBLASLt disabled,
+// pre-Blackwell device, name not registered) — the caller must then keep its multiply.
+GGML_BACKEND_API bool ggml_cuda_nvfp4_weight_global_folded(ggml_backend_t backend, const char * name);
+
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
