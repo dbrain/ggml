@@ -67,6 +67,16 @@ GGML_BACKEND_API void ggml_cuda_nvfp4_clear_weight_globals(void);
 // pre-Blackwell device, name not registered) — the caller must then keep its multiply.
 GGML_BACKEND_API bool ggml_cuda_nvfp4_weight_global_folded(ggml_backend_t backend, const char * name);
 
+// True iff `backend` can run an NVFP4 mul_mat with an F16 activation and an F16 destination
+// (the cuBLASLt FP4 GEMM: E2M1 activation quant that reads `half`, F32 accumulate, F16 store).
+// This is the ONLY such route, so a graph builder must consult this before choosing to run a
+// residual stream in F16 -- where it is false, every F16 mul_mat fails supports_op and
+// ggml_backend_sched drops those nodes to the CPU backend, which is catastrophic, not slow.
+// False for a non-CUDA backend, with the FP4 cuBLASLt env gate off, or pre-Blackwell.
+// NOTE: this answers the DEVICE question only. Per-node shape constraints (2D, contiguous,
+// K % 64 == 0) are still enforced independently by ggml_backend_supports_op().
+GGML_BACKEND_API bool ggml_cuda_nvfp4_f16_dst_available(ggml_backend_t backend);
+
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 

@@ -3013,8 +3013,17 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             add = cgraph->nodes[node_idx+2];
         }
 
-        GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
-        GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
+        // ggml_cuda_op_rms_norm() itself accepts an F16 stream, but the FUSED
+        // rms_norm+mul(+add) launcher below is F32-only (norm.cu reads src0/mul/add through
+        // `const float *`). These used to be GGML_ASSERTs, which was safe only while nothing
+        // could ever produce an F16 RMS_NORM. An F16 residual stream (LTX_DIT_F16) does:
+        // RMSNorm::forward emits rms_norm(x_f16) immediately followed by mul(w_f32), which
+        // satisfies ggml_can_fuse()'s adjacency/use-count checks and would abort the render
+        // here. Decline the fusion instead — the unfused F16 rms_norm + F16 mul then run as
+        // two ordinary kernels, which is what the reference implementation does too.
+        if (rms_norm->src[0]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32) {
+            return false;
+        }
 
         //rms norm only supports F32
         if (mul->src[0]->type != GGML_TYPE_F32 ||
@@ -4492,6 +4501,63 @@ bool ggml_cuda_nvfp4_weight_global_folded(ggml_backend_t backend, const char * n
     return ggml_cuda_nvfp4_weight_global_registered(name);
 }
 
+// Will a mul_mat node be served by the cuBLASLt FP4 GEMM on `device`?
+//
+// This is the ONLY route in ggml_cuda_mul_mat() that can consume an F16 activation with a
+// quantized weight, or produce an F16 destination. If it bails at run time the caller falls
+// through to ggml_cuda_mul_mat_cublas(), which writes its result through a `float *`
+// (ggml-cuda.cu:1448) -- so an F16 dst that reaches it overruns the destination buffer.
+// Mirrors the dispatch gate in ggml_cuda_mul_mat() AND the bail list at the top of
+// ggml_cuda_nvfp4_cublaslt_mul_mat(), so a `true` here is a promise the fast path runs.
+static bool ggml_cuda_nvfp4_fp4_gemm_serves(int device, const ggml_tensor * op) {
+    const ggml_tensor * a = op->src[0];
+    const ggml_tensor * b = op->src[1];
+
+    if (op->op != GGML_OP_MUL_MAT || a == nullptr || b == nullptr) {
+        return false;
+    }
+    // dispatch gate (ggml_cuda_mul_mat)
+    if (a->type != GGML_TYPE_NVFP4 ||
+        !ggml_cuda_nvfp4_cublaslt_enabled() ||
+        !blackwell_mma_available(ggml_cuda_info().devices[device].cc)) {
+        return false;
+    }
+    // bail list (ggml_cuda_nvfp4_cublaslt_mul_mat)
+    if (b->type != GGML_TYPE_F32 && b->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (a->ne[2] != 1 || a->ne[3] != 1 || b->ne[2] != 1 || b->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(op)) {
+        return false;
+    }
+    if (b->ne[0] != a->ne[0] || a->ne[0] % 64 != 0) {   // K must be whole 64-element blocks
+        return false;
+    }
+    if (op->ne[0] != a->ne[1] || op->ne[1] != b->ne[1]) {
+        return false;
+    }
+    return true;
+}
+
+bool ggml_cuda_nvfp4_f16_dst_available(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    if (!ggml_cuda_nvfp4_cublaslt_enabled()) {
+        return false;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (cuda_ctx == nullptr) {
+        return false;
+    }
+    return blackwell_mma_available(ggml_cuda_info().devices[cuda_ctx->device].cc);
+}
+
 void ggml_backend_cuda_trim_memory(ggml_backend_t backend) {
     if (!ggml_backend_is_cuda(backend)) {
         return;
@@ -4837,8 +4903,31 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (a->nb[0] != ggml_element_size(a) || b->nb[0] != ggml_element_size(b)) {
                     return false; // TODO this could in principle be implemented though currently there is no use case.
                 }
-                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
+                // ADDITIVE (F16 residual stream, e.g. LTX_DIT_F16): an NVFP4 weight DOES
+                // accept an F16 activation and CAN store an F16 destination — the cuBLASLt
+                // FP4 GEMM quantizes the activation to E2M1 itself (its quant kernel reads
+                // `half` directly, nvfp4-cublaslt.cu:305,384-390) and accumulates in F32 with
+                // an F16 store (nvfp4-cublaslt.cu:307,418). Advertising that is what keeps an
+                // F16 stream on the fast tensor-core path at all: without it every DiT Linear
+                // fails supports_op, ggml_backend_sched drops the node to the CPU backend, and
+                // the render is destroyed rather than merely slow.
+                //
+                // Both relaxations are gated on ggml_cuda_nvfp4_fp4_gemm_serves(), which
+                // mirrors BOTH the dispatch gate in ggml_cuda_mul_mat() (env + Blackwell) and
+                // the bail list inside ggml_cuda_nvfp4_cublaslt_mul_mat() (shapes, K%64,
+                // contiguity). That matters: if the FP4 path bails at run time the caller
+                // falls into ggml_cuda_mul_mat_cublas(), which writes through a `float *`
+                // (ggml-cuda.cu:1448) and would overrun an F16 destination. Anything not
+                // provably served keeps the original reject, so the scheduler casts to F32 and
+                // the standard MMQ/dequant path runs exactly as before.
+                const bool fp4_gemm_serves = ggml_cuda_nvfp4_fp4_gemm_serves(dev_ctx->device, op);
+                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 && !fp4_gemm_serves) {
                     return false;
+                }
+                if (op->type == GGML_TYPE_F16) {
+                    // The FP4 GEMM is the ONLY F16-dst producer wired up here; deliberately
+                    // not widened (nothing else requested an F16 dst before this change).
+                    return fp4_gemm_serves && b->type == GGML_TYPE_F16;
                 }
 #ifdef GGML_USE_MUSA
                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
