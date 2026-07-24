@@ -1832,6 +1832,20 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    // FP8 (e4m3) FFN path: route the matched Linears (name filter GGML_FP8_LAYERS, default
+    // "ff.net") through an 8-bit-activation cuBLASLt FP8xFP8 GEMM to kill the FP4-activation
+    // "worm"/stipple on flat regions. Checked BEFORE the FP4 path so a matched weight takes
+    // FP8; everything else falls through to FP4. Env-gated (GGML_FP8_FFN=1) => unset is
+    // byte-identical to the FP4-only behaviour. Blackwell-gated exactly like FP4 (sm86/3060
+    // keeps the existing path). A late bail inside returns false with dst untouched, so the
+    // FP4 branch below (then MMQ/dequant) still gets its chance.
+    if (src0->type == GGML_TYPE_NVFP4 && ggml_cuda_fp8_ffn_enabled()
+            && ggml_cuda_fp8_ffn_name_match(src0->name)
+            && blackwell_mma_available(ggml_cuda_info().devices[ctx.device].cc)
+            && ggml_cuda_fp8_cublaslt_mul_mat(ctx, src0, src1, dst)) {
+        return;
+    }
+
     // Phase-1 fast FP4 GEMM: NVFP4 weight matmul -> cuBLASLt blockscaled FP4 (Blackwell
     // FP4 tensor cores, ~3.3x MMQ). Env-gated (GGML_NVFP4_CUBLASLT=1); falls back cleanly.
     if (src0->type == GGML_TYPE_NVFP4 && ggml_cuda_nvfp4_cublaslt_enabled()
@@ -4479,16 +4493,28 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
 }
 
 // Proof, for the graph builder, that this weight's registered NVFP4 weight global will be
-// applied by the FP4 cuBLASLt GEMM (folded into alpha) rather than dropped. Deliberately
-// mirrors — and lives in the same file as — the dispatch conditions in ggml_cuda_mul_mat(),
-// so the two cannot drift apart: the fast path is only taken for an NVFP4 src0 when the env
-// gate is on and the target device has Blackwell MMA. Everything the caller cannot prove
-// (tensor shapes/types/contiguity) stays the caller's responsibility.
+// applied inside the cuBLASLt GEMM rather than dropped. Deliberately mirrors — and lives in
+// the same file as — the dispatch conditions in ggml_cuda_mul_mat(), so the two cannot drift
+// apart. Everything the caller cannot prove (tensor shapes/types/contiguity) stays the
+// caller's responsibility.
+//
+// TWO routes fold the scalar, and BOTH must be accounted for or the graph elides a multiply
+// nothing performs:
+//   - the FP4 GEMM folds it into the matmul alpha (ggml_cuda_nvfp4_cublaslt_mul_mat);
+//   - the FP8 FFN GEMM folds it into the NVFP4 -> e4m3 weight promotion itself
+//     (fp8_w_amax_kernel / fp8_w_quant_kernel take `wglobal`).
+// The FP8 path is dispatched FIRST, so with GGML_FP8_LAYERS=transformer_blocks it takes
+// every DiT Linear away from the FP4 alpha fold. Without the FP8 disjunct below, turning
+// GGML_NVFP4_CUBLASLT off while leaving GGML_FP8_FFN on would keep the explicit graph
+// multiply while the FP8 GEMM ALSO applies the scalar -> double-scaled output. With it, the
+// predicate tracks whichever path will actually run.
 bool ggml_cuda_nvfp4_weight_global_folded(ggml_backend_t backend, const char * name) {
     if (!ggml_backend_is_cuda(backend)) {
         return false;
     }
-    if (!ggml_cuda_nvfp4_cublaslt_enabled()) {
+    const bool fp4_folds = ggml_cuda_nvfp4_cublaslt_enabled();
+    const bool fp8_folds = ggml_cuda_fp8_ffn_enabled() && ggml_cuda_fp8_ffn_name_match(name);
+    if (!fp4_folds && !fp8_folds) {
         return false;
     }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
@@ -4501,28 +4527,20 @@ bool ggml_cuda_nvfp4_weight_global_folded(ggml_backend_t backend, const char * n
     return ggml_cuda_nvfp4_weight_global_registered(name);
 }
 
-// Will a mul_mat node be served by the cuBLASLt FP4 GEMM on `device`?
-//
-// This is the ONLY route in ggml_cuda_mul_mat() that can consume an F16 activation with a
-// quantized weight, or produce an F16 destination. If it bails at run time the caller falls
-// through to ggml_cuda_mul_mat_cublas(), which writes its result through a `float *`
-// (ggml-cuda.cu:1448) -- so an F16 dst that reaches it overruns the destination buffer.
-// Mirrors the dispatch gate in ggml_cuda_mul_mat() AND the bail list at the top of
-// ggml_cuda_nvfp4_cublaslt_mul_mat(), so a `true` here is a promise the fast path runs.
-static bool ggml_cuda_nvfp4_fp4_gemm_serves(int device, const ggml_tensor * op) {
+// Shape/type bail list shared by BOTH cuBLASLt GEMM entry points. The FP4 path
+// (ggml_cuda_nvfp4_cublaslt_mul_mat) and the FP8 FFN path (ggml_cuda_fp8_cublaslt_mul_mat)
+// open with byte-for-byte the same guard sequence; keeping one copy here is what stops the
+// supports_op promise from drifting away from either implementation.
+static bool ggml_cuda_nvfp4_cublaslt_shapes_ok(const ggml_tensor * op) {
     const ggml_tensor * a = op->src[0];
     const ggml_tensor * b = op->src[1];
 
     if (op->op != GGML_OP_MUL_MAT || a == nullptr || b == nullptr) {
         return false;
     }
-    // dispatch gate (ggml_cuda_mul_mat)
-    if (a->type != GGML_TYPE_NVFP4 ||
-        !ggml_cuda_nvfp4_cublaslt_enabled() ||
-        !blackwell_mma_available(ggml_cuda_info().devices[device].cc)) {
+    if (a->type != GGML_TYPE_NVFP4) {
         return false;
     }
-    // bail list (ggml_cuda_nvfp4_cublaslt_mul_mat)
     if (b->type != GGML_TYPE_F32 && b->type != GGML_TYPE_F16) {
         return false;
     }
@@ -4544,6 +4562,53 @@ static bool ggml_cuda_nvfp4_fp4_gemm_serves(int device, const ggml_tensor * op) 
     return true;
 }
 
+// Will a mul_mat node be served by the cuBLASLt FP4 GEMM on `device`?
+// Mirrors the dispatch gate in ggml_cuda_mul_mat() AND the bail list at the top of
+// ggml_cuda_nvfp4_cublaslt_mul_mat(), so a `true` here is a promise the fast path runs.
+static bool ggml_cuda_nvfp4_fp4_gemm_serves(int device, const ggml_tensor * op) {
+    if (!ggml_cuda_nvfp4_cublaslt_enabled() ||
+        !blackwell_mma_available(ggml_cuda_info().devices[device].cc)) {
+        return false;
+    }
+    return ggml_cuda_nvfp4_cublaslt_shapes_ok(op);
+}
+
+// Will a mul_mat node be served by the cuBLASLt FP8 (e4m3) FFN GEMM on `device`?
+// Same shape contract as the FP4 path, different gate: env GGML_FP8_FFN plus the
+// GGML_FP8_LAYERS name filter. Mirrors the dispatch branch in ggml_cuda_mul_mat().
+static bool ggml_cuda_nvfp4_fp8_gemm_serves(int device, const ggml_tensor * op) {
+    const ggml_tensor * a = op->src[0];
+    if (a == nullptr) {
+        return false;
+    }
+    if (!ggml_cuda_fp8_ffn_enabled() ||
+        !ggml_cuda_fp8_ffn_name_match(a->name) ||
+        !blackwell_mma_available(ggml_cuda_info().devices[device].cc)) {
+        return false;
+    }
+    return ggml_cuda_nvfp4_cublaslt_shapes_ok(op);
+}
+
+// Will a mul_mat node be served by EITHER cuBLASLt GEMM on `device`?
+//
+// These are the ONLY routes in ggml_cuda_mul_mat() that can consume an F16 activation with a
+// quantized weight, or produce an F16 destination. If both bail at run time the caller falls
+// through to ggml_cuda_mul_mat_cublas(), which writes its result through a `float *`
+// (ggml-cuda.cu:1448) -- so an F16 dst that reaches it overruns the destination buffer.
+// This must therefore be exactly the union of the two dispatch gates: too narrow and
+// ggml_backend_sched drops DiT Linears to the CPU backend; too wide and an F16 dst reaches a
+// path that cannot write it.
+static bool ggml_cuda_nvfp4_cublaslt_gemm_serves(int device, const ggml_tensor * op) {
+    return ggml_cuda_nvfp4_fp4_gemm_serves(device, op) ||
+           ggml_cuda_nvfp4_fp8_gemm_serves(device, op);
+}
+
+// Deliberately NOT widened with the FP8 FFN gate.  This decides whether the whole DiT
+// residual stream runs in F16, which is an ALL-Linears question, whereas GGML_FP8_FFN is
+// per-name (GGML_FP8_LAYERS).  With FP8 on and GGML_NVFP4_CUBLASLT off, a name that did not
+// match the filter would have no F16-capable path at all -- supports_op would reject it and
+// ggml_backend_sched would drop the node to the CPU backend.  Requiring the FP4 path (which
+// serves every NVFP4 Linear unconditionally) keeps the F16 stream an all-or-nothing decision.
 bool ggml_cuda_nvfp4_f16_dst_available(ggml_backend_t backend) {
     if (!ggml_backend_is_cuda(backend)) {
         return false;
@@ -4912,22 +4977,28 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 // fails supports_op, ggml_backend_sched drops the node to the CPU backend, and
                 // the render is destroyed rather than merely slow.
                 //
-                // Both relaxations are gated on ggml_cuda_nvfp4_fp4_gemm_serves(), which
-                // mirrors BOTH the dispatch gate in ggml_cuda_mul_mat() (env + Blackwell) and
-                // the bail list inside ggml_cuda_nvfp4_cublaslt_mul_mat() (shapes, K%64,
-                // contiguity). That matters: if the FP4 path bails at run time the caller
-                // falls into ggml_cuda_mul_mat_cublas(), which writes through a `float *`
+                // Both relaxations are gated on ggml_cuda_nvfp4_cublaslt_gemm_serves(), which
+                // mirrors BOTH dispatch gates in ggml_cuda_mul_mat() (FP8 FFN env + name
+                // filter, FP4 env; each + Blackwell) and the shared bail list inside the two
+                // cuBLASLt entry points (shapes, K%64, contiguity). That matters: if every
+                // fast path bails at run time the caller falls into
+                // ggml_cuda_mul_mat_cublas(), which writes through a `float *`
                 // (ggml-cuda.cu:1448) and would overrun an F16 destination. Anything not
                 // provably served keeps the original reject, so the scheduler casts to F32 and
                 // the standard MMQ/dequant path runs exactly as before.
-                const bool fp4_gemm_serves = ggml_cuda_nvfp4_fp4_gemm_serves(dev_ctx->device, op);
-                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 && !fp4_gemm_serves) {
+                //
+                // The FP8 disjunct is what stops GGML_FP8_FFN=1 from silently narrowing this:
+                // the FP8 path is dispatched FIRST and (with GGML_FP8_LAYERS=transformer_blocks)
+                // takes every DiT Linear, so the union — not the FP4 term alone — is the honest
+                // answer to "can this backend serve the node".
+                const bool cublaslt_gemm_serves = ggml_cuda_nvfp4_cublaslt_gemm_serves(dev_ctx->device, op);
+                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 && !cublaslt_gemm_serves) {
                     return false;
                 }
                 if (op->type == GGML_TYPE_F16) {
-                    // The FP4 GEMM is the ONLY F16-dst producer wired up here; deliberately
-                    // not widened (nothing else requested an F16 dst before this change).
-                    return fp4_gemm_serves && b->type == GGML_TYPE_F16;
+                    // The cuBLASLt FP4/FP8 GEMMs are the ONLY F16-dst producers wired up here;
+                    // deliberately not widened further.
+                    return cublaslt_gemm_serves && b->type == GGML_TYPE_F16;
                 }
 #ifdef GGML_USE_MUSA
                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;

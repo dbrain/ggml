@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <map>
 #include <string>
+#include <cstring>
 #include <tuple>
 
 // SWIZZLE_32_4_4 offset over a (rows x col_length) UE4M3 scale grid (comfy float_utils)
@@ -536,6 +537,362 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
                 fprintf(stderr, "[NVFP4_NAN] M=%d K=%d N=%d  dst0=%g max8=%g %s\n",
                         M, K, N, h[0], mx, bad?"NONFINITE":"BIG");
         }
+    }
+
+    if (Ad) cublasLtMatrixLayoutDestroy(Ad);
+    if (Bd) cublasLtMatrixLayoutDestroy(Bd);
+    if (Cd) cublasLtMatrixLayoutDestroy(Cd);
+    if (Dd) cublasLtMatrixLayoutDestroy(Dd);
+    if (op) cublasLtMatmulDescDestroy(op);
+    return ok;
+}
+
+// ============================ FP8 (e4m3) FFN path ============================
+// Ported from the prod fork (ggml a965c1ea, the "worm fix") + dfa463bb (the F16-store clamp).
+//
+// WHY: the FP4 path quantizes the ACTIVATION to E2M1 as well as the weight. A flat,
+// low-variance 16-element block sits near the FP4 `0 <-> 0.5*scale` decision boundary, so
+// a tiny frame-to-frame drift flips the whole block between codes -> a pulsating
+// blob/stipple ("worm") on flat coloured backgrounds under motion. The fix is the
+// Q4_K-clean recipe: keep the 4-bit WEIGHT, but give the ACTIVATION 8 bits.
+//
+// HOW: cuBLASLt has no mixed FP8xFP4 GEMM (unsupported on sm120), so the NVFP4-stored
+// weight is PROMOTED to e4m3 per call (decoded verbatim off its own FP4 grid -> no extra
+// weight loss, and no extra VRAM: the weight stays FP4-STORED, the e4m3 copy is transient
+// pool scratch) and the activation is quantized to e4m3. Both carry a per-tensor SCALAR_32F
+// scale (amax/448) on the cuBLASLt A/B scale pointers; alpha = 1. Costs ~2x the FP4 GEMM
+// instead of BF16's ~8x.
+//
+// Nothing here runs unless GGML_FP8_FFN=1 => the flag unset is byte-identical to today.
+
+#define FP8_E4M3_MAX 448.0f
+
+// per-tensor amax of the *reconstructed* NVFP4 weight (decoded to true float values,
+// matching the cuBLASLt convention: kvalues_mxfp4 = 2x e2m1, ue4m3_to_fp32 = scale/2, the
+// 2x cancel => stored bytes are the standard e2m1*e4m3 product; * the per-tensor wglobal).
+//
+// HAZARD (w_global): with GGML_FP8_LAYERS=transformer_blocks this path takes EVERY DiT
+// Linear, so those weights no longer reach the FP4 GEMM's `alpha = A_global * W_global`
+// fold — and the graph builder has already ELIDED the per-Linear ggml_mul on the strength of
+// ggml_cuda_nvfp4_weight_global_folded(). The scalar therefore has to be applied HERE or
+// every DiT Linear silently loses its per-tensor weight scale. It is folded into the
+// promotion itself (both the amax and the decode multiply by `wglobal`), exactly as prod
+// does, so the e4m3 weight bytes + their scalar scale already carry it and alpha stays 1.
+static __global__ void fp8_w_amax_kernel(const block_nvfp4 * __restrict__ W,
+                                         unsigned int * __restrict__ amax_bits,
+                                         int N, int K, float wglobal) {
+    const int nsub = K/16, nblk = K/64;
+    float local = 0.f;
+    for (long t = (long)blockIdx.x*blockDim.x + threadIdx.x; t < (long)N*nsub;
+         t += (long)gridDim.x*blockDim.x) {
+        const int r = (int)(t / nsub), ss = (int)(t % nsub);
+        const int block = ss/4, s = ss%4;
+        const block_nvfp4 & b = W[(long)r*nblk + block];
+        const float sc = ggml_cuda_ue4m3_to_fp32(b.d[s]) * wglobal;
+        const uint8_t * qs = &b.qs[s*8];
+        #pragma unroll
+        for (int e=0;e<16;e++) {
+            const uint8_t nib = (e<8) ? (qs[e]&0xF) : (qs[e-8]>>4);
+            local = fmaxf(local, fabsf(kvalues_mxfp4[nib & 7] * sc));
+        }
+    }
+    __shared__ float sh[256];
+    sh[threadIdx.x] = local; __syncthreads();
+    for (int st = blockDim.x/2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) sh[threadIdx.x] = fmaxf(sh[threadIdx.x], sh[threadIdx.x+st]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicMax(amax_bits, __float_as_uint(sh[0]));
+}
+
+// decode NVFP4 weight -> e4m3, row-major [N,K] (1 byte/elem). `scale` is the device-side
+// per-tensor scalar (amax/448) produced by fp8_scale_from_amax; wglobal folded in (see above).
+static __global__ void fp8_w_quant_kernel(const block_nvfp4 * __restrict__ W,
+                                          uint8_t * __restrict__ out, int N, int K,
+                                          float wglobal, const float * __restrict__ scale) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    const int nsub = K/16, nblk = K/64;
+    const long idx = (long)blockIdx.x*blockDim.x + threadIdx.x;
+    if (idx >= (long)N*nsub) return;
+    const int r = (int)(idx / nsub), ss = (int)(idx % nsub);
+    const int block = ss/4, s = ss%4;
+    const block_nvfp4 & b = W[(long)r*nblk + block];
+    const float sc  = ggml_cuda_ue4m3_to_fp32(b.d[s]) * wglobal;
+    const float inv = 1.0f / (*scale);
+    const uint8_t * qs = &b.qs[s*8];
+    uint8_t * od = &out[(long)r*K + (long)ss*16];   // row-major [N,K]
+    #pragma unroll
+    for (int e=0;e<16;e++) {
+        const uint8_t nib = (e<8) ? (qs[e]&0xF) : (qs[e-8]>>4);
+        float v = kvalues_mxfp4[nib & 7] * sc;
+        if (nib & 8) v = -v;
+        const __nv_fp8_e4m3 q(v * inv);
+        od[e] = q.__x;
+    }
+#else
+    NO_DEVICE_CODE;
+#endif
+}
+
+template <typename act_t>
+static __global__ void fp8_a_amax_kernel(const act_t * __restrict__ X,
+                                         unsigned int * __restrict__ amax_bits, long n) {
+    float local = 0.f;
+    for (long i = (long)blockIdx.x*blockDim.x + threadIdx.x; i < n;
+         i += (long)gridDim.x*blockDim.x)
+        local = fmaxf(local, fabsf(nvfp4_load_act(X[i])));
+    __shared__ float sh[256];
+    sh[threadIdx.x] = local; __syncthreads();
+    for (int st = blockDim.x/2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) sh[threadIdx.x] = fmaxf(sh[threadIdx.x], sh[threadIdx.x+st]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicMax(amax_bits, __float_as_uint(sh[0]));
+}
+
+// quantize activation -> e4m3, flat (src1 [K,M] contiguous == row-major [M,K]).
+// Templated on the element type so the F16 residual stream (LTX_DIT_F16) feeds in with no
+// per-Linear F16->F32 cast, exactly like the FP4 quant kernel above.
+template <typename act_t>
+static __global__ void fp8_a_quant_kernel(const act_t * __restrict__ X,
+                                          uint8_t * __restrict__ out, long n,
+                                          const float * __restrict__ scale) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    const float inv = 1.0f / (*scale);
+    for (long i = (long)blockIdx.x*blockDim.x + threadIdx.x; i < n;
+         i += (long)gridDim.x*blockDim.x) {
+        const __nv_fp8_e4m3 q(nvfp4_load_act(X[i]) * inv);
+        out[i] = q.__x;
+    }
+#else
+    NO_DEVICE_CODE;
+#endif
+}
+
+// finalize per-tensor SCALAR scale = amax / 448 (e4m3 max). amax==0 => 1 (all-zero tensor).
+static __global__ void fp8_scale_from_amax(const unsigned int * __restrict__ amax_bits,
+                                           float * __restrict__ scale_out) {
+    const float a = __uint_as_float(*amax_bits);
+    scale_out[0] = (a > 0.f) ? a * (1.0f / FP8_E4M3_MAX) : 1.0f;
+}
+
+bool ggml_cuda_fp8_ffn_enabled() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_FP8_FFN"); v = (e && atoi(e)) ? 1 : 0; }
+    return v == 1;
+}
+
+// substring filter (GGML_FP8_LAYERS, default "ff.net"): matches the DiT FFN up/gate
+// (ff.net.0.proj) + down-proj (ff.net.2) Linears; attention/other linears never match.
+// Prod ships GGML_FP8_LAYERS=transformer_blocks, i.e. ALL 1344 DiT linears.
+bool ggml_cuda_fp8_ffn_name_match(const char * name) {
+    if (!name) return false;
+    static std::string filt;
+    static int init = 0;
+    if (!init) { const char * e = getenv("GGML_FP8_LAYERS"); filt = (e && *e) ? e : "ff.net"; init = 1; }
+    return strstr(name, filt.c_str()) != nullptr;
+}
+
+// MANDATORY F16-store clamp (ggml dfa463bb). The cuBLASLt FP8 GEMM accumulates in F32; a
+// deep-block result > 65504 stores as +-inf into an F16 dst -> RoPE casts q/k F16->F32 ->
+// inf*cos - inf*sin = NaN -> softmax's row-max over NaN is comparison-ORDER-dependent ->
+// nondeterministic output / white frames. That was a live production bug 2026-07-04..07-17.
+//
+// DEFAULT ON, and it is a CORRECTNESS fix, not a tunable: for in-range values both paths
+// round the same F32 to F16 round-to-nearest, so they are bit-identical unless |x| > 65504.
+// It also has a second, structural benefit here — the GEMM writes an F32 pool temp, so a
+// late cuBLASLt failure can never leave a PARTIALLY-WRITTEN F16 destination behind.
+// This branch is not an edge case on this tree: LTX_DIT_F16 makes an F16 dst the norm.
+// Escape hatch GGML_F8_NO_CLAMP_OUT=1 to A/B the old (overflowing) behaviour.
+static bool ggml_cuda_f8_clamp_out_enabled() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_F8_NO_CLAMP_OUT"); v = (e && atoi(e)) ? 0 : 1; }
+    return v == 1;
+}
+
+static __global__ void fp8_clamp_f32_to_f16(const float * __restrict__ in, half * __restrict__ out, size_t n) {
+    for (size_t i = (size_t)blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x*blockDim.x) {
+        const float v = fminf(fmaxf(in[i], -65504.0f), 65504.0f);   // IEEE fmin/fmax: NaN -> -65504 (harmless; F32 accum has no NaN)
+        out[i] = __float2half_rn(v);
+    }
+}
+
+bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
+                                    const ggml_tensor * src0,
+                                    const ggml_tensor * src1,
+                                    ggml_tensor * dst) {
+    // Bail list — MUST stay in sync with ggml_cuda_nvfp4_cublaslt_shapes_ok() in ggml-cuda.cu,
+    // which promises supports_op() that this function runs for the nodes it advertises.
+    // Every bail here is side-effect-free (dst untouched) so the caller falls cleanly
+    // through to the FP4 / MMQ / dequant path.
+    if (src0->type != GGML_TYPE_NVFP4) return false;
+    if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) return false;
+    if (dst->type  != GGML_TYPE_F32 && dst->type  != GGML_TYPE_F16) return false;
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) return false;
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
+
+    const int K = src0->ne[0];   // contraction
+    const int N = src0->ne[1];   // out features
+    const int M = src1->ne[1];   // tokens
+    if (src1->ne[0] != K) return false;
+    if (K % 64 != 0)      return false;
+    if (dst->ne[0] != N || dst->ne[1] != M) return false;
+
+    cudaStream_t stream = ctx.stream();
+    cublasLtHandle_t lt = get_lt();
+    if (!lt) return false;
+
+    // See the fp8_w_amax_kernel header: this scalar MUST be applied here, because the graph
+    // builder elided the per-Linear ggml_mul on the promise that the GEMM folds it.
+    // Unregistered name -> 1.0, which is correct for a legacy FOLDED gguf (it has no globals)
+    // and is exactly what ggml_cuda_nvfp4_weight_global_registered() gates the elision on.
+    const float w_global = nvfp4_weight_global_for(src0->name);
+
+    // ggml's CUDA pool is a STACK allocator (it asserts frees are the exact reverse of
+    // allocs). Declare-and-allocate in one order and let the destructors unwind in reverse
+    // declaration order; every early return below is therefore LIFO-safe.
+
+    // 1) weight -> e4m3 [N,K] (transient pool scratch; the weight stays FP4-STORED, so the
+    //    steady-state VRAM delta of this path is ~zero).
+    ggml_cuda_pool_alloc<unsigned int> w_amax (ctx.pool(), 1);
+    ggml_cuda_pool_alloc<float>        w_scale(ctx.pool(), 1);
+    ggml_cuda_pool_alloc<uint8_t>      w_fp8  (ctx.pool(), (size_t)N*(size_t)K);
+    {
+        cudaMemsetAsync(w_amax.get(), 0, sizeof(unsigned int), stream);
+        const int  threads = 256;
+        const long total   = (long)N*(K/16);
+        unsigned int grid = (unsigned int)((total + threads - 1)/threads);
+        if (grid > 65535u) grid = 65535u;
+        if (grid == 0)     grid = 1;
+        fp8_w_amax_kernel<<<grid, threads, 0, stream>>>((const block_nvfp4*)src0->data, w_amax.get(), N, K, w_global);
+        fp8_scale_from_amax<<<1, 1, 0, stream>>>(w_amax.get(), w_scale.get());
+        fp8_w_quant_kernel<<<grid, threads, 0, stream>>>((const block_nvfp4*)src0->data, w_fp8.get(), N, K, w_global, w_scale.get());
+        if (cudaPeekAtLastError() != cudaSuccess) return false;
+    }
+
+    // 2) activation -> e4m3 [M,K] (src1 [K,M] contiguous == row-major [M,K]).
+    const long n_act = (long)M*(long)K;
+    ggml_cuda_pool_alloc<unsigned int> a_amax (ctx.pool(), 1);
+    ggml_cuda_pool_alloc<float>        a_scale(ctx.pool(), 1);
+    ggml_cuda_pool_alloc<uint8_t>      a_fp8  (ctx.pool(), (size_t)n_act);
+    {
+        cudaMemsetAsync(a_amax.get(), 0, sizeof(unsigned int), stream);
+        const int threads = 256;
+        unsigned int grid = (unsigned int)((n_act + threads - 1)/threads);
+        if (grid > 1024u) grid = 1024u;
+        if (grid == 0)    grid = 1;
+        if (src1->type == GGML_TYPE_F16) {
+            fp8_a_amax_kernel<half> <<<grid, threads, 0, stream>>>((const half*)  src1->data, a_amax.get(), n_act);
+        } else {
+            fp8_a_amax_kernel<float><<<grid, threads, 0, stream>>>((const float*) src1->data, a_amax.get(), n_act);
+        }
+        fp8_scale_from_amax<<<1, 1, 0, stream>>>(a_amax.get(), a_scale.get());
+        unsigned int qgrid = (unsigned int)((n_act + threads - 1)/threads);
+        if (qgrid > 65535u) qgrid = 65535u;
+        if (qgrid == 0)     qgrid = 1;
+        if (src1->type == GGML_TYPE_F16) {
+            fp8_a_quant_kernel<half> <<<qgrid, threads, 0, stream>>>((const half*)  src1->data, a_fp8.get(), n_act, a_scale.get());
+        } else {
+            fp8_a_quant_kernel<float><<<qgrid, threads, 0, stream>>>((const float*) src1->data, a_fp8.get(), n_act, a_scale.get());
+        }
+        if (cudaPeekAtLastError() != cudaSuccess) return false;
+    }
+
+    // 3) cuBLASLt FP8xFP8 GEMM: D[M,N] = W_fp8[N,K] @ A_fp8[M,K]^T. Column-major m=N,n=M,k=K;
+    //    A=weight (TN, e4m3), B=act (N, e4m3). Per-tensor SCALAR scales on A/B; alpha = 1
+    //    (w_global is already inside the weight's e4m3 bytes + scalar scale).
+    const int m=N, n=M, k=K;
+    float alpha_h = 1.0f; static float beta_h = 0.0f;
+
+    cublasLtMatmulDesc_t op = nullptr;
+    if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS) return false;
+    cublasLtMatmulMatrixScale_t sm = CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &sm, sizeof(sm));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &sm, sizeof(sm));
+    cublasOperation_t T=CUBLAS_OP_T, Nn=CUBLAS_OP_N;
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &T, sizeof(T));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &Nn, sizeof(Nn));
+    void* wsp = (void*)w_scale.get(); void* asp = (void*)a_scale.get();
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &wsp, sizeof(wsp));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &asp, sizeof(asp));
+    cublasDataType_t st = CUDA_R_32F;
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_SCALE_TYPE, &st, sizeof(st));
+
+    // F16-store clamp (see ggml_cuda_f8_clamp_out_enabled): accumulate into an F32 pool temp
+    // (one Linear's output — transient, ~no VRAM cost) and clamp+downconvert into the F16 dst.
+    const bool use_f32_temp = ggml_cuda_f8_clamp_out_enabled() && dst->type == GGML_TYPE_F16;
+    ggml_cuda_pool_alloc<float> d_f32(ctx.pool());
+    void * gemm_out = dst->data;
+    if (use_f32_temp) gemm_out = d_f32.alloc((size_t)N * (size_t)M);
+
+    const cublasDataType_t out_dt = (dst->type == GGML_TYPE_F16 && !use_f32_temp) ? CUDA_R_16F : CUDA_R_32F;
+    cublasLtMatrixLayout_t Ad=nullptr,Bd=nullptr,Cd=nullptr,Dd=nullptr;
+    cublasLtMatrixLayoutCreate(&Ad, CUDA_R_8F_E4M3, k, m, k);
+    cublasLtMatrixLayoutCreate(&Bd, CUDA_R_8F_E4M3, k, n, k);
+    cublasLtMatrixLayoutCreate(&Cd, out_dt, m, n, m);
+    cublasLtMatrixLayoutCreate(&Dd, out_dt, m, n, m);
+
+    // cuBLASLt REQUIRES a 256-byte-aligned matmul workspace; the ggml pool can hand back a
+    // 128-byte-offset pointer depending on prior allocs. A misaligned workspace makes
+    // cublasLtMatmul return CUBLAS_STATUS_INVALID_VALUE(7) -> silent fall-through to a path
+    // that does NOT apply w_global -> wrong pixels. Over-allocate +256 and round up.
+    size_t wsz = 32*1024*1024;
+    ggml_cuda_pool_alloc<uint8_t> ws(ctx.pool(), wsz + 256);
+    uint8_t * ws_ptr = (uint8_t *)(((uintptr_t)ws.get() + 255) & ~(uintptr_t)255);
+
+    // Per-shape ALGO cache (thread_local, mirrors the FP4 path): removes the per-call
+    // heuristic query, which is both the host-serializing cost and a source of run-to-run
+    // nondeterminism (it can hand back a different algo per call).
+    static int s_nocache = -1;
+    if (s_nocache < 0) { const char* e = getenv("GGML_NVFP4_CUBLASLT_NOCACHE"); s_nocache = (e && atoi(e)) ? 1 : 0; }
+    static thread_local std::map<std::tuple<int,int,int,int>, cublasLtMatmulAlgo_t> g_fp8_algo_cache;
+    const auto key = std::make_tuple(m, n, k, (int)out_dt);
+
+    cublasLtMatmulAlgo_t algo; bool have_algo = false;
+    if (!s_nocache) { auto it = g_fp8_algo_cache.find(key); if (it != g_fp8_algo_cache.end()) { algo = it->second; have_algo = true; } }
+    if (!have_algo) {
+        cublasLtMatmulPreference_t pref=nullptr;
+        cublasLtMatmulPreferenceCreate(&pref);
+        cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsz, sizeof(wsz));
+        cublasLtMatmulHeuristicResult_t hr={}; int got=0;
+        cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(lt, op, Ad, Bd, Cd, Dd, pref, 1, &hr, &got);
+        if (pref) cublasLtMatmulPreferenceDestroy(pref);
+        if (hs == CUBLAS_STATUS_SUCCESS && got > 0) {
+            algo = hr.algo; have_algo = true;
+            if (!s_nocache) g_fp8_algo_cache[key] = algo;
+        }
+    }
+
+    // cublasLtMatmul returns CUBLAS_STATUS_INVALID_VALUE (7) if a benign CUDA error is already
+    // pending on the thread from an unrelated prior op (e.g. a RoPE/norm kernel between q and
+    // k). Clear it so a legit fp8 matmul isn't spuriously rejected -> forced onto a fallback
+    // that does not apply w_global. (Only clears already-consumed errors.)
+    if (getenv("GGML_F8_CLEAR_ERR") == nullptr || atoi(getenv("GGML_F8_CLEAR_ERR")) != 0)
+        (void)cudaGetLastError();
+
+    bool ok = have_algo;
+    if (ok) {
+        cublasStatus_t ms = cublasLtMatmul(lt, op, &alpha_h, w_fp8.get(), Ad, a_fp8.get(), Bd,
+                                           &beta_h, gemm_out, Cd, gemm_out, Dd,
+                                           &algo, ws_ptr, wsz, stream);
+        ok = (ms == CUBLAS_STATUS_SUCCESS);
+    }
+
+    if (ok && use_f32_temp) {
+        const size_t nd = (size_t)N * (size_t)M;
+        const int thr = 256;
+        unsigned int gr = (unsigned int)((nd + thr - 1) / thr);
+        if (gr > 65535u) gr = 65535u;
+        if (gr == 0)     gr = 1;
+        fp8_clamp_f32_to_f16<<<gr, thr, 0, stream>>>((const float*)d_f32.get(), (half*)dst->data, nd);
+        ok = (cudaPeekAtLastError() == cudaSuccess);
+    }
+
+    if (ok) {
+        static int n_handled = 0;
+        if (n_handled++ == 0 || getenv("GGML_NVFP4_CUBLASLT_TRACE"))
+            fprintf(stderr, "[FP8_FFN] handled mul_mat #%d  M=%d K=%d N=%d  name=%s (cuBLASLt FP8 GEMM)\n",
+                    n_handled, M, K, N, src0->name);
     }
 
     if (Ad) cublasLtMatrixLayoutDestroy(Ad);
