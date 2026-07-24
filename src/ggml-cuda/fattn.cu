@@ -615,17 +615,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
-void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_cuda_set_device(ctx.device);
-#if defined(GGML_SAGEATTENTION3)
-    // SA3 is approximate attention and must remain opt-in. The adapter rejects
-    // unsupported shapes and the established ggml kernels remain the fallback.
-    if (const char * e = getenv("GGML_LTX_SA3"); e && atoi(e) != 0 &&
-        ggml_cuda_flash_attn_ext_sa3(ctx, dst)) {
-        return;
-    }
-#endif
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+static void ggml_cuda_flash_attn_ext_dispatch(best_fattn_kernel kernel, ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
@@ -644,6 +635,89 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_cudnn(ctx, dst);
             break;
     }
+}
+
+void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_set_device(ctx.device);
+#if defined(GGML_SAGEATTENTION3)
+    // SA3 is approximate attention and must remain opt-in. The adapter rejects
+    // unsupported shapes and the established ggml kernels remain the fallback.
+    if (const char * e = getenv("GGML_LTX_SA3"); e && atoi(e) != 0 &&
+        ggml_cuda_flash_attn_ext_sa3(ctx, dst)) {
+        return;
+    }
+#endif
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+
+    // Backstop for F16 attention graphs (GGML_CUDNN_ATTN_F16_OUT and friends).
+    //
+    // The native (non-cuDNN) flash-attn kernels hard-require an F32 Q and an F32 KQV
+    // (fattn-common.cuh: GGML_ASSERT(Q->type == GGML_TYPE_F32) and
+    // GGML_ASSERT(KQV->type == GGML_TYPE_F32)), while only cuDNN SDPA consumes F16 -- and
+    // cuDNN is selected exclusively on cc >= GGML_CUDA_CC_BLACKWELL. ggml_cuda_get_best_
+    // fattn_kernel() never inspects Q->type, so on any other GPU (e.g. an sm86 RTX 3060 that
+    // the same image is deployed to) a native kernel is chosen and aborts mid-render.
+    //
+    // The graph builders avoid this by construction (LTX normalizes Q to F32 before
+    // ggml_ext_attention_ext, and GGML_CUDNN_ATTN_F16_OUT retypes the RESULT with a separate
+    // CPY rather than the flash dst) -- so under the current callers this branch is dead and
+    // the dispatch below is bit-for-bit what it was. It exists so that property is enforced
+    // HERE, at the only place that knows which kernel actually runs, instead of relying on
+    // every present and future caller to maintain it: honor an F16 request by running the
+    // native kernel into F32 scratch and converting, which is correct on every GPU.
+    if (kernel != BEST_FATTN_KERNEL_NONE && kernel != BEST_FATTN_KERNEL_CUDNN &&
+        (dst->type != GGML_TYPE_F32 || dst->src[0]->type != GGML_TYPE_F32)) {
+        GGML_ASSERT((dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16) && ggml_is_contiguous(dst));
+        GGML_ASSERT((dst->src[0]->type == GGML_TYPE_F32 || dst->src[0]->type == GGML_TYPE_F16) &&
+                    ggml_is_contiguous(dst->src[0]));
+
+        ggml_tensor dst_native = *dst;
+        ggml_tensor q_f32      = *dst->src[0];
+        ggml_cuda_pool_alloc<float> q_f32_buf(ctx.pool());
+        ggml_cuda_pool_alloc<char>  dst_f32_buf(ctx.pool());
+
+        if (q_f32.type == GGML_TYPE_F16) {
+            q_f32_buf.alloc(ggml_nelements(&q_f32));
+            to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+            to_fp32(q_f32.data, q_f32_buf.ptr, ggml_nelements(&q_f32), ctx.stream());
+            q_f32.type        = GGML_TYPE_F32;
+            q_f32.data        = q_f32_buf.ptr;
+            q_f32.nb[0]       = ggml_type_size(GGML_TYPE_F32);
+            q_f32.nb[1]       = q_f32.nb[0] * q_f32.ne[0];
+            q_f32.nb[2]       = q_f32.nb[1] * q_f32.ne[1];
+            q_f32.nb[3]       = q_f32.nb[2] * q_f32.ne[2];
+            dst_native.src[0] = &q_f32;
+        }
+
+        if (dst_native.type == GGML_TYPE_F16) {
+            dst_native.type  = GGML_TYPE_F32;
+            dst_native.nb[0] = ggml_type_size(GGML_TYPE_F32);
+            dst_native.nb[1] = dst_native.nb[0] * dst_native.ne[0];
+            dst_native.nb[2] = dst_native.nb[1] * dst_native.ne[1];
+            dst_native.nb[3] = dst_native.nb[2] * dst_native.ne[2];
+            // The native kernels put their F16 K/V scratch DIRECTLY AFTER dst in memory
+            // (fattn-common.cuh ggml_cuda_flash_attn_ext_get_f16_extra_data derives it from
+            // dst->data + ggml_nbytes(dst)), which is why the CUDA buffer type over-allocates
+            // FLASH_ATTN_EXT nodes via ggml_cuda_flash_attn_ext_get_alloc_size(). A substitute
+            // destination MUST reserve that trailing region too, or the K/V conversion writes
+            // past the end of it. Size it the same way (still with the ORIGINAL data pointer,
+            // so ggml_nbytes/padding are computed the same) and add one alignment quantum of
+            // slack to absorb the 128-byte padding shifting under a different base address.
+            const size_t alloc_size = ggml_cuda_flash_attn_ext_get_alloc_size(ctx.device, &dst_native) + 128;
+            dst_f32_buf.alloc(alloc_size);
+            dst_native.data = dst_f32_buf.ptr;
+        }
+
+        ggml_cuda_flash_attn_ext_dispatch(kernel, ctx, &dst_native);
+
+        if (dst->type == GGML_TYPE_F16) {
+            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+            to_fp16(dst_native.data, (half *) dst->data, ggml_nelements(dst), ctx.stream());
+        }
+        return;
+    }
+
+    ggml_cuda_flash_attn_ext_dispatch(kernel, ctx, dst);
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
