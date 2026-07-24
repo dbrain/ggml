@@ -4141,6 +4141,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    // New graph compute => bump the FP8 activation-quant cache generation so the q/k/v
+    // activation reuse cache (nvfp4-cublaslt.cu) can never serve a buffer quantized during a
+    // PREVIOUS compute, even when gallocr recycles a node/data address. Hooked here rather
+    // than in the host runner so it covers every caller and every ggml_backend_sched split;
+    // an extra bump only costs a cache miss (a requant), never correctness.
+    ggml_cuda_fp8_act_cache_new_generation();
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
