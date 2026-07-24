@@ -1099,9 +1099,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "ROPE_PE",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1215,9 +1217,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "rope_pe(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4320,6 +4324,83 @@ struct ggml_tensor * ggml_rope_inplace(
     return ggml_rope_impl(
         ctx, a, b, NULL, n_dims, NULL, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, true
     );
+}
+
+// ggml_rope_pe
+
+static struct ggml_tensor * ggml_rope_pe_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * pe,
+        int                   interleaved) {
+    // a may be F32 (default) or F16 (the *_DIT_F16 stream keeps q/k F16 through
+    // RoPE to drop the two full-size F32 rope tensors from the compute buffer).
+    // pe is always F32; the result element type follows a.
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
+    GGML_ASSERT(pe->type == GGML_TYPE_F32);
+    const int64_t d_head = a->ne[0];
+    const int64_t n_head = a->ne[1];
+    const int64_t L      = a->ne[2];
+    const int64_t N      = a->ne[3];
+    GGML_ASSERT(d_head % 2 == 0);
+    GGML_ASSERT(pe->ne[0] == 2 && pe->ne[1] == 2);
+    GGML_ASSERT(pe->ne[2] == d_head / 2);
+    GGML_ASSERT(pe->ne[3] == L);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, a->type, d_head, L, n_head * N);
+
+    ggml_set_op_params_i32(result, 0, interleaved ? 1 : 0);
+
+    result->op     = GGML_OP_ROPE_PE;
+    result->src[0] = a;
+    result->src[1] = pe;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_rope_pe(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * pe) {
+    return ggml_rope_pe_impl(ctx, a, pe, 1);
+}
+
+struct ggml_tensor * ggml_rope_pe_ni(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * pe) {
+    return ggml_rope_pe_impl(ctx, a, pe, 0);
+}
+
+struct ggml_tensor * ggml_rope_pe_compact(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * basis,
+        struct ggml_tensor  * token_axis_index,
+        bool                  interleaved) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
+    GGML_ASSERT(basis->type == GGML_TYPE_F32);
+    GGML_ASSERT(token_axis_index->type == GGML_TYPE_I32);
+    GGML_ASSERT(a->ne[0] % 2 == 0);
+    GGML_ASSERT(basis->ne[0] == 2 && basis->ne[1] == 2);
+    GGML_ASSERT(token_axis_index->ne[0] == 3);
+    GGML_ASSERT(a->ne[2] % token_axis_index->ne[1] == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, a->type, a->ne[0], a->ne[2], a->ne[1] * a->ne[3]);
+    ggml_set_op_params_i32(result, 0, interleaved ? 1 : 0);
+    result->op     = GGML_OP_ROPE_PE;
+    result->src[0] = a;
+    result->src[1] = basis;
+    result->src[2] = token_axis_index;
+    return result;
+}
+
+struct ggml_tensor * ggml_rope_pe_ni_compact(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * basis,
+        struct ggml_tensor  * token_axis_index) {
+    return ggml_rope_pe_compact(ctx, a, basis, token_axis_index, false);
 }
 
 struct ggml_tensor * ggml_rope_ext(

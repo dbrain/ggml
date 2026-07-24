@@ -591,6 +591,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_ROPE_PE,  // longcat-avatar: fused interleaved RoPE from precomputed pe (cos/sin), CUDA-only
+
         GGML_OP_COUNT,
     };
 
@@ -1815,6 +1817,47 @@ extern "C" {
             struct ggml_tensor  * b,
             int                   n_dims,
             int                   mode);
+
+    // longcat-avatar: fused interleaved (GPT-J) RoPE from a precomputed pe (cos/sin) tensor.
+    // a:  input q/k, ggml ne = [d_head, n_head, L, N]  (the pre-rope, post-norm tensor)
+    // pe: precomputed rotation, ggml ne = [2, 2, d_head/2, L] laid out per pair j as
+    //     [[cos_j, sin_j],[-sin_j, cos_j]] (matches Rope::rope(): result[4j..4j+3] = cos,-sin,sin,cos).
+    // Computes, per pair j (out dims 2j, 2j+1), token t, head-row h:
+    //     out[2j]   = x[2j]*cos_j - x[2j+1]*sin_j
+    //     out[2j+1] = x[2j+1]*cos_j + x[2j]*sin_j
+    // and returns the permuted/contiguous result with ggml ne = [d_head, L, n_head*N]
+    // (i.e. exactly what Rope::apply_rope(..., rope_interleaved=true) produces), in ONE
+    // kernel with NO cont+2*repeat+mul+add intermediates. F32, bit-identical to the chain.
+    GGML_API struct ggml_tensor * ggml_rope_pe(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * pe);
+
+    // Non-interleaved (GPT-NeoX) variant of ggml_rope_pe: the rotated pair is
+    // (x[a], x[a+d_head/2]) — the first/second half of head_dim — and the output
+    // is written non-interleaved (out[a], out[a+d_head/2]). Same pe layout as
+    // ggml_rope_pe. Used by the LTX video self-attn (video_pe, per-head folded to
+    // n_head=1, L = video_tokens*num_heads) to skip the cont+permute+repeat chain.
+    GGML_API struct ggml_tensor * ggml_rope_pe_ni(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * pe);
+
+    // Compact RoPE for LTX video. `basis` holds exact precomputed rotations
+    // indexed by (axis-coordinate, full-model pair); `token_axis_index` is I32
+    // [3, video_tokens]. This avoids materialising the same rotations for every
+    // token/head while preserving the arithmetic of ggml_rope_pe_ni.
+    GGML_API struct ggml_tensor * ggml_rope_pe_compact(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * basis,
+            struct ggml_tensor  * token_axis_index,
+            bool                  interleaved);
+    GGML_API struct ggml_tensor * ggml_rope_pe_ni_compact(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * basis,
+            struct ggml_tensor  * token_axis_index);
 
     // RoPE operations with extended options
     // a is the input tensor to apply RoPE to, shape [n_embd, n_head, n_token]

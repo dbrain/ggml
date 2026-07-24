@@ -42,6 +42,8 @@
 #include "ggml-cuda/pool2d.cuh"
 #include "ggml-cuda/quantize.cuh"
 #include "ggml-cuda/rope.cuh"
+#include "ggml-cuda/rope-pe.cuh"
+#include "ggml-cuda/mul_add_bcast.cuh"
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
 #include "ggml-cuda/snake.cuh"
@@ -2290,6 +2292,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_ROPE_BACK:
             ggml_cuda_op_rope_back(ctx, dst);
             break;
+        case GGML_OP_ROPE_PE:
+            ggml_cuda_op_rope_pe(ctx, dst);
+            break;
         case GGML_OP_ROLL:
             ggml_cuda_op_roll(ctx, dst);
             break;
@@ -3902,6 +3907,276 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // ==== ported fusions: P2 (mul_add_bcast) + P3 (bias_gelu) ====
+    // LongCat lap-28.3: fused MUL+ADD with broadcast for the avatar's gate_add
+    // pattern: y_4d = RESHAPE(y, [d0, d1, d2, Nb]); y_mul = MUL(y_4d, gate)
+    // where gate is [d0, 1, d2, Nb] broadcasting on dim 1; y_3d = RESHAPE(y_mul,
+    // [d0, d1*d2, Nb]); dst = ADD(x, y_3d). The RESHAPEs are view-only — at the
+    // cgraph node level we see MUL then ADD (after skipping intermediate
+    // view-likes), with the ADD consuming MUL through the view chain.
+    //
+    // 96 chains/consume step × 7 consume steps = 672 chains per render. Each
+    // chain currently materializes a ~178 MB intermediate buffer between MUL
+    // and ADD; the fused kernel reads y / gate / x and writes dst in one pass
+    // (no intermediate). __fmul_rn + __fadd_rn keep it bit-exact vs the unfused
+    // chain (two roundings, not the single-rounding FMA the compiler would emit).
+    if (node->op == GGML_OP_MUL) {
+        auto is_view_like = [](ggml_op op) {
+            return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
+                   op == GGML_OP_TRANSPOSE || op == GGML_OP_PERMUTE;
+        };
+        auto trace_back = [](ggml_tensor * t) {
+            while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW ||
+                         t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_PERMUTE)) {
+                t = t->src[0];
+            }
+            return t;
+        };
+        ggml_tensor * mul_n = node;
+        ggml_tensor * s0    = mul_n->src[0];
+        ggml_tensor * s1    = mul_n->src[1];
+        // Identify the broadcast operand (gate). For gate_add it's a [d0, 1, d2, Nb]
+        // tensor against a [d0, d1, d2, Nb] tensor with d1 > 1.
+        // GGML_CUDA_F16_BCAST_FUSE=1: also fold the broadcast modulate/gate chain when the
+        // residual stream is F16 (LTX_DIT_F16). The big operand (x/y) is then F16 while the
+        // modulation gate/shift stay F32 — these a2v/v2a video modulates otherwise run as
+        // separate k_bin_bcast<op_mul,half,float,half> + <op_add,half,float,half> kernels
+        // (the 6.2%+1.7% profile buckets). Bit-exact via round_big (round-to-half per step).
+        // Default off (F32-only, = prior behaviour); opt-in A/B lever.
+        static const bool f16_bcast_fuse = (getenv("GGML_CUDA_F16_BCAST_FUSE") != nullptr);
+        ggml_tensor * y_view = nullptr;
+        ggml_tensor * gate   = nullptr;
+        if (s0 && s1) {
+            const bool s0_bcast = (s0->ne[1] == 1 && s1->ne[1] >  1);
+            const bool s1_bcast = (s1->ne[1] == 1 && s0->ne[1] >  1);
+            if (s0_bcast ^ s1_bcast) {
+                ggml_tensor * big = s1_bcast ? s0 : s1;   // non-broadcast operand (x/y)
+                ggml_tensor * bc  = s1_bcast ? s1 : s0;   // broadcast operand (gate)
+                const bool big_ok = big->type == GGML_TYPE_F32 ||
+                                    (big->type == GGML_TYPE_F16 && f16_bcast_fuse);
+                // gate is normally F32 (the modulation tables). Under WAN_DIT_F16_MOD the
+                // gates are F16 too — accept an F16 gate ONLY when the big operand is also
+                // F16 (the dit_f16 mod stream) and the F16 fuse is enabled; the fused kernel
+                // reads either MOD type. Default (F32 gate) path is byte-identical.
+                const bool bc_ok = bc->type == GGML_TYPE_F32 ||
+                                   (bc->type == GGML_TYPE_F16 && big->type == GGML_TYPE_F16 && f16_bcast_fuse);
+                if (big_ok && bc_ok && mul_n->type == big->type) {
+                    y_view = big; gate = bc;
+                }
+            }
+        }
+        // Must match the gate_add 4D broadcast pattern exactly.
+        if (y_view && gate &&
+            mul_n->ne[0] == gate->ne[0] && gate->ne[1] == 1 &&
+            mul_n->ne[2] == gate->ne[2] && mul_n->ne[3] == gate->ne[3] &&
+            ggml_is_contiguous(gate) &&
+            ggml_node_get_use_count(cgraph, i) == 1) {
+            // Walk past view-likes to find the next compute node — expect ADD.
+            int j = i + 1;
+            while (j < cgraph->n_nodes && is_view_like(cgraph->nodes[j]->op)) {
+                ++j;
+            }
+            if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_ADD) {
+                ggml_tensor * add_n = cgraph->nodes[j];
+                // ADD must have one side tracing back to MUL via views; the other
+                // side is `x` (residual). Same-shape ADD (no further broadcast).
+                ggml_tensor * x_side = nullptr;
+                if (trace_back(add_n->src[0]) == mul_n) {
+                    x_side = add_n->src[1];
+                } else if (trace_back(add_n->src[1]) == mul_n) {
+                    x_side = add_n->src[0];
+                }
+                if (x_side &&
+                    add_n->type == mul_n->type &&
+                    x_side->type == mul_n->type &&
+                    ggml_is_contiguous(add_n) &&
+                    ggml_is_contiguous(x_side) &&
+                    ggml_nelements(x_side) == ggml_nelements(mul_n) &&
+                    ggml_nelements(add_n)  == ggml_nelements(mul_n)) {
+                    // The y view: must trace to a contiguous tensor of the BIG (residual) type.
+                    ggml_tensor * y_root = trace_back(y_view);
+                    if (y_root && y_root->type == mul_n->type &&
+                        ggml_is_contiguous(y_root) &&
+                        ggml_nelements(y_root) == ggml_nelements(mul_n)) {
+                        // flux2 AdaLN: modulate() emits `x + x*scale` (this gate_add,
+                        // gate=scale) immediately followed by a broadcast `+ shift`
+                        // with shift sharing gate's [d0,1,d2,Nb] layout. If add_n is
+                        // consumed only by that trailing ADD, fold the shift into the
+                        // same kernel (dst = x + x*scale + shift) — kills one bcast
+                        // kernel + its intermediate buffer per modulate, bit-exact.
+                        ggml_tensor * shift     = nullptr;
+                        ggml_tensor * final_add = add_n;
+                        int k = j + 1;
+                        while (k < cgraph->n_nodes && is_view_like(cgraph->nodes[k]->op)) {
+                            ++k;
+                        }
+                        if (k < cgraph->n_nodes && cgraph->nodes[k]->op == GGML_OP_ADD &&
+                            ggml_node_get_use_count(cgraph, j) == 1) {
+                            ggml_tensor * sadd   = cgraph->nodes[k];
+                            ggml_tensor * sshift = nullptr;
+                            if (trace_back(sadd->src[0]) == add_n) {
+                                sshift = sadd->src[1];
+                            } else if (trace_back(sadd->src[1]) == add_n) {
+                                sshift = sadd->src[0];
+                            }
+                            // shift must share the gate's dtype (the fused kernel reads gate
+                            // and shift as one MOD type). Default gate is F32 -> shift F32 =
+                            // the original check; under WAN_DIT_F16_MOD both are F16.
+                            if (sshift && sadd->type == mul_n->type &&
+                                sshift->type == gate->type &&
+                                ggml_is_contiguous(sadd) &&
+                                ggml_is_contiguous(sshift) &&
+                                sshift->ne[0] == gate->ne[0] && sshift->ne[1] == 1 &&
+                                sshift->ne[2] == gate->ne[2] && sshift->ne[3] == gate->ne[3] &&
+                                ggml_nelements(sadd) == ggml_nelements(add_n)) {
+                                shift     = sshift;
+                                final_add = sadd;
+                            }
+                        }
+                        ggml_cuda_op_mul_add_bcast(*cuda_ctx, mul_n, final_add,
+                                                   x_side, y_view, gate, shift);
+                        // Skip i+1 .. final_add inclusive (k if shift folded, else j).
+                        return (shift ? k : j) - i;
+                    }
+                }
+            }
+        }
+    }
+
+    // NAVA per-token AdaLN: same-shape (no-broadcast) MUL+ADD(+ADD) fusion.
+    // dst = x + y*g (+ shift), all contiguous F32 of equal element count. The
+    // broadcast detector above can't match it (gate is full [d0,L,1], batch
+    // N=1) so x + x*scale + shift ran as 3 full-size kernels — ~17% of the DiT.
+    // Bit-exact (__fmul_rn + __fadd_rn). General + safe: fuses any
+    // ADD(x, MUL(a,b)) chain with single-use intermediates. Env-disable:
+    // GGML_CUDA_NO_MADD_FUSE=1.
+    static const bool madd_fuse_disabled = (getenv("GGML_CUDA_NO_MADD_FUSE") != nullptr);
+    // The same-shape fusion also accepts a STRIDED gate operand (LTX-2.3
+    // align_token_modulation permutes the gate [d0,1,L]->[d0,L,1] -> non-contiguous,
+    // which the original both-contiguous check rejected). Bit-exact (the kernel reads
+    // the gate via its strides). Set GGML_CUDA_NO_STRIDED_GATE_FUSE to force the old
+    // conservative no-fuse path for that case (clean A/B isolation).
+    static const bool strided_gate_fuse_disabled = (getenv("GGML_CUDA_NO_STRIDED_GATE_FUSE") != nullptr);
+    if (!madd_fuse_disabled && node->op == GGML_OP_MUL &&
+        (node->type == GGML_TYPE_F32 || node->type == GGML_TYPE_F16) &&
+        ggml_is_contiguous(node) && ggml_node_get_use_count(cgraph, i) == 1) {
+        auto is_view_like = [](ggml_op op) {
+            return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
+                   op == GGML_OP_TRANSPOSE || op == GGML_OP_PERMUTE;
+        };
+        auto trace_back = [&](ggml_tensor * t) {
+            while (t && is_view_like(t->op)) {
+                t = t->src[0];
+            }
+            return t;
+        };
+        ggml_tensor * mul_n = node;
+        ggml_tensor * a     = mul_n->src[0];
+        ggml_tensor * b     = mul_n->src[1];
+        const int64_t n_elem = ggml_nelements(mul_n);
+        // The `y` operand must be contiguous F32 (flat-read); the `gate` operand may be
+        // a strided/permuted view of the SAME shape (kernel reads it via its strides).
+        // Identify which operand is contiguous (= y); the other is the gate.
+        // y = the "big" operand (same type as the MUL output — F32 prod, or F16 for the
+        // dit_f16 residual stream) and contiguous; g = the modulation operand (F32, may
+        // be a strided/permuted view). The fused kernel reads each at its own type and
+        // rounds to the BIG precision per step → bit-identical to the unfused chain.
+        ggml_tensor * y_op = nullptr;
+        ggml_tensor * g_op = nullptr;
+        if (a && b && ggml_nelements(a) == n_elem && ggml_nelements(b) == n_elem) {
+            if (a->type == node->type && ggml_is_contiguous(a))      { y_op = a; g_op = b; }
+            else if (b->type == node->type && ggml_is_contiguous(b)) { y_op = b; g_op = a; }
+        }
+        // only the (BIG,MOD) combos the kernel instantiates: MOD (gate/shift) must be F32.
+        if (g_op && g_op->type != GGML_TYPE_F32) { y_op = nullptr; g_op = nullptr; }
+        const bool g_strided = g_op && !ggml_is_contiguous(g_op);
+        if (y_op && g_op && ggml_are_same_shape(g_op, mul_n) &&
+            !(g_strided && strided_gate_fuse_disabled)) {
+            int j = i + 1;
+            while (j < cgraph->n_nodes && is_view_like(cgraph->nodes[j]->op)) {
+                ++j;
+            }
+            if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_ADD) {
+                ggml_tensor * add_n  = cgraph->nodes[j];
+                ggml_tensor * x_side = nullptr;
+                if (trace_back(add_n->src[0]) == mul_n) {
+                    x_side = add_n->src[1];
+                } else if (trace_back(add_n->src[1]) == mul_n) {
+                    x_side = add_n->src[0];
+                }
+                if (x_side && add_n->type == node->type && x_side->type == node->type &&
+                    ggml_is_contiguous(add_n) && ggml_is_contiguous(x_side) &&
+                    ggml_nelements(add_n) == n_elem && ggml_nelements(x_side) == n_elem) {
+                    // Optional trailing same-shape ADD(_, shift): fold x + y*g + shift.
+                    ggml_tensor * shift     = nullptr;
+                    ggml_tensor * final_add = add_n;
+                    int k = j + 1;
+                    while (k < cgraph->n_nodes && is_view_like(cgraph->nodes[k]->op)) {
+                        ++k;
+                    }
+                    if (k < cgraph->n_nodes && cgraph->nodes[k]->op == GGML_OP_ADD &&
+                        ggml_node_get_use_count(cgraph, j) == 1) {
+                        ggml_tensor * sadd   = cgraph->nodes[k];
+                        ggml_tensor * sshift = nullptr;
+                        if (trace_back(sadd->src[0]) == add_n) {
+                            sshift = sadd->src[1];
+                        } else if (trace_back(sadd->src[1]) == add_n) {
+                            sshift = sadd->src[0];
+                        }
+                        if (sshift && sadd->type == node->type && sshift->type == GGML_TYPE_F32 &&
+                            ggml_is_contiguous(sadd) && ggml_is_contiguous(sshift) &&
+                            ggml_nelements(sadd) == n_elem && ggml_nelements(sshift) == n_elem) {
+                            shift     = sshift;
+                            final_add = sadd;
+                        }
+                    }
+                    ggml_cuda_op_fused_madd_same(*cuda_ctx, final_add, x_side, y_op, g_op, shift);
+                    return (shift ? k : j) - i;
+                }
+            }
+        }
+    }
+
+    // Fused bias-add + GELU (LTX FFN w1): ggml_ext_linear emits ADD(matmul_out, bias)
+    // immediately followed by ggml_gelu_inplace. The bias-add otherwise runs as a
+    // full-width op_add<half,float,half> over the 4x-wide [inner_dim, tokens] intermediate.
+    // Fold ADD(bias bcast)+GELU into one bit-exact pass. env GGML_CUDA_BIAS_GELU_FUSE (A/B; off by default).
+    {
+        static const bool bias_gelu_fuse = (getenv("GGML_CUDA_BIAS_GELU_FUSE") != nullptr);
+        auto is_view_like = [](ggml_op op) {
+            return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW ||
+                   op == GGML_OP_TRANSPOSE || op == GGML_OP_PERMUTE;
+        };
+        if (bias_gelu_fuse && node->op == GGML_OP_ADD &&
+            (node->type == GGML_TYPE_F16 || node->type == GGML_TYPE_F32) &&
+            ggml_is_contiguous(node) && ggml_node_get_use_count(cgraph, i) == 1) {
+            ggml_tensor * big  = node->src[0];   // matmul output (add_inplace: src0 = x)
+            ggml_tensor * bias = node->src[1];   // 1D bias, broadcast over tokens
+            if (big && bias && big->type == node->type && ggml_is_contiguous(big) &&
+                bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
+                bias->ne[0] == node->ne[0] && bias->ne[1] == 1 && bias->ne[2] == 1 && bias->ne[3] == 1 &&
+                ggml_nelements(big) == ggml_nelements(node) && node->ne[1] > 1) {
+                int j = i + 1;
+                while (j < cgraph->n_nodes && is_view_like(cgraph->nodes[j]->op)) {
+                    ++j;
+                }
+                if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_UNARY &&
+                    ggml_get_unary_op(cgraph->nodes[j]) == GGML_UNARY_OP_GELU) {
+                    ggml_tensor * gelu_n = cgraph->nodes[j];
+                    ggml_tensor * gsrc   = gelu_n->src[0];
+                    while (gsrc && is_view_like(gsrc->op)) {
+                        gsrc = gsrc->src[0];
+                    }
+                    if (gsrc == node && gelu_n->type == node->type &&
+                        ggml_is_contiguous(gelu_n) && ggml_nelements(gelu_n) == ggml_nelements(node)) {
+                        ggml_cuda_op_bias_gelu(*cuda_ctx, gelu_n, big, bias);
+                        return j - i;
+                    }
+                }
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -5295,6 +5570,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_ROPE_BACK: {
             return op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && ggml_is_contiguous_2(op->src[0]);
         }
+        case GGML_OP_ROPE_PE:
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                   op->src[1]->type == GGML_TYPE_F32 && op->type == op->src[0]->type;
         case GGML_OP_IM2COL:
         case GGML_OP_IM2COL_3D:
         case GGML_OP_CONV_2D:
