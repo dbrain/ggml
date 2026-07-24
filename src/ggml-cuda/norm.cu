@@ -506,9 +506,12 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 template <typename T>
-static __global__ void rms_norm_channels_kernel(const T * __restrict__ x,
+// NOTE: x and dst must NOT be __restrict__ — this op is on the ggml_op_can_inplace
+// allowlist (ggml-alloc.c), so dst can alias x. Restrict pointers there are UB and
+// miscompile on CUDA13/Blackwell (NaN/white VAE decode). gamma never aliases dst.
+static __global__ void rms_norm_channels_kernel(const T * x,
                                                 const float * __restrict__ gamma,
-                                                T * __restrict__ dst,
+                                                T * dst,
                                                 int64_t positions,
                                                 int channels,
                                                 float eps) {
