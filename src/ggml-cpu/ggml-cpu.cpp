@@ -481,6 +481,17 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SSM_SCAN:
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
+        case GGML_OP_ROPE_PE:
+            // longcat-avatar: fused RoPE-from-precomputed-pe is primarily a CUDA fused kernel.
+            // A CPU ggml_compute_forward_rope_pe fallback now exists (ops.cpp) + ggml_get_n_tasks
+            // handles it, so a CPU-backend graph that contains ROPE_PE no longer aborts (the
+            // sd.cpp fork's runner computes the whole graph on ONE backend with no
+            // ggml_backend_sched, so the CPU path is load-bearing whenever the runtime backend
+            // is CPU). We still report it *unsupported* for ggml_backend_sched: when a scheduler
+            // IS present it should keep this op on CUDA (much faster fused kernel) rather than
+            // splitting it onto the CPU. supports_op only affects the scheduler; the CPU backend
+            // will still execute it directly when handed a graph that contains it.
+            return false;
         default:
             return true;
     }
