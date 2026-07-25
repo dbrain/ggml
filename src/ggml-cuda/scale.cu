@@ -48,7 +48,7 @@ void ggml_cuda_op_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     cudaStream_t stream = ctx.stream();
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
     GGML_ASSERT(dst->type == src0->type);
     GGML_ASSERT(ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(dst));
 
@@ -59,6 +59,8 @@ void ggml_cuda_op_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     if (src0->type == GGML_TYPE_BF16) {
         scale_f32_cuda((const nv_bfloat16 *) src0->data, (nv_bfloat16 *) dst->data, scale, bias, src0, dst, stream);
+    } else if (src0->type == GGML_TYPE_F16) {
+        scale_f32_cuda((const half *) src0->data, (half *) dst->data, scale, bias, src0, dst, stream);
     } else {
         scale_f32_cuda((const float *) src0->data, (float *) dst->data, scale, bias, src0, dst, stream);
     }
