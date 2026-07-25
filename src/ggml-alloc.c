@@ -20,6 +20,20 @@
 
 // ops that return true for this function must not use restrict pointers for their backend implementations
 bool ggml_op_can_inplace(enum ggml_op op) {
+    // Diagnostic: GGML_NO_INPLACE=1 forbids ALL in-place reuse, so every op writes to a
+    // distinct buffer. This is the blunt test for the whole "dst aliases src" bug class
+    // (e.g. a kernel declaring __restrict__ on an op the allocator ran in-place). It costs
+    // a lot of VRAM; it exists to identify the class, not to ship.
+    {
+        static int no_inplace = -1;
+        if (no_inplace < 0) {
+            const char * e = getenv("GGML_NO_INPLACE");
+            no_inplace = (e != NULL && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+        }
+        if (no_inplace) {
+            return false;
+        }
+    }
     switch (op) {
         case GGML_OP_FILL:
         case GGML_OP_SCALE:
