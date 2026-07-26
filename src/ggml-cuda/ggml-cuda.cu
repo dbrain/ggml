@@ -688,13 +688,34 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         if (pool_addr == 0 || pool_size == pool_used) {
             return;
         }
-        // VMM allocations are a stack.  Once buffers at the top have been
-        // returned, unmap that free suffix so it stops reserving physical VRAM
-        // for a later model/window in the same worker.
+        // Return this pool's physical VRAM to the driver so it stops reserving pages for a
+        // later model/window in the same worker.
+        //
+        // ONLY the fully-drained pool can be unmapped, and unmapping a SUFFIX is never valid:
+        // allocations are carved off the stack at 128-byte alignment (see alloc()), while the
+        // mappings underneath them are created in granularity-sized chunks — 2 MiB on current
+        // NVIDIA parts. So `pool_used` is essentially never granularity-aligned, and
+        //   cuMemUnmap(pool_addr + pool_used, pool_size - pool_used)
+        // both violates cuMemUnmap's alignment contract AND starts INSIDE the chunk that still
+        // backs the live top of the stack — ripping physical pages out from under a live
+        // allocation. It then leaves `pool_size` unaligned, so the next alloc()'s cuMemMap
+        // lands at a bad offset and the destructor's unmap no longer describes what is mapped.
+        //
+        // All of that is silent at the point of damage. It surfaces later, on unrelated work,
+        // as `an illegal memory access was encountered` or a bare `an internal operation
+        // failed` out of the next cuBLAS GEMM — which is how it presented: a 1920x1088 LTX
+        // render completed correctly and the NEXT job on that worker died on its first GEMM.
+        //
+        // Draining is the case that actually matters (a job boundary, where every pool
+        // allocation has been returned), and there the unmap is the whole pool, which IS
+        // aligned. If anything is still live, keep the pages; a partial trim is not worth
+        // corrupting the pool for.
+        if (pool_used != 0) {
+            return;
+        }
         ggml_cuda_set_device(device);
-        const size_t unused_size = pool_size - pool_used;
-        CU_CHECK(cuMemUnmap((CUdeviceptr) ((char *) pool_addr + pool_used), unused_size));
-        pool_size = pool_used;
+        CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+        pool_size = 0;
     }
 };
 #endif // defined(GGML_USE_VMM)
@@ -1434,6 +1455,32 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const int64_t ne_dst = ggml_nelements(dst);
     cudaStream_t main_stream = ctx.stream();
     CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), main_stream));
+
+    // GGML_CUDA_CHECK_MM_PTRS=1 — diagnostic, default off. cuBLAS reports a non-device
+    // operand pointer as a bare CUBLAS_STATUS_INTERNAL_ERROR ("an internal operation
+    // failed"), or, without CUDA_LAUNCH_BLOCKING, as an illegal memory access at the next
+    // synchronize — neither of which names the tensor. Under --offload-to-cpu a weight whose
+    // compute staging was released points back at its HOST home, so this turns that class of
+    // bug into "src0 <name> is host memory" instead of a stack trace in ggml-cuda.
+    if (getenv("GGML_CUDA_CHECK_MM_PTRS") != nullptr) {
+        const ggml_tensor * to_check[3] = { src0, src1, dst };
+        const char * which[3] = { "src0", "src1", "dst" };
+        for (int i = 0; i < 3; ++i) {
+            cudaPointerAttributes attr = {};
+            const cudaError_t err = cudaPointerGetAttributes(&attr, to_check[i]->data);
+            const bool is_device = err == cudaSuccess && (attr.type == cudaMemoryTypeDevice ||
+                                                          attr.type == cudaMemoryTypeManaged);
+            if (!is_device) {
+                GGML_LOG_ERROR("%s: %s '%s' (op %s) data=%p is NOT device memory "
+                               "(cudaPointerGetAttributes err=%d type=%d)\n",
+                               __func__, which[i], to_check[i]->name,
+                               ggml_op_name(dst->op), to_check[i]->data,
+                               (int) err, (int) attr.type);
+                GGML_ABORT("cuBLAS operand is not device memory");
+            }
+            cudaGetLastError();  // clear the "invalid value" a host pointer leaves behind
+        }
+    }
 
     const size_t src0_ts = ggml_type_size(src0->type);
     GGML_ASSERT(nb00 == src0_ts);
@@ -4910,6 +4957,13 @@ void ggml_backend_cuda_trim_memory(ggml_backend_t backend) {
         return;
     }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    // Pool trim is destructive: ggml_cuda_pool_vmm::trim() cuMemUnmaps the free suffix of
+    // the pool, handing those physical pages back to the driver. That is the ONE GPU-memory
+    // release in this backend that does not implicitly synchronize (cudaFree does), and the
+    // callers only ggml_backend_synchronize(), which waits on ONE stream of ONE device while
+    // trim_pools() unmaps every device/stream pool. Wait for the whole device instead.
+    CUDA_CHECK(cudaDeviceSynchronize());
     cuda_ctx->trim_pools();
 }
 
