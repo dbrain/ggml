@@ -723,3 +723,80 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
+
+// ---------------------------------------------------------------------------
+// GGML_OP_FLASH_ATTN_EXT_LSE
+// ---------------------------------------------------------------------------
+//
+// Deliberately NOT routed through ggml_cuda_get_best_fattn_kernel: none of the native
+// ggml kernels expose the softmax denominator, so there is nothing to fall back to.
+// Callers are expected to ask ggml_backend_supports_op() and take their own masked path
+// when the answer is no.
+//
+// SA3 can serve this op too (GGML_LTX_SA3=1 GGML_LTX_SA3_LSE=1, both default off) -- its
+// epilogue now stores the LSE and the adapter undoes the K-smoothing shift. That is an
+// EXECUTION-time choice only: eligibility below stays exactly cuDNN's, so the graph a
+// caller builds after asking supports_op() does not depend on the SA3 gate.
+static bool ggml_cuda_flash_attn_ext_lse_cudnn_eligible(int device, const ggml_tensor * dst) {
+#ifdef GGML_CUDNN
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    if (!ggml_cuda_cudnn_attn_env() || !ggml_cuda_cudnn_available()) {
+        return false;
+    }
+    if (ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_BLACKWELL) {
+        return false;
+    }
+    if (mask != nullptr || dst->src[4] != nullptr) {
+        return false;
+    }
+    float max_bias = 0.0f, logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+    if (Q->ne[2] != K->ne[2]) {   // no GQA broadcast in the cuDNN graph
+        return false;
+    }
+    if (K->ne[0] != V->ne[0] || (K->ne[0] != 64 && K->ne[0] != 128)) {
+        return false;
+    }
+    if (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (Q->type != GGML_TYPE_F32 && Q->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    return ggml_is_contiguous(Q) && ggml_is_contiguous(K) && ggml_is_contiguous(V);
+#else
+    GGML_UNUSED(device); GGML_UNUSED(dst);
+    return false;
+#endif
+}
+
+bool ggml_cuda_flash_attn_ext_lse_supported(int device, const ggml_tensor * dst) {
+    return ggml_cuda_flash_attn_ext_lse_cudnn_eligible(device, dst);
+}
+
+void ggml_cuda_flash_attn_ext_lse(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_set_device(ctx.device);
+#if defined(GGML_SAGEATTENTION3)
+    // SA3 is approximate attention and stays opt-in. It rejects anything outside its own
+    // contract (and the closed gate) by returning false, leaving cuDNN untouched below.
+    if (ggml_cuda_flash_attn_ext_lse_sa3(ctx, dst)) {
+        return;
+    }
+#endif
+    if (!ggml_cuda_flash_attn_ext_lse_cudnn_eligible(ggml_cuda_get_device(), dst)) {
+        GGML_ABORT("ggml_flash_attn_ext_lse: no CUDA backend for this shape "
+                   "(ask ggml_backend_supports_op before building the node)");
+    }
+    ggml_cuda_flash_attn_ext_lse_cudnn(ctx, dst);
+}

@@ -12,6 +12,7 @@
 #ifdef GGML_CUDNN
 
 #include "convert.cuh"
+#include "fattn-lse-selfcheck.cuh"
 
 #include <cudnn.h>
 #include <cudnn_frontend.h>
@@ -37,6 +38,7 @@ namespace fe = cudnn_frontend;
 #define O_UID 4
 #define SEQ_LEN_Q_UID 5
 #define SEQ_LEN_KV_UID 6
+#define STATS_UID 7
 
 bool ggml_cuda_cudnn_available() { return true; }
 
@@ -244,15 +246,21 @@ struct sdpa_key {
     int64_t B, H, Lq, Lkv, D;   // Lq==Lkv for self-attn; Lq!=Lkv for cross-attn (LTX-AV a2v/v2a)
     int     io_half;   // 1 == fp16 io, 0 == bf16 (reserved)
     int     padding_mask;
+    // 1 == the graph also emits the softmax Stats (per-query log-sum-exp), which is a
+    // DIFFERENT cuDNN graph and therefore a different cache entry. Only ggml's
+    // GGML_OP_FLASH_ATTN_EXT_LSE asks for it; the inference path stays on gen_stats == 0
+    // and keeps the exact plan it always built.
+    int     gen_stats;
     bool operator==(const sdpa_key & o) const {
         return B == o.B && H == o.H && Lq == o.Lq && Lkv == o.Lkv && D == o.D &&
-               io_half == o.io_half && padding_mask == o.padding_mask;
+               io_half == o.io_half && padding_mask == o.padding_mask && gen_stats == o.gen_stats;
     }
 };
 struct sdpa_key_hash {
     size_t operator()(const sdpa_key & k) const {
         size_t h = 1469598103934665603ull;
-        for (int64_t v : {k.B, k.H, k.Lq, k.Lkv, k.D, (int64_t)k.io_half, (int64_t)k.padding_mask}) {
+        for (int64_t v : {k.B, k.H, k.Lq, k.Lkv, k.D, (int64_t)k.io_half, (int64_t)k.padding_mask,
+                          (int64_t)k.gen_stats}) {
             h ^= (size_t)v; h *= 1099511628211ull;
         }
         return h;
@@ -413,7 +421,7 @@ static cudnn_sdpa_plan & get_or_build_plan(cudnnHandle_t handle, const sdpa_key 
                  .set_dim({B, H, Lkv, D}).set_stride({H * Lkv * D, Lkv * D, D, 1}));
 
     auto sdpa_opts = fe::graph::SDPA_attributes().set_name("flash_attention")
-                         .set_generate_stats(false)   // inference: no LSE stats
+                         .set_generate_stats(key.gen_stats != 0)
                          .set_attn_scale(scale);
     if (key.padding_mask) {
         auto seq_q = graph->tensor(fe::graph::Tensor_attributes()
@@ -428,7 +436,16 @@ static cudnn_sdpa_plan & get_or_build_plan(cudnnHandle_t handle, const sdpa_key 
     }
 
     auto [O, Stats] = graph->sdpa(Q, K, V, sdpa_opts);
-    (void) Stats;
+    if (key.gen_stats) {
+        // Stats is auto-dimensioned [B, H, Lq, 1] with stride {H*Lq, Lq, 1, 1}
+        // (scaled_dot_product_flash_attention.h infer_properties_node), i.e. query
+        // innermost -- exactly ggml_flash_attn_ext_lse's LSE layout. Leave the dims
+        // alone so cuDNN keeps its own convention; only claim it as an output.
+        GGML_ASSERT(Stats != nullptr);
+        Stats->set_output(true).set_data_type(fe::DataType_t::FLOAT).set_uid(STATS_UID);
+    } else {
+        (void) Stats;
+    }
     // O dims [B,H,L,D], standard BHSD F16 into a scratch buffer; a follow-up kernel
     // permutes+converts to ggml's BSHD F32 dst. (Non-standard strided FP32 output is
     // not reliably honored by the SDPA engine, so keep the graph output canonical.)
@@ -543,7 +560,7 @@ static bool cudnn_qtile(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
             (const float *) Q->data, q_tile.get(), (int) H, (int) Lq, (int) len, (int) off, (int) D);
         CUDA_CHECK(cudaGetLastError());
         // No padding mask or bucket: each query row attends the unchanged full K/V.
-        sdpa_key key{N, H, len, Lkv, D, io_half, 0};
+        sdpa_key key{N, H, len, Lkv, D, io_half, 0, /*gen_stats=*/0};
         cudnn_sdpa_plan & plan = get_or_build_plan(handle, key, scale);
         ggml_cuda_pool_alloc<uint8_t> ws(ctx.pool());
         void * ws_ptr = nullptr;
@@ -575,7 +592,28 @@ static bool cudnn_qtile(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
     return true;
 }
 
-void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+// Strip the sequence padding cuDNN's bucketed plan added back out of the Stats buffer:
+// [N, H, Lq_plan] -> [N, H, Lq], both query-innermost. A no-op memcpy shape when the plan
+// length equals the real one, which is every un-bucketed call.
+static __global__ void cudnn_stats_unpad(const float * __restrict__ in, float * __restrict__ out,
+                                         int N, int H, int Lq, int Lq_plan) {
+    const long idx = (long) blockIdx.x * blockDim.x + threadIdx.x;
+    const long tot = (long) N * H * Lq;
+    if (idx >= tot) return;
+    const int  l  = (int) (idx % Lq);
+    const long nh = idx / Lq;
+    out[idx] = in[nh * Lq_plan + l];
+}
+
+
+// The LSE self-check now lives in fattn-lse-selfcheck.cu so the SA3 path can point the
+// same oracle at its own stats. Env var, output format and semantics are unchanged.
+
+// `lse_dst`, when non-null, is an F32 [Lq, H, N] (query innermost) destination for the
+// per-query natural-log log-sum-exp of the SCALED scores -- cuDNN's SDPA "Stats". Null keeps
+// the plan cache entry, the graph and the kernels byte-for-byte what the inference path
+// always built.
+static void cudnn_sdpa_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * lse_dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -621,7 +659,8 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         GGML_ABORT("cudnnSetStream failed");
     }
 
-    if (cudnn_qtile(ctx, dst, Q, K, V, N, H, Lq, Lkv, D, io_half, scale, handle)) {
+    // Q tiling runs one plan per tile and never asks for Stats, so it cannot serve the LSE op.
+    if (lse_dst == nullptr && cudnn_qtile(ctx, dst, Q, K, V, N, H, Lq, Lkv, D, io_half, scale, handle)) {
         return;
     }
 
@@ -702,7 +741,7 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
     const bool pad_q       = Lq_plan != Lq;
     const bool pad_kv      = Lkv_plan != Lkv;
 
-    sdpa_key key{N, H, Lq_plan, Lkv_plan, D, io_half, use_mask ? 1 : 0};
+    sdpa_key key{N, H, Lq_plan, Lkv_plan, D, io_half, use_mask ? 1 : 0, lse_dst != nullptr ? 1 : 0};
     cudnn_sdpa_plan & plan = get_or_build_plan(handle, key, scale);
 
     // GGML_CUDNN_ZERO_WS: the SDPA workspace comes from the ggml pool, which RECYCLES memory and
@@ -786,6 +825,17 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
         {V_UID, const_cast<void *>(v_exec)},
         {O_UID, o_ptr},
     };
+    // Stats is [N, H, Lq_plan]; bind lse_dst directly when the plan was not padded, otherwise
+    // a scratch that the unpad kernel below strips into it.
+    ggml_cuda_pool_alloc<float> stats_scratch(ctx.pool());
+    if (lse_dst != nullptr) {
+        if (Lq_plan != Lq) {
+            stats_scratch.alloc((size_t)(N * H * Lq_plan));
+            vpack[STATS_UID] = stats_scratch.get();
+        } else {
+            vpack[STATS_UID] = lse_dst;
+        }
+    }
     ggml_cuda_pool_alloc<int32_t> seq_q(ctx.pool());
     ggml_cuda_pool_alloc<int32_t> seq_kv(ctx.pool());
     if (use_mask) {
@@ -877,6 +927,16 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
                 o_bhsd_b.get(), (float *) dst->data, (int)N, (int)H, (int)Lq, (int)Lq_plan, (int)D);
         }
     }
+    if (lse_dst != nullptr && Lq_plan != Lq) {
+        const long ltot = (long) N * H * Lq;
+        cudnn_stats_unpad<<<(int)((ltot + bs - 1) / bs), bs, 0, stream>>>(
+            stats_scratch.get(), lse_dst, (int)N, (int)H, (int)Lq, (int)Lq_plan);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    if (lse_dst != nullptr && N == 1) {
+        ggml_cuda_attn_lse_selfcheck("cudnn", Q, K, lse_dst, H, Lq, Lkv, D, scale,
+                                     /*tol=*/1e-2f, stream);
+    }
     if (time_sdpa_shape) {
         CUDA_CHECK(cudaEventRecord(timing_events[3], stream));
         CUDA_CHECK(cudaEventSynchronize(timing_events[3]));
@@ -895,6 +955,33 @@ void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor
     }
 }
 
+void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    cudnn_sdpa_impl(ctx, dst, /*lse_dst=*/nullptr);
+}
+
+void ggml_cuda_flash_attn_ext_lse_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // dst is the flat F32 pack from ggml_flash_attn_ext_lse: O first, then the LSE. Present
+    // the O half to the shared implementation as an ordinary flash-attn dst so nothing below
+    // has to know about the packing.
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * V = dst->src[2];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst));
+
+    ggml_tensor o = *dst;
+    o.ne[0] = V->ne[0];
+    o.ne[1] = Q->ne[2];
+    o.ne[2] = Q->ne[1];
+    o.ne[3] = Q->ne[3];
+    o.nb[0] = sizeof(float);
+    o.nb[1] = o.nb[0] * o.ne[0];
+    o.nb[2] = o.nb[1] * o.ne[1];
+    o.nb[3] = o.nb[2] * o.ne[2];
+
+    float * lse = (float *) dst->data + (size_t) o.ne[0] * o.ne[1] * o.ne[2] * o.ne[3];
+    cudnn_sdpa_impl(ctx, &o, lse);
+}
+
 #else  // !GGML_CUDNN
 
 bool ggml_cuda_cudnn_available() { return false; }
@@ -903,6 +990,12 @@ void ggml_cuda_cudnn_sdpa_release_plans() {}
 void ggml_cuda_cudnn_sdpa_release_handle() {}
 
 void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+    GGML_ABORT("ggml-cuda built without GGML_CUDNN");
+}
+
+void ggml_cuda_flash_attn_ext_lse_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED(ctx);
     GGML_UNUSED(dst);
     GGML_ABORT("ggml-cuda built without GGML_CUDNN");

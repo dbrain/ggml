@@ -480,6 +480,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             // splitting it onto the CPU. supports_op only affects the scheduler; the CPU backend
             // will still execute it directly when handed a graph that contains it.
             return false;
+        case GGML_OP_FLASH_ATTN_EXT_LSE:
+            // longcat-avatar: no CPU implementation. The default arm below is `return true`,
+            // so without this case the CPU device would CLAIM the op and then abort at compute
+            // time -- and the whole point of the op is that a graph builder can ask
+            // ggml_backend_supports_op() and keep its old masked path when the answer is no.
+            return false;
         default:
             return true;
     }

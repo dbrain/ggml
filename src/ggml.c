@@ -1101,9 +1101,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "ROPE_PE",
+
+    "FLASH_ATTN_EXT_LSE",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1219,9 +1221,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "rope_pe(x)",
+
+    "flash_attn_ext_lse(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5563,10 +5567,89 @@ struct ggml_tensor * ggml_flash_attn_ext(
 }
 
 
+// ggml_flash_attn_ext_lse
+//
+// Same math, same op_params layout and same src[] slots as ggml_flash_attn_ext -- so the CUDA
+// backend can share every accessor -- but a flat F32 dst that holds O and the LSE back to back.
+// See the header for the layout and for why this is a separate op.
+struct ggml_tensor * ggml_flash_attn_ext_lse(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap) {
+    GGML_ASSERT(ggml_can_mul_mat(k, q));
+
+    GGML_ASSERT(q->ne[3] == k->ne[3]);
+    GGML_ASSERT(q->ne[3] == v->ne[3]);
+
+    if (mask) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_is_contiguous(mask));
+
+        GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
+        GGML_ASSERT(q->ne[3] % mask->ne[3] == 0);
+    }
+
+    if (max_bias > 0.0f) {
+        GGML_ASSERT(mask);
+    }
+
+    const int64_t n_o   = v->ne[0] * q->ne[2] * q->ne[1] * q->ne[3];
+    const int64_t n_lse = q->ne[1] * q->ne[2] * q->ne[3];
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_o + n_lse);
+
+    float params[] = { scale, max_bias, logit_softcap };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_FLASH_ATTN_EXT_LSE;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = mask;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_lse_out(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_LSE);
+
+    const struct ggml_tensor * q = a->src[0];
+    const struct ggml_tensor * v = a->src[2];
+
+    return ggml_view_4d(ctx, a, v->ne[0], q->ne[2], q->ne[1], q->ne[3],
+                        v->ne[0]*sizeof(float),
+                        v->ne[0]*q->ne[2]*sizeof(float),
+                        v->ne[0]*q->ne[2]*q->ne[1]*sizeof(float),
+                        0);
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_lse_stats(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_LSE);
+
+    const struct ggml_tensor * q = a->src[0];
+    const struct ggml_tensor * v = a->src[2];
+
+    const size_t offset = (size_t)v->ne[0]*q->ne[2]*q->ne[1]*q->ne[3]*sizeof(float);
+
+    return ggml_view_3d(ctx, a, q->ne[1], q->ne[2], q->ne[3],
+                        q->ne[1]*sizeof(float),
+                        q->ne[1]*q->ne[2]*sizeof(float),
+                        offset);
+}
+
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_LSE);
 
     const int32_t prec_i32 = (int32_t) prec;
 
@@ -5575,7 +5658,7 @@ void ggml_flash_attn_ext_set_prec(
 
 enum ggml_prec ggml_flash_attn_ext_get_prec(
         const struct ggml_tensor * a) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_LSE);
 
     const int32_t prec_i32 = ggml_get_op_params_i32(a, 3);
 

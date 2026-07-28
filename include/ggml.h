@@ -593,6 +593,11 @@ extern "C" {
 
         GGML_OP_ROPE_PE,  // longcat-avatar: fused interleaved RoPE from precomputed pe (cos/sin), CUDA-only
 
+        // longcat-avatar: ggml_flash_attn_ext + the per-query log-sum-exp of the softmax
+        // denominator, packed into one dst. Appended at the END of the enum so every existing
+        // op keeps its value. See ggml_flash_attn_ext_lse() below.
+        GGML_OP_FLASH_ATTN_EXT_LSE,
+
         GGML_OP_COUNT,
     };
 
@@ -2501,6 +2506,47 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // ggml_flash_attn_ext_lse — flash attention that ALSO returns the softmax log-sum-exp.
+    //
+    // Deliberately a SEPARATE op rather than an extra output on ggml_flash_attn_ext: that op's
+    // contract (one F32 [n_embd_v, n_head, n_batch, ne3] dst) is relied on by every backend and
+    // every other model in this tree, and must keep working untouched.
+    //
+    // Multi-output follows the GGML_OP_SSM_SCAN idiom: one flat F32 dst holding both results
+    // back to back, with view helpers to address them.
+    //
+    //   O   : ne = [n_embd_v, n_head, n_batch, ne3]   (identical to ggml_flash_attn_ext's dst)
+    //   LSE : ne = [n_batch,  n_head, ne3,     1]     natural-log log-sum-exp of the SCALED
+    //                                                 scores, one value per (query, head, ne3);
+    //                                                 query is the innermost axis, which is
+    //                                                 exactly cuDNN's Stats [b, h, s_q, 1].
+    //
+    // softmax(q_i . K^T * scale + mask_i) sums to 1 by construction, so
+    //   LSE_i = log sum_j exp(scale * q_i.k_j + mask_ij)
+    // and two attentions over DISJOINT key ranges can be merged exactly with
+    //   O = sum_s w_s O_s,  w_s = exp(LSE_s + b_s - logsumexp_s(LSE_s + b_s)).
+    //
+    // Only implemented where a backend can produce the statistic (currently CUDA + cuDNN SDPA);
+    // ask ggml_backend_supports_op() and fall back to a masked ggml_flash_attn_ext otherwise.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_lse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
+
+    // Views into the packed result above. `a` must be a GGML_OP_FLASH_ATTN_EXT_LSE tensor.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_lse_out(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_lse_stats(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

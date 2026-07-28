@@ -155,6 +155,34 @@ struct SoftmaxFused{
         }
     }
 
+    // Absolute, natural-log log-sum-exp of the SCALED scores for row `mi`.
+    // Valid only AFTER finalize(), which butterfly-reduces row_sum across the quad.
+    //
+    // Derivation, straight from online_softmax_with_quant() above. Write
+    // ssl2 = softmax_scale_log2 = scale*log2(e) and C = fp8_scalexfp4_scale_log2:
+    //
+    //   max_scaled = row_max*ssl2 + C
+    //   P_j        = exp2(acc_j*ssl2 - max_scaled)
+    //   row_sum    = sum_j P_j          (accumulated BEFORE the /AbsMaxP split, and the
+    //                                    cross-tile rescale carries no C because the same
+    //                                    C sits in both max_scaled's and cancels)
+    //
+    // so, with sum_j exp(scale*acc_j) == sum_j exp2(acc_j*ssl2) == 2^max_scaled * row_sum,
+    //
+    //   LSE = ln2 * (row_max*ssl2 + C + log2(row_sum)).
+    //
+    // C appears EXACTLY ONCE. It is why row_sum is 2^-C times the true denominator, and it
+    // cancels against the identical factor carried by the PV accumulator -- which is why
+    // the kernel is already correct today without ever materialising an LSE.
+    //
+    // NOTE the scores exponentiated here are the SMOOTHED ones, q.(k - kmean); undoing that
+    // per-row shift is the adapter's job (fattn-sa3.cu sa3_lse_to_dst).
+    CUTLASS_DEVICE float lse_natural(int mi, const float softmax_scale_log2) {
+        const float sum = row_sum(mi);
+        if (!(sum > 0.f)) { return -INFINITY; }  // also catches the all-masked NaN row
+        return 0.69314718055994531f * (row_max(mi) * softmax_scale_log2 + fp8_scalexfp4_scale_log2 + log2f(sum));
+    }
+
     template<typename TensorAcc>
     CUTLASS_DEVICE void rescale_o(TensorAcc& o_store, TensorAcc const& o_tmp) {
         Tensor o_store_reduction_view = make_tensor(o_store.data(), flash::convert_to_reduction_layout(o_store.layout()));
