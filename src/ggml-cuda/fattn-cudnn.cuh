@@ -16,6 +16,11 @@
 
 void ggml_cuda_flash_attn_ext_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// GGML_OP_FLASH_ATTN_EXT_LSE: same SDPA, plus cuDNN's softmax Stats (the per-query
+// natural-log log-sum-exp) written after the output in the packed F32 dst. Asking for
+// Stats builds a SEPARATE cuDNN graph, so the inference plan cache is untouched.
+void ggml_cuda_flash_attn_ext_lse_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 // True when the TU was compiled with cuDNN support (GGML_CUDNN defined at build).
 bool ggml_cuda_cudnn_available();
 

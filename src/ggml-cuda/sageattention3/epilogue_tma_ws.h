@@ -183,6 +183,55 @@ struct CollectiveEpilogueFwd{
         tma_store_wait<0>();
     }
 
+    // Per-query natural-log log-sum-exp of the scaled scores.
+    //
+    // Upstream's LSE store (the commented-out block in tma_store above) is dead for a
+    // structural reason, not an oversight: tma_store runs in the PRODUCER warpgroup's
+    // epilogue warp, which does not own the softmax registers -- `lse` is not even in
+    // scope there. So the store lives here and is driven from the CONSUMER warpgroups
+    // instead, immediately after CollectiveMainloopFwd::mma() has run finalize().
+    //
+    // ptr_LSE == nullptr (what the ggml adapter passes on the inference path) skips the
+    // whole thing, which is what keeps production SA3 byte-for-byte what it was.
+    template <typename TiledMmaQK, typename Softmax>
+    CUTLASS_DEVICE void
+    store_lse(
+        Params const& epilogue_params,
+        TiledMmaQK tiled_mma_qk,
+        Softmax& softmax,
+        float softmax_scale_log2,
+        int thread_idx,
+        cute::tuple<int32_t, int32_t, int32_t> const& block_coord
+    ) {
+        if (epilogue_params.ptr_LSE == nullptr) { return; }
+        auto [m_block, bidh, bidb] = block_coord;
+        auto shape_LSE = select<0, 2, 3>(epilogue_params.shape_O);
+        Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.ptr_LSE), shape_LSE, epilogue_params.stride_LSE);
+        Tensor gLSE = local_tile(mLSE(_, bidh, bidb), Shape<Int<kBlockM>>{}, make_coord(m_block));
+
+        // Partition an identity tensor exactly the way the softmax accumulator is
+        // partitioned, then regroup it with the SAME convert_to_reduction_layout the
+        // softmax uses. Mode 0 of the result is then indexed by the very `mi` that indexes
+        // row_max/row_sum, and its coordinates give (query row, key column) without
+        // hard-coding anything about the MMA atom.
+        auto thread_mma_qk = tiled_mma_qk.get_thread_slice(thread_idx);
+        Tensor cS   = cute::make_identity_tensor(select<0, 1>(TileShape_MNK{}));
+        Tensor tScS = thread_mma_qk.partition_C(cS);
+        Tensor tScS_red = flash::convert_to_reduction_tensor(tScS);
+
+        const int rows_left = get<0>(shape_LSE) - m_block * kBlockM;
+        CUTLASS_PRAGMA_UNROLL
+        for (int mi = 0; mi < size<0>(tScS_red); ++mi) {
+            // finalize() has already butterfly-reduced row_sum over the four threads of the
+            // quad that share this row (and online_softmax did the same for row_max), so all
+            // four hold the identical value. Elect the one holding key column 0 to store.
+            if (int(get<1>(tScS_red(mi, _0{}))) != 0) { continue; }
+            const int row = int(get<0>(tScS_red(mi, _0{})));
+            if (row >= rows_left) { continue; }
+            gLSE(row) = softmax.lse_natural(mi, softmax_scale_log2);
+        }
+    }
+
     // Write 0 to output and -inf to LSE
     CUTLASS_DEVICE void
     store_zero(
@@ -194,6 +243,8 @@ struct CollectiveEpilogueFwd{
         Tensor mO = make_tensor(make_gmem_ptr(epilogue_params.ptr_O), epilogue_params.shape_O, epilogue_params.stride_O);
         Tensor gO = local_tile(mO(_, _, bidh, bidb), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
         auto shape_LSE = select<0, 2, 3>(epilogue_params.shape_O);
+        // ptr_LSE may legitimately be null now (the ggml inference path asks for no LSE);
+        // building the tensor is pure address arithmetic, only the store below dereferences.
         Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.ptr_LSE), shape_LSE, epilogue_params.stride_LSE);
         Tensor gLSE = local_tile(mLSE(_, bidh, bidb), Shape<Int<kBlockM>>{}, make_coord(m_block));
 
@@ -214,7 +265,12 @@ struct CollectiveEpilogueFwd{
             gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, get<0>(epilogue_params.shape_O) - m_block * kBlockM
         );
         static_assert(kBlockM <= NumMmaThreads);
-        if (thread_idx < get<0>(shape_LSE) - m_block * kBlockM) { gLSE(thread_idx) = INFINITY; }
+        // Reachable only under Is_causal (a query tile with no visible keys), which the ggml
+        // adapter never sets. -INFINITY, not +INFINITY: an empty softmax has zero mass, and
+        // now that the LSE is actually consumed the sign matters.
+        if (epilogue_params.ptr_LSE != nullptr && thread_idx < get<0>(shape_LSE) - m_block * kBlockM) {
+            gLSE(thread_idx) = -INFINITY;
+        }
     }
 
 };

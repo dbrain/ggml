@@ -2,8 +2,10 @@
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <algorithm>
 #include <mutex>
 
+#include "fattn-lse-selfcheck.cuh"
 #include "sageattention3/launch.h"
 
 // This file is intentionally the only ggml-facing SA3 adapter.  The imported
@@ -242,41 +244,84 @@ __global__ void sa3_o_to_dst(const half * in, void * dst, int l, int lr, int hea
     }
 }
 
-bool ggml_cuda_flash_attn_ext_sa3(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * q = dst->src[0];
-    const ggml_tensor * k = dst->src[1];
-    const ggml_tensor * v = dst->src[2];
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    float scale = 0.0f, max_bias = 0.0f, softcap = 0.0f;
-    memcpy(&scale, dst->op_params, sizeof(scale));
-    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(max_bias));
-    memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(softcap));
-    const bool contract = cc >= GGML_CUDA_CC_BLACKWELL && dst->src[3] == nullptr &&
-        q->ne[0] == kHeadDim && q->ne[1] == k->ne[1] && q->ne[1] == v->ne[1] &&
+// LSE fix-up and copy-out.
+//
+// SA3 smooths K by subtracting a per-(head, channel) mean before the QK GEMM and folds the
+// q-block mean back in through delta_s, so what the kernel actually exponentiates is
+//
+//     S'_ij = q_i . (k_j - kmean_h) = S_ij - q_i . kmean_h
+//
+// -- a shift that is CONSTANT ALONG A QUERY ROW. The output O is invariant to it (softmax
+// is shift-invariant), which is exactly why the kernel is correct today. The LSE is not:
+// it comes out low by scale * (q_i . kmean_h). And kmean is computed over THIS call's keys,
+// so in a segmented merge every segment carries a DIFFERENT shift and it does not cancel
+// between them -- getting this wrong would silently mis-weight the merge, not crash.
+//
+// One warp per query row so the 128 head-dim values are read as one coalesced burst.
+template <typename TQ>
+__global__ void sa3_lse_to_dst(const float * __restrict__ lse_src, const TQ * __restrict__ q,
+                               const float * __restrict__ kmean, float * __restrict__ dst,
+                               int lq, int lqr, int head_start, float scale) {
+    const int warps_per_block = blockDim.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int row  = blockIdx.x * warps_per_block + threadIdx.x / 32;
+    const int h    = blockIdx.y;
+    if (row >= lq) return;
+    const TQ    * qp = q     + ((size_t) h * lq + row) * kHeadDim;
+    const float * mp = kmean + (size_t) h * kHeadDim;
+    constexpr int per_lane = kHeadDim / 32;
+    float acc = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < per_lane; ++i) {
+        const int d = lane * per_lane + i;
+        acc += (float) qp[d] * mp[d];
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) {
+        dst[(size_t) (head_start + h) * lq + row] = lse_src[(size_t) h * lqr + row] + scale * acc;
+    }
+}
+
+// The shape/dtype contract. `allow_rect` relaxes ONLY the Lq == Lkv requirement and is set
+// exclusively by the LSE entry point, so the production GGML_OP_FLASH_ATTN_EXT route keeps
+// rejecting precisely what it rejected before (notably LTX's cross-attention).
+static bool sa3_contract_ok(int cc, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v,
+                            const ggml_tensor * mask, ggml_type o_type, bool o_contiguous,
+                            float max_bias, float softcap, bool allow_rect) {
+    return cc >= GGML_CUDA_CC_BLACKWELL && mask == nullptr &&
+        q->ne[0] == kHeadDim && (allow_rect || q->ne[1] == k->ne[1]) && k->ne[1] == v->ne[1] &&
         q->ne[2] == 32 && k->ne[2] == 32 && v->ne[2] == 32 && q->ne[3] == 1 &&
         k->ne[3] == 1 && v->ne[3] == 1 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
-        (q->type == GGML_TYPE_F16 || q->type == GGML_TYPE_F32) && (dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32) &&
+        (q->type == GGML_TYPE_F16 || q->type == GGML_TYPE_F32) && (o_type == GGML_TYPE_F16 || o_type == GGML_TYPE_F32) &&
         max_bias == 0.0f && softcap == 0.0f && ggml_is_contiguous(q) && ggml_is_contiguous(k) &&
-        ggml_is_contiguous(v) && ggml_is_contiguous(dst);
-    if (!contract) {
-        static int rejected = 0;
-        if (rejected++ < 3) {
-            fprintf(stderr, "[sa3] reject cc=%d q=[%lld,%lld,%lld,%lld] qtype=%d kvtype=%d/%d dst=%d mask=%d contiguous=%d/%d/%d/%d bias=%g softcap=%g\n",
-                    cc, (long long) q->ne[0], (long long) q->ne[1], (long long) q->ne[2], (long long) q->ne[3],
-                    q->type, k->type, v->type, dst->type, dst->src[3] != nullptr,
-                    ggml_is_contiguous(q), ggml_is_contiguous(k), ggml_is_contiguous(v), ggml_is_contiguous(dst), max_bias, softcap);
-        }
-        return false;
-    }
+        ggml_is_contiguous(v) && o_contiguous;
+}
 
-    const int l = q->ne[1], total_h = 32, lr = ((l + 127) / 128) * 128, blocks = lr / 128;
+// The single implementation behind both entry points.
+//
+//   o   -- [D, H, Lq, 1] BSHD, F32 or F16, contiguous (ggml's flash-attn dst layout).
+//   lse -- null on the inference path; otherwise F32 [Lq, H, 1], query innermost, which is
+//          the layout ggml_flash_attn_ext_lse_stats() views.
+static void sa3_run(ggml_backend_cuda_context & ctx,
+                    const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v,
+                    void * o, bool o_f32, float * lse_dst, float scale) {
+    const int total_h = 32;
+    // Q and K/V lengths are independent: the relay's segment merge calls this with a full
+    // query set against one slice of the keys. Each side is padded to its own multiple of
+    // the 128-token block; the CUTLASS kernel already grids M over ceil(seqlen_q/kBlockM)
+    // and masks the K tail at `unpadded_seqlen_k`, so only the adapter had to learn this.
+    const int lq = q->ne[1], lk = k->ne[1];
+    const int lqr = ((lq + 127) / 128) * 128, lkr = ((lk + 127) / 128) * 128;
+    const int qblocks = lqr / 128, kblocks = lkr / 128;
     int head_group = total_h;
     if (const char * e = getenv("GGML_LTX_SA3_HEAD_GROUP")) {
         const int requested = atoi(e);
         if (requested > 0 && requested <= total_h && total_h % requested == 0) head_group = requested;
     }
-    const size_t elems = (size_t) head_group * l * kHeadDim;
-    const size_t elems_padded = (size_t) head_group * lr * kHeadDim;
+    const size_t elems_q        = (size_t) head_group * lq  * kHeadDim;   // unpadded Q/O
+    const size_t elems_q_padded = (size_t) head_group * lqr * kHeadDim;
+    const size_t elems_k_padded = (size_t) head_group * lkr * kHeadDim;
     const cudaStream_t stream = ctx.stream();
     // The locked singing repro enables the validated F16 storage path. Keep
     // the core runtime opt-in so other callers retain the original FP32 path.
@@ -306,30 +351,32 @@ bool ggml_cuda_flash_attn_ext_sa3(ggml_backend_cuda_context & ctx, ggml_tensor *
     ggml_cuda_pool_alloc<half> delta_f16_buf(ctx.pool());
     ggml_cuda_pool_alloc<float> delta(ctx.pool()), lse(ctx.pool());
     ggml_cuda_pool_alloc<uint8_t> q4(ctx.pool()), k4(ctx.pool()), v4(ctx.pool()), sfq(ctx.pool()), sfk(ctx.pool()), sfv(ctx.pool());
-    scratch.alloc(elems_padded); q_mean.alloc((size_t) head_group * blocks * kHeadDim);
+    scratch.alloc(std::max(elems_q_padded, elems_k_padded));
+    q_mean.alloc((size_t) head_group * qblocks * kHeadDim);
     k_mean.alloc((size_t) head_group * kHeadDim);
-    if (delta_f16) delta_f16_buf.alloc((size_t) head_group * blocks * lr);
-    else delta.alloc((size_t) head_group * blocks * lr);
-    lse.alloc((size_t) head_group * lr);
-    q4.alloc((size_t) head_group * lr * kHeadDim / 2); k4.alloc((size_t) head_group * lr * kHeadDim / 2); v4.alloc((size_t) head_group * kHeadDim * lr / 2);
-    sfq.alloc((size_t) head_group * lr * kHeadDim / 16); sfk.alloc((size_t) head_group * lr * kHeadDim / 16); sfv.alloc((size_t) head_group * kHeadDim * lr / 16);
+    if (delta_f16) delta_f16_buf.alloc((size_t) head_group * qblocks * lkr);
+    else delta.alloc((size_t) head_group * qblocks * lkr);
+    if (lse_dst != nullptr) lse.alloc((size_t) head_group * lqr);
+    q4.alloc((size_t) head_group * lqr * kHeadDim / 2); k4.alloc((size_t) head_group * lkr * kHeadDim / 2); v4.alloc((size_t) head_group * kHeadDim * lkr / 2);
+    sfq.alloc((size_t) head_group * lqr * kHeadDim / 16); sfk.alloc((size_t) head_group * lkr * kHeadDim / 16); sfv.alloc((size_t) head_group * kHeadDim * lkr / 16);
     for (int head_start = 0; head_start < total_h; head_start += head_group) {
-        const size_t head_offset = (size_t) head_start * l * kHeadDim;
-        const float * q_f32 = static_cast<const float *>(q->data) + head_offset;
-        const half * k_f16 = static_cast<const half *>(k->data) + head_offset;
-        const half * v_f16 = static_cast<const half *>(v->data) + head_offset;
-        if (q->type == GGML_TYPE_F32) sa3_cast_q_f32_pad<<<(elems_padded + 255) / 256, 256, 0, stream>>>(q_f32, scratch.get(), l, lr, head_group);
-        else sa3_pad_f16<<<(elems_padded + 255) / 256, 256, 0, stream>>>((const half *) q->data + head_offset, scratch.get(), l, lr, head_group);
+        const size_t q_head_offset = (size_t) head_start * lq * kHeadDim;
+        const size_t k_head_offset = (size_t) head_start * lk * kHeadDim;
+        const float * q_f32 = static_cast<const float *>(q->data) + q_head_offset;
+        const half * k_f16 = static_cast<const half *>(k->data) + k_head_offset;
+        const half * v_f16 = static_cast<const half *>(v->data) + k_head_offset;
+        if (q->type == GGML_TYPE_F32) sa3_cast_q_f32_pad<<<(elems_q_padded + 255) / 256, 256, 0, stream>>>(q_f32, scratch.get(), lq, lqr, head_group);
+        else sa3_pad_f16<<<(elems_q_padded + 255) / 256, 256, 0, stream>>>((const half *) q->data + q_head_offset, scratch.get(), lq, lqr, head_group);
         check_stage("Q cast");
-        sa3_k_mean<<<dim3(kHeadDim, head_group), 256, 0, stream>>>(k_f16, k_mean.get(), l);
-        sa3_q_block_mean<<<dim3(kHeadDim, blocks, head_group), kTokenBlock, 0, stream>>>(scratch.get(), q_mean.get(), lr, blocks);
-        sa3_center_q<<<(elems_padded + 255) / 256, 256, 0, stream>>>(scratch.get(), q_mean.get(), scratch.get(), elems_padded, lr, blocks);
+        sa3_k_mean<<<dim3(kHeadDim, head_group), 256, 0, stream>>>(k_f16, k_mean.get(), lk);
+        sa3_q_block_mean<<<dim3(kHeadDim, qblocks, head_group), kTokenBlock, 0, stream>>>(scratch.get(), q_mean.get(), lqr, qblocks);
+        sa3_center_q<<<(elems_q_padded + 255) / 256, 256, 0, stream>>>(scratch.get(), q_mean.get(), scratch.get(), elems_q_padded, lqr, qblocks);
         check_stage("centering");
-        sa3_quant_qk<false><<<dim3(blocks, 1, head_group), 1024, 0, stream>>>(scratch.get(), q4.get(), sfq.get(), lr, lr, false);
+        sa3_quant_qk<false><<<dim3(qblocks, 1, head_group), 1024, 0, stream>>>(scratch.get(), q4.get(), sfq.get(), lqr, lqr, false);
         check_stage("Q FP4 quantization");
 
         // Q is quantized, so its scratch storage can become centered K.
-        sa3_center_k_pad<<<(elems_padded + 255) / 256, 256, 0, stream>>>(k_f16, k_mean.get(), scratch.get(), l, lr, head_group);
+        sa3_center_k_pad<<<(elems_k_padded + 255) / 256, 256, 0, stream>>>(k_f16, k_mean.get(), scratch.get(), lk, lkr, head_group);
         // The long-resolution delta GEMM can otherwise select an atomic
         // reduction algorithm.  Those reductions are order-dependent on
         // Blackwell, so exclude them for this reproducibility-critical path.
@@ -339,38 +386,53 @@ bool ggml_cuda_flash_attn_ext_sa3(ggml_backend_cuda_context & ctx, ggml_tensor *
         for (int head = 0; head < head_group; ++head) {
             const float one = 1.0f, zero = 0.0f;
             CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
-            CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N, lr, blocks, kHeadDim,
-                &one, scratch.get() + (size_t) head * lr * kHeadDim, CUDA_R_16F, kHeadDim,
-                q_mean.get() + (size_t) head * blocks * kHeadDim, CUDA_R_16F, kHeadDim,
+            CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N, lkr, qblocks, kHeadDim,
+                &one, scratch.get() + (size_t) head * lkr * kHeadDim, CUDA_R_16F, kHeadDim,
+                q_mean.get() + (size_t) head * qblocks * kHeadDim, CUDA_R_16F, kHeadDim,
                 &zero,
-                delta_f16 ? static_cast<void *>(delta_f16_buf.get() + (size_t) head * blocks * lr)
-                          : static_cast<void *>(delta.get() + (size_t) head * blocks * lr),
-                delta_f16 ? CUDA_R_16F : CUDA_R_32F, lr, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                delta_f16 ? static_cast<void *>(delta_f16_buf.get() + (size_t) head * qblocks * lkr)
+                          : static_cast<void *>(delta.get() + (size_t) head * qblocks * lkr),
+                delta_f16 ? CUDA_R_16F : CUDA_R_32F, lkr, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         }
         CUBLAS_CHECK(cublasSetAtomicsMode(ctx.cublas_handle(), previous_atomics_mode));
         check_stage("delta GEMM");
-        sa3_quant_qk<true><<<dim3(blocks, 1, head_group), 1024, 0, stream>>>(scratch.get(), k4.get(), sfk.get(), lr, lr, false);
+        sa3_quant_qk<true><<<dim3(kblocks, 1, head_group), 1024, 0, stream>>>(scratch.get(), k4.get(), sfk.get(), lkr, lkr, false);
         check_stage("K FP4 quantization");
         // K is quantized, so the same scratch storage can become padded V.
-        sa3_pad_f16<<<(elems_padded + 255) / 256, 256, 0, stream>>>(v_f16, scratch.get(), l, lr, head_group);
-        sa3_quant_vt<<<dim3(blocks, 1, head_group), 1024, 0, stream>>>(scratch.get(), v4.get(), sfv.get(), lr, lr, false);
+        sa3_pad_f16<<<(elems_k_padded + 255) / 256, 256, 0, stream>>>(v_f16, scratch.get(), lk, lkr, head_group);
+        sa3_quant_vt<<<dim3(kblocks, 1, head_group), 1024, 0, stream>>>(scratch.get(), v4.get(), sfv.get(), lkr, lkr, false);
         check_stage("V FP4 quantization");
         Flash_fwd_params p = {};
-        p.q_ptr=q4.get(); p.k_ptr=k4.get(); p.v_ptr=v4.get(); p.delta_s_ptr=delta_f16 ? static_cast<void *>(delta_f16_buf.get()) : static_cast<void *>(delta.get()); p.sfq_ptr=sfq.get(); p.sfk_ptr=sfk.get(); p.sfv_ptr=sfv.get(); p.o_ptr=scratch.get(); p.softmax_lse_ptr=lse.get();
-        p.b=1; p.h=head_group; p.h_k=head_group; p.h_h_k_ratio=1; p.seqlen_q=lr; p.seqlen_k=lr; p.unpadded_seqlen_k=l; p.seqlen_q_rounded=lr; p.seqlen_k_rounded=lr; p.d=kHeadDim; p.d_rounded=kHeadDim; p.head_divmod=cutlass::FastDivmod(head_group);
+        p.q_ptr=q4.get(); p.k_ptr=k4.get(); p.v_ptr=v4.get(); p.delta_s_ptr=delta_f16 ? static_cast<void *>(delta_f16_buf.get()) : static_cast<void *>(delta.get()); p.sfq_ptr=sfq.get(); p.sfk_ptr=sfk.get(); p.sfv_ptr=sfv.get(); p.o_ptr=scratch.get();
+        // Null on the inference path: the epilogue's LSE store is predicated on this pointer,
+        // so production SA3 executes exactly the instructions it did before.
+        p.softmax_lse_ptr = lse_dst != nullptr ? static_cast<void *>(lse.get()) : nullptr;
+        p.b=1; p.h=head_group; p.h_k=head_group; p.h_h_k_ratio=1; p.seqlen_q=lqr; p.seqlen_k=lkr; p.unpadded_seqlen_k=lk; p.seqlen_q_rounded=lqr; p.seqlen_k_rounded=lkr; p.d=kHeadDim; p.d_rounded=kHeadDim; p.head_divmod=cutlass::FastDivmod(head_group);
     // FP4 pointer arithmetic is in nibbles (cutlass::float_e2m1_t), whereas
     // the backing buffers above are byte-addressed.  The upstream adapter
     // therefore multiplies every Q/K/V stride by two.
-    p.q_row_stride=kHeadDim; p.k_row_stride=kHeadDim; p.v_row_stride=lr; p.q_head_stride=(int64_t) lr*kHeadDim; p.k_head_stride=(int64_t) lr*kHeadDim; p.v_head_stride=(int64_t) kHeadDim*lr;
-    p.q_batch_stride=(int64_t) head_group*lr*kHeadDim; p.k_batch_stride=p.q_batch_stride; p.v_batch_stride=(int64_t) head_group*kHeadDim*lr;
-    p.sfq_row_stride=kHeadDim/16; p.sfk_row_stride=kHeadDim/16; p.sfv_row_stride=lr/16; p.sfq_head_stride=(int64_t) lr*kHeadDim/16; p.sfk_head_stride=p.sfq_head_stride; p.sfv_head_stride=(int64_t) kHeadDim*lr/16;
-    p.sfq_batch_stride=(int64_t) head_group*lr*kHeadDim/16; p.sfk_batch_stride=p.sfq_batch_stride; p.sfv_batch_stride=(int64_t) head_group*kHeadDim*lr/16;
-    p.ds_row_stride=lr; p.ds_head_stride=(int64_t) blocks*lr; p.ds_batch_stride=(int64_t) head_group*blocks*lr; p.o_row_stride=kHeadDim; p.o_head_stride=(int64_t) lr*kHeadDim; p.o_batch_stride=(int64_t) head_group*lr*kHeadDim;
-    p.scale_softmax=scale; p.scale_softmax_log2=scale * M_LOG2E; p.is_causal=false; p.per_block_mean=true; p.seqlen_s=lr; p.is_bf16=false; p.is_seqlens_k_cumulative=true;
+    p.q_row_stride=kHeadDim; p.k_row_stride=kHeadDim; p.v_row_stride=lkr; p.q_head_stride=(int64_t) lqr*kHeadDim; p.k_head_stride=(int64_t) lkr*kHeadDim; p.v_head_stride=(int64_t) kHeadDim*lkr;
+    p.q_batch_stride=(int64_t) head_group*lqr*kHeadDim; p.k_batch_stride=(int64_t) head_group*lkr*kHeadDim; p.v_batch_stride=(int64_t) head_group*kHeadDim*lkr;
+    p.sfq_row_stride=kHeadDim/16; p.sfk_row_stride=kHeadDim/16; p.sfv_row_stride=lkr/16; p.sfq_head_stride=(int64_t) lqr*kHeadDim/16; p.sfk_head_stride=(int64_t) lkr*kHeadDim/16; p.sfv_head_stride=(int64_t) kHeadDim*lkr/16;
+    p.sfq_batch_stride=(int64_t) head_group*lqr*kHeadDim/16; p.sfk_batch_stride=(int64_t) head_group*lkr*kHeadDim/16; p.sfv_batch_stride=(int64_t) head_group*kHeadDim*lkr/16;
+    // delta_s is [head][q_block][lkr]; the kernel's LayoutDS derives that from shape alone
+    // (seqlen_s picks the q-block count, seqlen_k the row length), so seqlen_s must be the
+    // PADDED query length. ds_row_stride is informational -- the TMA never reads it.
+    p.ds_row_stride=lkr; p.ds_head_stride=(int64_t) qblocks*lkr; p.ds_batch_stride=(int64_t) head_group*qblocks*lkr; p.o_row_stride=kHeadDim; p.o_head_stride=(int64_t) lqr*kHeadDim; p.o_batch_stride=(int64_t) head_group*lqr*kHeadDim;
+    p.scale_softmax=scale; p.scale_softmax_log2=scale * M_LOG2E; p.is_causal=false; p.per_block_mean=true; p.seqlen_s=lqr; p.is_bf16=false; p.is_seqlens_k_cumulative=true;
     if (timing) CUDA_CHECK(cudaEventRecord(timing_mha, stream));
     if (delta_f16) run_mha_fwd_<cutlass::nv_float4_t<cutlass::float_e2m1_t>, kHeadDim, cutlass::half_t, cutlass::half_t>(p, stream);
     else run_mha_fwd_<cutlass::nv_float4_t<cutlass::float_e2m1_t>, kHeadDim, cutlass::half_t>(p, stream);
-        sa3_o_to_dst<<<(elems + 255) / 256, 256, 0, stream>>>(scratch.get(), dst->data, l, lr, head_group, head_start, total_h, dst->type == GGML_TYPE_F32);
+        sa3_o_to_dst<<<(elems_q + 255) / 256, 256, 0, stream>>>(scratch.get(), o, lq, lqr, head_group, head_start, total_h, o_f32);
+        if (lse_dst != nullptr) {
+            // 8 warps per block, one query row each.
+            const dim3 grid((unsigned) ((lq + 7) / 8), (unsigned) head_group);
+            if (q->type == GGML_TYPE_F32) {
+                sa3_lse_to_dst<float><<<grid, 256, 0, stream>>>(lse.get(), q_f32, k_mean.get(), lse_dst, lq, lqr, head_start, scale);
+            } else {
+                sa3_lse_to_dst<half><<<grid, 256, 0, stream>>>(lse.get(), (const half *) q->data + q_head_offset, k_mean.get(), lse_dst, lq, lqr, head_start, scale);
+            }
+        }
         CUDA_CHECK(cudaGetLastError());
     }
     if (timing) {
@@ -379,9 +441,91 @@ bool ggml_cuda_flash_attn_ext_sa3(ggml_backend_cuda_context & ctx, ggml_tensor *
         float total_ms = 0.0f, prep_ms = 0.0f;
         CUDA_CHECK(cudaEventElapsedTime(&total_ms, timing_begin, timing_end));
         CUDA_CHECK(cudaEventElapsedTime(&prep_ms, timing_begin, timing_mha));
-        fprintf(stderr, "[sa3-timing] L=%d total=%.3fms prep=%.3fms mha+out=%.3fms\n", l, total_ms, prep_ms, total_ms - prep_ms);
+        fprintf(stderr, "[sa3-timing] Lq=%d Lkv=%d total=%.3fms prep=%.3fms mha+out=%.3fms\n", lq, lk, total_ms, prep_ms, total_ms - prep_ms);
     }
-    static int calls = 0;
-    if (calls++ < 4) fprintf(stderr, "[sa3] dispatch B=1 H=32 group=%d L=%d D=128 Q=%s delta=%s\n", head_group, l, q->type == GGML_TYPE_F32 ? "f32" : "f16", delta_f16 ? "f16" : "f32");
+    // Separate counters: the inference path's "[sa3] dispatch" lines are how a render is
+    // confirmed to be on SA3 at all, so LSE calls must not consume that budget.
+    static int calls = 0, lse_calls = 0;
+    if ((lse_dst != nullptr ? lse_calls++ : calls++) < 4) {
+        fprintf(stderr, "[sa3%s] dispatch B=1 H=32 group=%d Lq=%d Lkv=%d D=128 Q=%s delta=%s\n",
+                lse_dst != nullptr ? "-lse" : "", head_group, lq, lk,
+                q->type == GGML_TYPE_F32 ? "f32" : "f16", delta_f16 ? "f16" : "f32");
+    }
+    if (lse_dst != nullptr) {
+        // Same brute-force F32 oracle the cuDNN stats were validated with. FP4 QK means the
+        // residual here is quantization-sized, not 1e-3, so the tolerance is looser -- but
+        // every failure mode worth worrying about (a missing or doubled 2^C offset is
+        // ~7.9 nats, a log2 reading is ~30% of |LSE|) is still far outside it.
+        ggml_cuda_attn_lse_selfcheck("sa3", q, k, lse_dst, total_h, lq, lk, kHeadDim, scale,
+                                     /*tol=*/0.5f, stream);
+    }
+}
+
+bool ggml_cuda_flash_attn_ext_sa3(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    float scale = 0.0f, max_bias = 0.0f, softcap = 0.0f;
+    memcpy(&scale, dst->op_params, sizeof(scale));
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(max_bias));
+    memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(softcap));
+    if (!sa3_contract_ok(cc, q, k, v, dst->src[3], dst->type, ggml_is_contiguous(dst),
+                         max_bias, softcap, /*allow_rect=*/false)) {
+        static int rejected = 0;
+        if (rejected++ < 3) {
+            fprintf(stderr, "[sa3] reject cc=%d q=[%lld,%lld,%lld,%lld] qtype=%d kvtype=%d/%d dst=%d mask=%d contiguous=%d/%d/%d/%d bias=%g softcap=%g\n",
+                    cc, (long long) q->ne[0], (long long) q->ne[1], (long long) q->ne[2], (long long) q->ne[3],
+                    q->type, k->type, v->type, dst->type, dst->src[3] != nullptr,
+                    ggml_is_contiguous(q), ggml_is_contiguous(k), ggml_is_contiguous(v), ggml_is_contiguous(dst), max_bias, softcap);
+        }
+        return false;
+    }
+    sa3_run(ctx, q, k, v, dst->data, dst->type == GGML_TYPE_F32, /*lse_dst=*/nullptr, scale);
+    return true;
+}
+
+bool ggml_cuda_flash_attn_ext_lse_sa3(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // Opt-in on top of GGML_LTX_SA3, so simply turning SA3 on -- which is what production
+    // does -- never moves the LSE op off cuDNN.
+    // Read GGML_LTX_SA3 EVERY call, never cache it. The engine rewrites it per sampling
+    // step when GGML_LTX_SA3_POLICY is set (stable-diffusion.cpp ~3020; prod uses "first",
+    // i.e. cuDNN takes step 1 and SA3 the rest), which is why the main dispatcher also
+    // getenvs per forward. Caching on first call latched the step-1 value of "0" and
+    // disabled this path for entire renders with no reject line and no error -- it simply
+    // never ran. GGML_LTX_SA3_LSE is our own gate and is safe to cache.
+    static const int lse_gate = [] {
+        const char * e = getenv("GGML_LTX_SA3_LSE");
+        return e && atoi(e) ? 1 : 0;
+    }();
+    if (!lse_gate) return false;
+    const char * sa3_now = getenv("GGML_LTX_SA3");
+    if (!sa3_now || !atoi(sa3_now)) return false;
+
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    float scale = 0.0f, max_bias = 0.0f, softcap = 0.0f;
+    memcpy(&scale, dst->op_params, sizeof(scale));
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(max_bias));
+    memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(softcap));
+    // dst is the flat F32 pack from ggml_flash_attn_ext_lse: O ([D,H,Lq,N] BSHD) first,
+    // then the LSE ([Lq,H,N], query innermost).
+    if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || dst->src[4] != nullptr) return false;
+    if (!sa3_contract_ok(cc, q, k, v, dst->src[3], GGML_TYPE_F32, /*o_contiguous=*/true,
+                         max_bias, softcap, /*allow_rect=*/true)) {
+        static int rejected = 0;
+        if (rejected++ < 3) {
+            fprintf(stderr, "[sa3-lse] reject cc=%d q=[%lld,%lld,%lld,%lld] k=[%lld,%lld,%lld,%lld] qtype=%d kvtype=%d/%d\n",
+                    cc, (long long) q->ne[0], (long long) q->ne[1], (long long) q->ne[2], (long long) q->ne[3],
+                    (long long) k->ne[0], (long long) k->ne[1], (long long) k->ne[2], (long long) k->ne[3],
+                    q->type, k->type, v->type);
+        }
+        return false;
+    }
+    const size_t n_o = (size_t) v->ne[0] * q->ne[2] * q->ne[1] * q->ne[3];
+    float * lse_dst  = (float *) dst->data + n_o;
+    sa3_run(ctx, q, k, v, dst->data, /*o_f32=*/true, lse_dst, scale);
     return true;
 }

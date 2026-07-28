@@ -194,6 +194,12 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             barrier_o.wait();
             collective_epilogue.mma_store(shared_storage, tiled_mma_pv, tOrO, threadIdx.x - NumCopyThreads);
             barrier_o.arrive();
+            // The LSE lives in the CONSUMER's softmax registers, so it cannot be stored by
+            // the producer-side tma_store (see CollectiveEpilogueFwd::store_lse). Runtime
+            // no-op -- and no extra kernel instantiation -- when no LSE was requested.
+            collective_epilogue.store_lse(epilogue_params, typename Ktraits::TiledMmaQK{}, softmax_fused,
+                                          mainloop_params.softmax_scale_log2,
+                                          threadIdx.x - NumCopyThreads, block_coord);
             ++work_idx;
         }
     }
