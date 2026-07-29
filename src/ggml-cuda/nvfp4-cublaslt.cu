@@ -18,6 +18,7 @@
 #include <cuda_fp16.h>
 #include <cfloat>
 #include <atomic>
+#include <cmath>
 #include <mutex>
 #include <unordered_map>
 #include <map>
@@ -599,6 +600,31 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
             cudaStreamSynchronize(stream);
             float amax_t = 0.f; memcpy(&amax_t, &bits, sizeof(float));
             a_per_tensor = amax_t > 0.f ? amax_t/(6.0f*448.0f) : 0.f;
+            // GGML_ACT_AMAX_REPORT=1 -- answer "would an F16 residual stream have overflowed?"
+            // WITHOUT running F16. This amax is the largest absolute activation feeding this GEMM
+            // and it is already on the host (the two-level quant needs it), so the probe is free.
+            // Every large intermediate in the DiT is some Linear's input -- including the 16384-wide
+            // SwiGLU product -- so this covers the tensors that would actually blow F16's 65504.
+            // Reports headroom = 65504/amax; anything approaching 1.0 means F16 would clip.
+            // Deliberately reports the RUNNING MAX, not per-call: the risk is content-dependent, so
+            // what matters is the worst activation any prompt produces, not the average.
+            if (amax_t > 0.f) {
+                static int s_amax_report = -1;
+                if (s_amax_report < 0) { const char* e = getenv("GGML_ACT_AMAX_REPORT"); s_amax_report = (e && atoi(e)) ? 1 : 0; }
+                if (s_amax_report) {
+                    static std::mutex        s_amax_mu;
+                    static float             s_amax_hi = 0.f;
+                    std::lock_guard<std::mutex> lk(s_amax_mu);
+                    if (amax_t > s_amax_hi) {
+                        s_amax_hi = amax_t;
+                        const float f16_max  = 65504.0f;
+                        const float headroom = f16_max / amax_t;
+                        fprintf(stderr, "[act-amax] new max %.1f on '%s' [M=%d K=%d] -- f16 headroom %.1fx%s\n",
+                                amax_t, src1->name[0] ? src1->name : "(unnamed)", (int)M, (int)K, headroom,
+                                headroom < 4.0f ? "  <-- WARN: under 4x, an F16 stream is at risk" : "");
+                    }
+                }
+            }
         }
     }
     if (!act_reused) {
@@ -1445,6 +1471,36 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
             fp8_a_amax_kernel<float><<<grid, threads, 0, stream>>>((const float*) src1->data, a_amax_d, (long)n_act);
         }
         fp8_scale_from_amax<<<1, 1, 0, stream>>>(a_amax_d, a_scale_ptr);
+        // GGML_ACT_AMAX_REPORT=1 -- same probe as the NVFP4 path above, but this one costs a D2H
+        // + sync, so it is STRICTLY env-gated: this path deliberately keeps everything on device.
+        // This is the interesting one for LTX and Wan: they ship LTX_DIT_F16/WAN_DIT_F16 AND route
+        // their FFN through here, so if an F16 stream is already clipping in production, the
+        // non-finite amax shows up at THIS call site and nowhere else.
+        {
+            static int s_probe = -1;
+            if (s_probe < 0) { const char * e = getenv("GGML_ACT_AMAX_REPORT"); s_probe = (e && atoi(e)) ? 1 : 0; }
+            if (s_probe) {
+                unsigned int abits = 0;
+                if (cudaMemcpyAsync(&abits, a_amax_d, sizeof(unsigned int), cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+                    cudaStreamSynchronize(stream) == cudaSuccess) {
+                    float a_amax_h = 0.f; memcpy(&a_amax_h, &abits, sizeof(float));
+                    static std::mutex s_mu; static float s_hi = 0.f; static bool s_of = false;
+                    std::lock_guard<std::mutex> lk(s_mu);
+                    if (!std::isfinite(a_amax_h)) {
+                        if (!s_of) { s_of = true;
+                            fprintf(stderr, "[act-amax] *** NON-FINITE activation on '%s' [fp8 M=%d K=%d] -- the "
+                                            "stream HAS overflowed (F16 max 65504); output is clipping\n",
+                                    src1->name[0] ? src1->name : "(unnamed)", (int)M, (int)K); }
+                    } else if (a_amax_h > s_hi) {
+                        s_hi = a_amax_h;
+                        const float headroom = 65504.0f / a_amax_h;
+                        fprintf(stderr, "[act-amax] new max %.1f on '%s' [fp8 M=%d K=%d] -- f16 headroom %.1fx%s\n",
+                                a_amax_h, src1->name[0] ? src1->name : "(unnamed)", (int)M, (int)K, headroom,
+                                headroom < 4.0f ? "  <-- WARN: under 4x, an F16 stream is at risk" : "");
+                    }
+                }
+            }
+        }
         if (!chunk_act) {
             unsigned int qgrid = (unsigned int)((n_act + threads - 1)/threads);
             if (qgrid > 65535u) qgrid = 65535u;
