@@ -109,7 +109,42 @@ GGML_BACKEND_API bool ggml_cuda_lora_fold_nvfp4(void * blocks, int64_t in, int64
                                                 const struct ggml_cuda_lora_module * mods,
                                                 int n_mods, uint64_t seed);
 
-// Free the fold's device scratch and cuBLAS handle. Safe to call when no fold is running.
+// Same fold, but `blocks` is ALREADY DEVICE memory and is folded in place there.
+//
+// This is the fast entry point and the reason the fold got under 10 s. MEASURED with
+// SD_LORA_FOLD_PROFILE on 588 tensors: the two block transfers of the host entry point
+// above are ~91% of its cost (blk-up 1685 ms + blk-down 3064 ms against 282 ms of
+// GEMM+kernel), and the download is expensive not because the link is slow but because
+// its destination is ~10.4 GB of never-yet-written model pages -- a D2H into faulted
+// pages runs 11.49 GB/s, into unfaulted ones 2.12 GB/s. Neither pinned staging nor
+// LONGCAT_DIT_NO_MMAP=1 moved it, because both still fault.
+//
+// The way out is not to make the copies faster but to not make them: when the weight is
+// folded on the copy the compute backend already holds, there is no upload (staging paid
+// for it) and no download at all. What is left is only the ~2 ms/tensor of real work.
+GGML_BACKEND_API bool ggml_cuda_lora_fold_nvfp4_dev(void * d_blocks, int64_t in, int64_t out,
+                                                    float inv_wglobal,
+                                                    const struct ggml_cuda_lora_module * mods,
+                                                    int n_mods, uint64_t seed);
+
+// The same fold for a weight stored in a DENSE type (F32/F16/BF16): w += delta, elementwise.
+// `weight` is host memory for the first form and device memory for the `_dev` form.
+//
+// These exist because the non-NVFP4 LoRA targets used to fall through to the CPU fold, and
+// MEASURED over the full 1632-module adapter that was 288 tensors costing 14.8 s -- more
+// than the entire CUDA half of the pass. The delta is the same cuBLAS SGEMM either way; only
+// the merge differs, and for these formats it is an exact add with no rounding trick needed.
+GGML_BACKEND_API bool ggml_cuda_lora_fold_dense(void * weight, enum ggml_type type,
+                                                int64_t in, int64_t out,
+                                                const struct ggml_cuda_lora_module * mods,
+                                                int n_mods);
+GGML_BACKEND_API bool ggml_cuda_lora_fold_dense_dev(void * d_weight, enum ggml_type type,
+                                                    int64_t in, int64_t out,
+                                                    const struct ggml_cuda_lora_module * mods,
+                                                    int n_mods);
+
+// Free the fold's device scratch and cuBLAS handle, after synchronising the device so the
+// fold's writes are visible to whatever runs next. Safe to call when no fold is running.
 GGML_BACKEND_API void ggml_cuda_lora_fold_release(void);
 
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);

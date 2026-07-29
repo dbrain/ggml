@@ -117,6 +117,40 @@ static __global__ void lf_requantise(uint8_t * __restrict__ blocks,
     }
 }
 
+// Dense (non-quantised) fold: w += delta, elementwise, in whatever precision w is stored.
+//
+// WHY THIS EXISTS. Not every LoRA target in the DiT is NVFP4, and until now the ones that
+// were not fell through to the CPU fold. MEASURED on the full 1632-module adapter: 288 of
+// the tensors took that path and cost 14.8 s of the fold's 29 s -- MORE than the entire
+// CUDA half. The expensive part is not the store, it is `accumulate_rows` building the
+// [rows, in] delta as a naive CPU GEMM; at 4096x4096xrank that is gigaflops of work per
+// tensor against a cuBLAS SGEMM that does it in well under a millisecond.
+//
+// No stochastic rounding here, and none is wanted: these formats have enough mantissa to
+// represent the delta directly, so round-to-nearest lands it exactly. Stochastic rounding
+// is a workaround for NVFP4's step being LARGER than the delta, which is not the case here.
+template <typename T>
+static __device__ __forceinline__ T lf_from_float(float x);
+template <>
+__device__ __forceinline__ float lf_from_float<float>(float x) { return x; }
+template <>
+__device__ __forceinline__ half lf_from_float<half>(float x) { return __float2half(x); }
+template <>
+__device__ __forceinline__ nv_bfloat16 lf_from_float<nv_bfloat16>(float x) { return __float2bfloat16(x); }
+
+static __device__ __forceinline__ float lf_to_float(float x)       { return x; }
+static __device__ __forceinline__ float lf_to_float(half x)        { return __half2float(x); }
+static __device__ __forceinline__ float lf_to_float(nv_bfloat16 x) { return __bfloat162float(x); }
+
+template <typename T>
+static __global__ void lf_add_delta(T * __restrict__ w, const float * __restrict__ delta, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    w[i] = lf_from_float<T>(lf_to_float(w[i]) + delta[i]);
+}
+
 // Device scratch, reused across tensors: a 22B DiT folds ~1344 of them and per-tensor
 // cudaMalloc/cudaFree would serialise the whole pass on the allocator.
 struct lf_scratch {
@@ -133,38 +167,21 @@ struct lf_scratch {
 };
 static lf_scratch g_delta, g_blocks, g_down, g_up;
 
-// PINNED host bounce buffer for the NVFP4 block array.
+// THERE IS DELIBERATELY NO PINNED BOUNCE BUFFER HERE ANY MORE.
 //
-// MEASURED (SD_LORA_FOLD_PROFILE, 588 tensors): the two block transfers are 91% of the fold
-// -- upload 1685 ms, download 3064 ms -- against 282 ms of GEMM+kernel. Per tensor that is
-// 3.2 GB/s up and 1.8 GB/s down, far below what the link does, because the destination is
-// PAGEABLE: it is the mmap'd model, so the driver pins and unpins ~2400 pages per transfer
-// and the download additionally faults COW pages in the MAP_PRIVATE mapping. Staging through
-// pinned memory turns both legs into full-rate DMA plus a plain host memcpy.
-struct lf_pinned {
-    void * ptr  = nullptr;
-    size_t size = 0;
-    void * get(size_t n) {
-        if (n > size) {
-            if (ptr) cudaFreeHost(ptr);
-            if (cudaHostAlloc(&ptr, n, cudaHostAllocDefault) != cudaSuccess) {
-                // NEVER fall back silently: an unreported fallback is indistinguishable from
-                // "pinning did not help", and that ambiguity cost a whole measurement round
-                // here -- pinned and pageable produced the same numbers and there was no way
-                // to tell which had actually run.
-                static bool warned = false;
-                if (!warned) {
-                    fprintf(stderr, "[lora-fold] cudaHostAlloc(%zu) FAILED; using pageable copies\n", n);
-                    warned = true;
-                }
-                ptr = nullptr; size = 0; return nullptr;
-            }
-            size = n;
-        }
-        return ptr;
-    }
-};
-static lf_pinned g_pin;
+// A pinned staging buffer was tried, on the theory that the block transfers were slow
+// because their host side is PAGEABLE (the mmap'd model) and the driver has to pin and
+// unpin ~2400 pages per copy. It measured as noise: blk-down 3064 -> 3233 ms, i.e. very
+// slightly WORSE. The reason is that pinning does not remove the cost, it relocates it --
+// the DMA lands in pinned memory at full rate and then a plain memcpy into the model pages
+// takes exactly the same COW faults the DMA used to take.
+//
+// The cost is the FAULTS, not the pinning: a D2H into pages that have already been written
+// runs 11.49 GB/s on this card, into never-written ones 2.12 GB/s, and the fold's write-back
+// targets ~10 GB of never-written MAP_PRIVATE model pages. So the destination is now faulted
+// in ONCE, in parallel, before the pass starts (model_manager.cpp::prefault_fold_targets),
+// and the copies here are plain pageable ones again -- which beats pinned+memcpy, because it
+// moves each byte across the bus once instead of once plus a host copy.
 static cublasHandle_t g_blas = nullptr;
 
 // Phase timers, SD_LORA_FOLD_PROFILE=1. The fold is ~22 ms/tensor against ~2 ms of actual
@@ -192,18 +209,14 @@ static double lf_now_ms() {
 #define LF_TICK(v) do { if (g_prof.on) { cudaDeviceSynchronize(); (v) = lf_now_ms(); } } while (0)
 #define LF_TOCK(acc, v) do { if (g_prof.on) { cudaDeviceSynchronize(); (acc) += lf_now_ms() - (v); } } while (0)
 
-// ggml_cuda_lora_module is declared in ggml-cuda.h, which common.cuh already includes.
-extern "C" {
 
-bool ggml_cuda_lora_fold_nvfp4(void * blocks, int64_t in, int64_t out, float inv_wglobal,
-                               const struct ggml_cuda_lora_module * mods, int n_mods,
-                               uint64_t seed) {
-    if (!blocks || !mods || n_mods <= 0 || in <= 0 || out <= 0 || in % QK_NVFP4_LF != 0) {
-        return false;
-    }
+// Build delta[out, in] = sum_l scale_l * (up_l @ down_l) into the shared device scratch.
+// Shared by the NVFP4 and dense folds -- they differ only in how they merge the result.
+static float * lf_build_delta(int64_t in, int64_t out,
+                              const struct ggml_cuda_lora_module * mods, int n_mods) {
     if (!g_blas) {
         if (cublasCreate(&g_blas) != CUBLAS_STATUS_SUCCESS) {
-            return false;
+            return nullptr;
         }
         // cuBLAS may serve SGEMM from TF32 tensor cores under CUBLAS_DEFAULT_MATH on
         // Ampere and later, which would compute the delta with a 10-bit mantissa. The
@@ -213,16 +226,12 @@ bool ggml_cuda_lora_fold_nvfp4(void * blocks, int64_t in, int64_t out, float inv
         cublasSetMathMode(g_blas, CUBLAS_PEDANTIC_MATH);
     }
 
-    const int64_t nb          = in / QK_NVFP4_LF;
-    const size_t delta_bytes  = (size_t) out * in * sizeof(float);
-    const size_t block_bytes  = (size_t) out * nb * NVFP4_BLOCK_SZ;
-
-    float * d_delta = (float *) g_delta.get(delta_bytes);
-    uint8_t * d_blk = (uint8_t *) g_blocks.get(block_bytes);
-    if (!d_delta || !d_blk) {
-        return false;
+    const size_t delta_bytes = (size_t) out * in * sizeof(float);
+    float * d_delta          = (float *) g_delta.get(delta_bytes);
+    if (!d_delta) {
+        return nullptr;
     }
-    g_prof.on = lf_profile_enabled();
+
     double t = 0;
     // No cudaMemset: the FIRST module's GEMM runs with beta=0 and writes the whole buffer,
     // subsequent ones accumulate with beta=1. That removes a full [out,in] f32 clear per
@@ -237,7 +246,7 @@ bool ggml_cuda_lora_fold_nvfp4(void * blocks, int64_t in, int64_t out, float inv
     if (need_clear) {
         LF_TICK(t);
         if (cudaMemset(d_delta, 0, delta_bytes) != cudaSuccess) {
-            return false;
+            return nullptr;
         }
         LF_TOCK(g_prof.memset_ms, t);
     }
@@ -248,17 +257,17 @@ bool ggml_cuda_lora_fold_nvfp4(void * blocks, int64_t in, int64_t out, float inv
     for (int i = 0; i < n_mods; ++i) {
         const struct ggml_cuda_lora_module & m = mods[i];
         if (m.rows <= 0 || m.rank <= 0 || m.row_begin < 0 || m.row_begin + m.rows > out) {
-            return false;
+            return nullptr;
         }
         float * dn = (float *) g_down.get((size_t) m.rank * in * sizeof(float));
         float * up = (float *) g_up.get((size_t) m.rows * m.rank * sizeof(float));
         if (!dn || !up) {
-            return false;
+            return nullptr;
         }
         LF_TICK(t);
         if (cudaMemcpy(dn, m.down, (size_t) m.rank * in * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
             cudaMemcpy(up, m.up,   (size_t) m.rows * m.rank * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
-            return false;
+            return nullptr;
         }
         LF_TOCK(g_prof.up_lora_ms, t);
         LF_TICK(t);
@@ -271,45 +280,163 @@ bool ggml_cuda_lora_fold_nvfp4(void * blocks, int64_t in, int64_t out, float inv
                         up, (int) m.rank,
                         &beta,
                         d_delta + m.row_begin * in, (int) in) != CUBLAS_STATUS_SUCCESS) {
-            return false;
+            return nullptr;
         }
         LF_TOCK(g_prof.gemm_ms, t);
     }
+    return d_delta;
+}
 
-    LF_TICK(t);
-    void * pin = g_pin.get(block_bytes);
-    if (pin != nullptr) {
-        memcpy(pin, blocks, block_bytes);
-        if (cudaMemcpy(d_blk, pin, block_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-            return false;
-        }
-    } else if (cudaMemcpy(d_blk, blocks, block_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+static size_t lf_type_size(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:  return 4;
+        case GGML_TYPE_F16:  return 2;
+        case GGML_TYPE_BF16: return 2;
+        default:             return 0;
+    }
+}
+
+// ggml_cuda_lora_module is declared in ggml-cuda.h, which common.cuh already includes.
+extern "C" {
+
+bool ggml_cuda_lora_fold_nvfp4_dev(void * d_blocks, int64_t in, int64_t out, float inv_wglobal,
+                                   const struct ggml_cuda_lora_module * mods, int n_mods,
+                                   uint64_t seed) {
+    if (!d_blocks || !mods || n_mods <= 0 || in <= 0 || out <= 0 || in % QK_NVFP4_LF != 0) {
         return false;
     }
-    LF_TOCK(g_prof.up_blk_ms, t);
+    g_prof.on = lf_profile_enabled();
+
+    float * d_delta = lf_build_delta(in, out, mods, n_mods);
+    if (!d_delta) {
+        return false;
+    }
+
+    double t = 0;
     LF_TICK(t);
+    const int64_t nb  = in / QK_NVFP4_LF;
     const int threads = 256;
     dim3 grid((unsigned) ((nb * 4 + threads - 1) / threads), (unsigned) out, 1);
-    lf_requantise<<<grid, threads>>>(d_blk, d_delta, in, nb, inv_wglobal, seed);
+    lf_requantise<<<grid, threads>>>((uint8_t *) d_blocks, d_delta, in, nb, inv_wglobal, seed);
     if (cudaGetLastError() != cudaSuccess) {
         return false;
     }
     LF_TOCK(g_prof.kern_ms, t);
-    LF_TICK(t);
-    if (pin != nullptr) {
-        if (cudaMemcpy(pin, d_blk, block_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
-            return false;
-        }
-        memcpy(blocks, pin, block_bytes);
-    } else if (cudaMemcpy(blocks, d_blk, block_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
-        return false;
-    }
-    LF_TOCK(g_prof.dn_blk_ms, t);
     g_prof.n++;
     return true;
 }
 
+bool ggml_cuda_lora_fold_nvfp4(void * blocks, int64_t in, int64_t out, float inv_wglobal,
+                               const struct ggml_cuda_lora_module * mods, int n_mods,
+                               uint64_t seed) {
+    if (!blocks || in <= 0 || out <= 0 || in % QK_NVFP4_LF != 0) {
+        return false;
+    }
+    const int64_t nb         = in / QK_NVFP4_LF;
+    const size_t block_bytes = (size_t) out * nb * NVFP4_BLOCK_SZ;
+
+    uint8_t * d_blk = (uint8_t *) g_blocks.get(block_bytes);
+    if (!d_blk) {
+        return false;
+    }
+
+    g_prof.on = lf_profile_enabled();
+    double t  = 0;
+    LF_TICK(t);
+    if (cudaMemcpy(d_blk, blocks, block_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        return false;
+    }
+    LF_TOCK(g_prof.up_blk_ms, t);
+
+    if (!ggml_cuda_lora_fold_nvfp4_dev(d_blk, in, out, inv_wglobal, mods, n_mods, seed)) {
+        return false;
+    }
+
+    LF_TICK(t);
+    if (cudaMemcpy(blocks, d_blk, block_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        return false;
+    }
+    LF_TOCK(g_prof.dn_blk_ms, t);
+    return true;
+}
+
+bool ggml_cuda_lora_fold_dense_dev(void * d_weight, enum ggml_type type, int64_t in, int64_t out,
+                                   const struct ggml_cuda_lora_module * mods, int n_mods) {
+    const size_t ts = lf_type_size(type);
+    if (!d_weight || !mods || n_mods <= 0 || in <= 0 || out <= 0 || ts == 0) {
+        return false;
+    }
+    g_prof.on = lf_profile_enabled();
+
+    float * d_delta = lf_build_delta(in, out, mods, n_mods);
+    if (!d_delta) {
+        return false;
+    }
+
+    double t = 0;
+    LF_TICK(t);
+    const int64_t n   = in * out;
+    const int threads = 256;
+    const unsigned blocks_n = (unsigned) ((n + threads - 1) / threads);
+    switch (type) {
+        case GGML_TYPE_F32:
+            lf_add_delta<float><<<blocks_n, threads>>>((float *) d_weight, d_delta, n);
+            break;
+        case GGML_TYPE_F16:
+            lf_add_delta<half><<<blocks_n, threads>>>((half *) d_weight, d_delta, n);
+            break;
+        case GGML_TYPE_BF16:
+            lf_add_delta<nv_bfloat16><<<blocks_n, threads>>>((nv_bfloat16 *) d_weight, d_delta, n);
+            break;
+        default:
+            return false;
+    }
+    if (cudaGetLastError() != cudaSuccess) {
+        return false;
+    }
+    LF_TOCK(g_prof.kern_ms, t);
+    g_prof.n++;
+    return true;
+}
+
+bool ggml_cuda_lora_fold_dense(void * weight, enum ggml_type type, int64_t in, int64_t out,
+                               const struct ggml_cuda_lora_module * mods, int n_mods) {
+    const size_t ts = lf_type_size(type);
+    if (!weight || in <= 0 || out <= 0 || ts == 0) {
+        return false;
+    }
+    const size_t weight_bytes = (size_t) in * out * ts;
+
+    uint8_t * d_w = (uint8_t *) g_blocks.get(weight_bytes);
+    if (!d_w) {
+        return false;
+    }
+
+    g_prof.on = lf_profile_enabled();
+    double t  = 0;
+    LF_TICK(t);
+    if (cudaMemcpy(d_w, weight, weight_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        return false;
+    }
+    LF_TOCK(g_prof.up_blk_ms, t);
+
+    if (!ggml_cuda_lora_fold_dense_dev(d_w, type, in, out, mods, n_mods)) {
+        return false;
+    }
+
+    LF_TICK(t);
+    if (cudaMemcpy(weight, d_w, weight_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        return false;
+    }
+    LF_TOCK(g_prof.dn_blk_ms, t);
+    return true;
+}
+
 void ggml_cuda_lora_fold_release(void) {
+    // The fold runs on the default stream while ggml computes on its own non-blocking
+    // streams, so nothing implicitly orders them. Everything the fold wrote has to be
+    // visible before the caller stages or runs a graph over those weights.
+    cudaDeviceSynchronize();
     if (g_prof.on && g_prof.n > 0) {
         fprintf(stderr,
                 "[lora-fold] %d tensors: memset %.0f ms | lora-up %.0f | gemm %.0f | "
@@ -323,7 +450,6 @@ void ggml_cuda_lora_fold_release(void) {
     for (lf_scratch * s : {&g_delta, &g_blocks, &g_down, &g_up}) {
         if (s->ptr) { cudaFree(s->ptr); s->ptr = nullptr; s->size = 0; }
     }
-    if (g_pin.ptr) { cudaFreeHost(g_pin.ptr); g_pin.ptr = nullptr; g_pin.size = 0; }
     if (g_blas) { cublasDestroy(g_blas); g_blas = nullptr; }
 }
 
