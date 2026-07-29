@@ -243,7 +243,13 @@ struct cudnn_sdpa_plan {
 };
 
 struct sdpa_key {
-    int64_t B, H, Lq, Lkv, D;   // Lq==Lkv for self-attn; Lq!=Lkv for cross-attn (LTX-AV a2v/v2a)
+    // ⚠️ Field ORDER is load-bearing: every construction site uses positional aggregate init
+    // (`sdpa_key{N, H, H_kv, Lq, Lkv, D, ...}`), so H_kv must sit here, right after H, and not
+    // be appended at the end. Declaring it last silently shifts Lq/Lkv/D by one and hands cuDNN
+    // garbage dims — which validates as "heads for key must be a factor of heads for query".
+    // H_kv < H means GQA; H_kv == H is plain MHA. It is part of the key because a GQA plan and
+    // an MHA plan of otherwise identical dims are DIFFERENT cuDNN graphs.
+    int64_t B, H, H_kv, Lq, Lkv, D;   // Lq==Lkv self-attn; Lq!=Lkv cross-attn (LTX-AV a2v/v2a)
     int     io_half;   // 1 == fp16 io, 0 == bf16 (reserved)
     int     padding_mask;
     // 1 == the graph also emits the softmax Stats (per-query log-sum-exp), which is a
@@ -252,15 +258,15 @@ struct sdpa_key {
     // and keeps the exact plan it always built.
     int     gen_stats;
     bool operator==(const sdpa_key & o) const {
-        return B == o.B && H == o.H && Lq == o.Lq && Lkv == o.Lkv && D == o.D &&
+        return B == o.B && H == o.H && H_kv == o.H_kv && Lq == o.Lq && Lkv == o.Lkv && D == o.D &&
                io_half == o.io_half && padding_mask == o.padding_mask && gen_stats == o.gen_stats;
     }
 };
 struct sdpa_key_hash {
     size_t operator()(const sdpa_key & k) const {
         size_t h = 1469598103934665603ull;
-        for (int64_t v : {k.B, k.H, k.Lq, k.Lkv, k.D, (int64_t)k.io_half, (int64_t)k.padding_mask,
-                          (int64_t)k.gen_stats}) {
+        for (int64_t v : {k.B, k.H, k.H_kv, k.Lq, k.Lkv, k.D, (int64_t)k.io_half,
+                          (int64_t)k.padding_mask, (int64_t)k.gen_stats}) {
             h ^= (size_t)v; h *= 1099511628211ull;
         }
         return h;
@@ -415,10 +421,13 @@ static cudnn_sdpa_plan & get_or_build_plan(cudnnHandle_t handle, const sdpa_key 
     // query seqlen Lq; K/V use the key/value seqlen Lkv (Lq==Lkv self-attn, Lq!=Lkv cross-attn).
     auto Q = graph->tensor(fe::graph::Tensor_attributes().set_name("Q").set_uid(Q_UID)
                  .set_dim({B, H, Lq, D}).set_stride({H * Lq * D, Lq * D, D, 1}));
+    // GQA: K/V carry H_kv heads and cuDNN broadcasts each across H/H_kv query heads. For MHA
+    // H_kv == H and these are byte-identical to the previous descriptors.
+    const int64_t Hkv = key.H_kv;
     auto K = graph->tensor(fe::graph::Tensor_attributes().set_name("K").set_uid(K_UID)
-                 .set_dim({B, H, Lkv, D}).set_stride({H * Lkv * D, Lkv * D, D, 1}));
+                 .set_dim({B, Hkv, Lkv, D}).set_stride({Hkv * Lkv * D, Lkv * D, D, 1}));
     auto V = graph->tensor(fe::graph::Tensor_attributes().set_name("V").set_uid(V_UID)
-                 .set_dim({B, H, Lkv, D}).set_stride({H * Lkv * D, Lkv * D, D, 1}));
+                 .set_dim({B, Hkv, Lkv, D}).set_stride({Hkv * Lkv * D, Lkv * D, D, 1}));
 
     auto sdpa_opts = fe::graph::SDPA_attributes().set_name("flash_attention")
                          .set_generate_stats(key.gen_stats != 0)
@@ -452,9 +461,21 @@ static cudnn_sdpa_plan & get_or_build_plan(cudnnHandle_t handle, const sdpa_key 
     O->set_output(true).set_data_type(io_dt)
         .set_dim({B, H, Lq, D}).set_stride({H * Lq * D, Lq * D, D, 1}).set_uid(O_UID);
 
-    if (!graph->validate().is_good())                                 { GGML_ABORT("cudnn sdpa validate failed"); }
-    if (!graph->build_operation_graph(handle).is_good())              { GGML_ABORT("cudnn sdpa build_operation_graph failed"); }
-    if (!graph->create_execution_plans({fe::HeurMode_t::A}).is_good()){ GGML_ABORT("cudnn sdpa create_execution_plans failed"); }
+    // Surface cuDNN's own diagnostic: a bare "validate failed" gives nothing to act on, and
+    // these shapes now vary by GQA ratio as well as dims.
+    if (auto e = graph->validate(); !e.is_good()) {
+        fprintf(stderr, "[cudnn] validate failed for B=%ld H=%ld H_kv=%ld Lq=%ld Lkv=%ld D=%ld: %s\n",
+                (long)B, (long)H, (long)Hkv, (long)Lq, (long)Lkv, (long)D, e.get_message().c_str());
+        GGML_ABORT("cudnn sdpa validate failed");
+    }
+    if (auto e = graph->build_operation_graph(handle); !e.is_good()) {
+        fprintf(stderr, "[cudnn] build_operation_graph failed: %s\n", e.get_message().c_str());
+        GGML_ABORT("cudnn sdpa build_operation_graph failed");
+    }
+    if (auto e = graph->create_execution_plans({fe::HeurMode_t::A}); !e.is_good()) {
+        fprintf(stderr, "[cudnn] create_execution_plans failed: %s\n", e.get_message().c_str());
+        GGML_ABORT("cudnn sdpa create_execution_plans failed");
+    }
     if (sdpa_ws_cap() > 0) {
         graph->deselect_workspace_greater_than(sdpa_ws_cap());
     }
@@ -548,6 +569,9 @@ static bool cudnn_qtile(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
     }
     const int64_t tile = e ? atoll(e) : 0;
     if (tile <= 0 || Lq <= tile || N != 1 || Q->type != GGML_TYPE_F32 || io_half != 1 || dst->src[3] != nullptr) return false;
+    // K/V head count (GQA: H_kv < H). Derived here rather than threaded through the signature —
+    // this opt-in tiled path binds K/V straight from ggml, so only the plan key needs it.
+    const int64_t H_kv = K->ne[2];
     const cudaStream_t stream = ctx.stream();
     const int64_t tile_len = std::min<int64_t>(tile, Lq);
     ggml_cuda_pool_alloc<half> q_tile(ctx.pool()), o_tile(ctx.pool());
@@ -560,7 +584,7 @@ static bool cudnn_qtile(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
             (const float *) Q->data, q_tile.get(), (int) H, (int) Lq, (int) len, (int) off, (int) D);
         CUDA_CHECK(cudaGetLastError());
         // No padding mask or bucket: each query row attends the unchanged full K/V.
-        sdpa_key key{N, H, len, Lkv, D, io_half, 0, /*gen_stats=*/0};
+        sdpa_key key{N, H, H_kv, len, Lkv, D, io_half, 0, /*gen_stats=*/0};
         cudnn_sdpa_plan & plan = get_or_build_plan(handle, key, scale);
         ggml_cuda_pool_alloc<uint8_t> ws(ctx.pool());
         void * ws_ptr = nullptr;
@@ -626,6 +650,10 @@ static void cudnn_sdpa_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
     const int64_t H   = Q->ne[2];
     const int64_t N   = Q->ne[3];
     const int64_t Lkv = K->ne[1];
+    // GQA: K/V may carry fewer heads than Q (Krea2 is 48/12). cuDNN broadcasts each KV head
+    // across H/H_kv query heads natively; every K/V-shaped buffer below must use H_kv, NOT H,
+    // or we read past the end of K/V. H_kv == H is the MHA path and is unchanged.
+    const int64_t H_kv = K->ne[2];
 
     // io_half==1 => fp16 K/V/Q IO (prod). io_half==0 => bf16 (WAN_ATTN_BF16 casts K/V/Q to
     // bf16 in build_kqv, and the selection in fattn.cu routes bf16 D-in-{64,128} here). K/V
@@ -741,7 +769,7 @@ static void cudnn_sdpa_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
     const bool pad_q       = Lq_plan != Lq;
     const bool pad_kv      = Lkv_plan != Lkv;
 
-    sdpa_key key{N, H, Lq_plan, Lkv_plan, D, io_half, use_mask ? 1 : 0, lse_dst != nullptr ? 1 : 0};
+    sdpa_key key{N, H, H_kv, Lq_plan, Lkv_plan, D, io_half, use_mask ? 1 : 0, lse_dst != nullptr ? 1 : 0};
     cudnn_sdpa_plan & plan = get_or_build_plan(handle, key, scale);
 
     // GGML_CUDNN_ZERO_WS: the SDPA workspace comes from the ggml pool, which RECYCLES memory and
@@ -783,12 +811,12 @@ static void cudnn_sdpa_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
                 q_exec = q_pad_h.get();
             }
             if (pad_kv) {
-                k_pad_h.alloc((size_t)(N * H * Lkv_plan * D));
-                v_pad_h.alloc((size_t)(N * H * Lkv_plan * D));
-                cudaMemsetAsync(k_pad_h.get(), 0, (size_t)(N * H * Lkv_plan * D) * sizeof(half), stream);
-                cudaMemsetAsync(v_pad_h.get(), 0, (size_t)(N * H * Lkv_plan * D) * sizeof(half), stream);
-                bhsd_pad_seq_kernel<half><<<(int)(((long)N * H * Lkv * D + bs - 1) / bs), bs, 0, stream>>>((const half *)K->data, k_pad_h.get(), (int)N, (int)H, (int)Lkv, (int)Lkv_plan, (int)D);
-                bhsd_pad_seq_kernel<half><<<(int)(((long)N * H * Lkv * D + bs - 1) / bs), bs, 0, stream>>>((const half *)V->data, v_pad_h.get(), (int)N, (int)H, (int)Lkv, (int)Lkv_plan, (int)D);
+                k_pad_h.alloc((size_t)(N * H_kv * Lkv_plan * D));
+                v_pad_h.alloc((size_t)(N * H_kv * Lkv_plan * D));
+                cudaMemsetAsync(k_pad_h.get(), 0, (size_t)(N * H_kv * Lkv_plan * D) * sizeof(half), stream);
+                cudaMemsetAsync(v_pad_h.get(), 0, (size_t)(N * H_kv * Lkv_plan * D) * sizeof(half), stream);
+                bhsd_pad_seq_kernel<half><<<(int)(((long)N * H_kv * Lkv * D + bs - 1) / bs), bs, 0, stream>>>((const half *)K->data, k_pad_h.get(), (int)N, (int)H_kv, (int)Lkv, (int)Lkv_plan, (int)D);
+                bhsd_pad_seq_kernel<half><<<(int)(((long)N * H_kv * Lkv * D + bs - 1) / bs), bs, 0, stream>>>((const half *)V->data, v_pad_h.get(), (int)N, (int)H_kv, (int)Lkv, (int)Lkv_plan, (int)D);
                 k_exec = k_pad_h.get();
                 v_exec = v_pad_h.get();
             }
@@ -800,12 +828,12 @@ static void cudnn_sdpa_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
                 q_exec = q_pad_b.get();
             }
             if (pad_kv) {
-                k_pad_b.alloc((size_t)(N * H * Lkv_plan * D));
-                v_pad_b.alloc((size_t)(N * H * Lkv_plan * D));
-                cudaMemsetAsync(k_pad_b.get(), 0, (size_t)(N * H * Lkv_plan * D) * sizeof(nv_bfloat16), stream);
-                cudaMemsetAsync(v_pad_b.get(), 0, (size_t)(N * H * Lkv_plan * D) * sizeof(nv_bfloat16), stream);
-                bhsd_pad_seq_kernel<nv_bfloat16><<<(int)(((long)N * H * Lkv * D + bs - 1) / bs), bs, 0, stream>>>((const nv_bfloat16 *)K->data, k_pad_b.get(), (int)N, (int)H, (int)Lkv, (int)Lkv_plan, (int)D);
-                bhsd_pad_seq_kernel<nv_bfloat16><<<(int)(((long)N * H * Lkv * D + bs - 1) / bs), bs, 0, stream>>>((const nv_bfloat16 *)V->data, v_pad_b.get(), (int)N, (int)H, (int)Lkv, (int)Lkv_plan, (int)D);
+                k_pad_b.alloc((size_t)(N * H_kv * Lkv_plan * D));
+                v_pad_b.alloc((size_t)(N * H_kv * Lkv_plan * D));
+                cudaMemsetAsync(k_pad_b.get(), 0, (size_t)(N * H_kv * Lkv_plan * D) * sizeof(nv_bfloat16), stream);
+                cudaMemsetAsync(v_pad_b.get(), 0, (size_t)(N * H_kv * Lkv_plan * D) * sizeof(nv_bfloat16), stream);
+                bhsd_pad_seq_kernel<nv_bfloat16><<<(int)(((long)N * H_kv * Lkv * D + bs - 1) / bs), bs, 0, stream>>>((const nv_bfloat16 *)K->data, k_pad_b.get(), (int)N, (int)H_kv, (int)Lkv, (int)Lkv_plan, (int)D);
+                bhsd_pad_seq_kernel<nv_bfloat16><<<(int)(((long)N * H_kv * Lkv * D + bs - 1) / bs), bs, 0, stream>>>((const nv_bfloat16 *)V->data, v_pad_b.get(), (int)N, (int)H_kv, (int)Lkv, (int)Lkv_plan, (int)D);
                 k_exec = k_pad_b.get();
                 v_exec = v_pad_b.get();
             }
