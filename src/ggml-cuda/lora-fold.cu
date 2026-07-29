@@ -141,8 +141,16 @@ bool ggml_cuda_lora_fold_nvfp4(void * blocks, int64_t in, int64_t out, float inv
     if (!blocks || !mods || n_mods <= 0 || in <= 0 || out <= 0 || in % QK_NVFP4_LF != 0) {
         return false;
     }
-    if (!g_blas && cublasCreate(&g_blas) != CUBLAS_STATUS_SUCCESS) {
-        return false;
+    if (!g_blas) {
+        if (cublasCreate(&g_blas) != CUBLAS_STATUS_SUCCESS) {
+            return false;
+        }
+        // cuBLAS may serve SGEMM from TF32 tensor cores under CUBLAS_DEFAULT_MATH on
+        // Ampere and later, which would compute the delta with a 10-bit mantissa. The
+        // delta is already SMALLER than the NVFP4 quantisation step it has to survive, so
+        // it is the last thing that should be computed at reduced precision -- and this
+        // GEMM is nowhere near the bottleneck, so full fp32 is free here.
+        cublasSetMathMode(g_blas, CUBLAS_PEDANTIC_MATH);
     }
 
     const int64_t nb          = in / QK_NVFP4_LF;
