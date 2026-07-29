@@ -77,6 +77,41 @@ GGML_BACKEND_API bool ggml_cuda_nvfp4_weight_global_folded(ggml_backend_t backen
 // K % 64 == 0) are still enforced independently by ggml_backend_supports_op().
 GGML_BACKEND_API bool ggml_cuda_nvfp4_f16_dst_available(ggml_backend_t backend);
 
+// One LoRA module's contribution to one weight, as f32 host arrays.
+// `down` is [rank, in] row-major (== a ggml lora_down with ne = {in, rank}) and `up` is
+// [rows, rank] row-major (== a ggml lora_up with ne = {rank, rows}). row_begin/rows exist
+// because a LoRA may target a PACKED projection in segments, each owning a slice of the
+// output rows, which the runtime path expresses as a concat along dim 0.
+struct ggml_cuda_lora_module {
+    const float * down;
+    const float * up;
+    int64_t rank;
+    int64_t row_begin;
+    int64_t rows;
+    float   scale;
+};
+
+// Merge `mods` into an NVFP4 weight IN PLACE, on the GPU. `blocks` is the host-side ggml
+// NVFP4 block array ([out, in/64] blocks of 36 bytes); it is uploaded, folded and written
+// back. Every UE4M3 block scale is preserved EXACTLY -- the grid is frozen, so `.wglobal`
+// never changes and the weight-global registry above stays valid. `inv_wglobal` converts
+// the true-unit delta into the scaled domain the nibbles live in.
+//
+// Rounding is STOCHASTIC, which is not a detail: the LoRA delta is smaller than the NVFP4
+// quantisation step, so round-to-nearest discards most of it (measured projection 0.06 vs
+// 0.94). It is also DETERMINISTIC -- the stream is a counter-based hash of (seed, row,
+// element) -- so two folds of the same inputs produce identical bytes.
+//
+// Returns false without touching `blocks` if the shapes are unsupported or CUDA/cuBLAS
+// fails; the caller is expected to fall back to the CPU fold.
+GGML_BACKEND_API bool ggml_cuda_lora_fold_nvfp4(void * blocks, int64_t in, int64_t out,
+                                                float inv_wglobal,
+                                                const struct ggml_cuda_lora_module * mods,
+                                                int n_mods, uint64_t seed);
+
+// Free the fold's device scratch and cuBLAS handle. Safe to call when no fold is running.
+GGML_BACKEND_API void ggml_cuda_lora_fold_release(void);
+
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
