@@ -148,7 +148,16 @@ struct lf_pinned {
         if (n > size) {
             if (ptr) cudaFreeHost(ptr);
             if (cudaHostAlloc(&ptr, n, cudaHostAllocDefault) != cudaSuccess) {
-                ptr = nullptr; size = 0; return nullptr;   // caller falls back to pageable
+                // NEVER fall back silently: an unreported fallback is indistinguishable from
+                // "pinning did not help", and that ambiguity cost a whole measurement round
+                // here -- pinned and pageable produced the same numbers and there was no way
+                // to tell which had actually run.
+                static bool warned = false;
+                if (!warned) {
+                    fprintf(stderr, "[lora-fold] cudaHostAlloc(%zu) FAILED; using pageable copies\n", n);
+                    warned = true;
+                }
+                ptr = nullptr; size = 0; return nullptr;
             }
             size = n;
         }
