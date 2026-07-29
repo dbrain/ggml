@@ -42,7 +42,9 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
                                     const ggml_tensor * src1,
                                     ggml_tensor * dst);
 
-// Invalidate the FP8 activation-quant reuse cache. MUST be called once per graph compute,
+// Invalidate the FP8 AND NVFP4 activation-quant reuse caches (one counter each, bumped
+// together; GGML_NVFP4_ACT_QUANT_CACHE gates the FP4 one and is default OFF).
+// MUST be called once per graph compute,
 // before any node of that graph runs: the cache reuses an e4m3 activation across the q/k/v
 // Linears that share one src1, and node/data ADDRESSES are recycled by gallocr between
 // computes, so identity alone cannot tell "same activation" from "same address, new value".

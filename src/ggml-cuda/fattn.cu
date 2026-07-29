@@ -415,7 +415,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         cc >= GGML_CUDA_CC_BLACKWELL && mask == nullptr && max_bias == 0.0f) {
         float logit_softcap = 0.0f;
         memcpy(&logit_softcap, (const float*) KQV->op_params + 2, sizeof(float));
-        if (logit_softcap == 0.0f && gqa_ratio == 1 &&
+        // GQA is served natively by cuDNN SDPA (K/V carry H_kv heads and cuDNN broadcasts each
+        // across H/H_kv query heads), so this admits gqa_ratio >= 1 rather than MHA only. The
+        // old `gqa_ratio == 1` was guarding a WRAPPER assumption, not a cuDNN limit: every
+        // K/V-shaped buffer in fattn-cudnn.cu was sized with Q's head count, so a GQA shape
+        // would have read past the end of K/V. Those now use K->ne[2]. Krea2 (48/12 = 4) is the
+        // model this opens up; LongCat/flux2 MHA still take the identical H_kv == H path.
+        const bool gqa_ok = gqa_ratio >= 1 && Q->ne[2] % K->ne[2] == 0 && K->ne[2] == V->ne[2];
+        if (logit_softcap == 0.0f && gqa_ok &&
             K->ne[0] == V->ne[0] && (K->ne[0] == 64 || K->ne[0] == 128) &&
             K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
             return BEST_FATTN_KERNEL_CUDNN;
