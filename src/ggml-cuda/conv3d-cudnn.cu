@@ -8,12 +8,15 @@
 //
 // Structurally identical to conv2d-cudnn.cu: the input/output transposes are the same
 // [C,SPATIAL]<->[SPATIAL,C] tiled shared-mem transpose with SPATIAL = D*H*W (NCDHW<->NDHWC),
-// the weight is reordered KCRS-3d->KRSC-3d f16 (cached per ptr), and the cuDNN plan is
+// the weight is reordered KCRS-3d->KRSC-3d f16 (cached by stable identity, not by device
+// pointer -- see cudnn-weight-key.cuh), and the cuDNN plan is
 // cached per shape. Differences vs 2D: 5 conv dims, a 3D weight reorder, and a workspace cap.
 
 #include "conv3d-cudnn.cuh"
 
 #ifdef GGML_CUDNN
+
+#include "cudnn-weight-key.cuh"
 
 #include <cuda_fp16.h>
 #include <cudnn.h>
@@ -435,26 +438,38 @@ void ggml_cuda_cudnn_conv3d_release_handle() {
     }
 }
 
-struct weight3d_buf { half * d = nullptr; size_t n = 0; };
-static std::unordered_map<const void *, weight3d_buf> g_weight3d_cache;
+// Both weight caches are keyed by STABLE IDENTITY (tensor name + buffer + shape + type +
+// device), not by the weight's device address — see cudnn-weight-key.cuh. `src` is the
+// address the entry was reordered from and is diagnostic only.
+struct weight3d_buf { half * d = nullptr; size_t n = 0; const void * src = nullptr; };
+static std::unordered_map<cudnn_weight_id, weight3d_buf, cudnn_weight_id_hash> g_weight3d_cache;
 
 // Separate fp32 weight cache for the full-F32-IO head.2 plan (KRSC-3d fp32).
-struct weight3d_buf_f32 { float * d = nullptr; size_t n = 0; };
-static std::unordered_map<const void *, weight3d_buf_f32> g_weight3d_f32_cache;
+struct weight3d_buf_f32 { float * d = nullptr; size_t n = 0; const void * src = nullptr; };
+static std::unordered_map<cudnn_weight_id, weight3d_buf_f32, cudnn_weight_id_hash> g_weight3d_f32_cache;
 
-// Free the raw-cudaMalloc'd reordered conv-weight buffers and drop the caches. These are
-// keyed by the weight DEVICE pointer; LTXAV_VAE_LAZY re-offloads the VAE params every
-// segment, so on a continuation the weights land at a fresh device address each segment
-// (100% cache miss across segments) and the prior buffers are orphaned -> ~1.4 GB leaked
-// per segment. Call at a segment boundary right after the VAE params are released (their
-// pointers are now stale). Zero perf cost: the reorder is already recomputed every
-// segment. Caller must ensure no conv3d op is in flight (the public wrapper syncs first).
+// Free the raw-cudaMalloc'd reordered conv-weight buffers and drop the caches.
+//
+// Since these became identity-keyed, a re-offload no longer invalidates them: LTXAV_VAE_LAZY
+// re-stages the VAE params every segment at a fresh device address, and the reorder now
+// SURVIVES that (it used to be a 100% miss across segments, orphaning ~1.4 GB per segment,
+// and — worse — a recycled address could produce a stale hit holding another tensor's
+// weights). What this call is still for: a weight-CONTENT change under an unchanged tensor
+// name (LoRA epoch change, different checkpoint into the same names), and lifecycle hygiene
+// when the VAE goes away for good. Existing callers stay correct; they now cost a rebuild
+// rather than being load-bearing.
+// Caller must ensure no conv3d op is in flight (the public wrapper syncs first).
 void ggml_cuda_cudnn_conv3d_release_weights() {
     std::lock_guard<std::mutex> lk(g_conv3d_mtx);
     for (auto & kv : g_weight3d_cache)     cudaFree(kv.second.d);
     for (auto & kv : g_weight3d_f32_cache) cudaFree(kv.second.d);
     g_weight3d_cache.clear();
     g_weight3d_f32_cache.clear();
+}
+
+bool ggml_cuda_cudnn_conv3d_has_cached_weights() {
+    std::lock_guard<std::mutex> lk(g_conv3d_mtx);
+    return !g_weight3d_cache.empty() || !g_weight3d_f32_cache.empty();
 }
 
 // WAN_VAE_CONV3D_NO_WINOGRAD (default ON; =0 restores Winograd): exclude Winograd and
@@ -605,10 +620,19 @@ static conv3d_plan & get_or_build_conv3d_plan(cudnnHandle_t handle, const conv3d
     return ins->second;
 }
 
-static half * get_or_build_weight3d(const ggml_tensor * kernel, int OC, int IC,
+static half * get_or_build_weight3d(const ggml_tensor * kernel, int device, int OC, int IC,
                                     int KD, int KH, int KW, cudaStream_t stream) {
-    auto it = g_weight3d_cache.find(kernel->data);
-    if (it != g_weight3d_cache.end()) return it->second.d;
+    const cudnn_weight_id key = cudnn_make_weight_id(kernel, device);
+
+    auto it = g_weight3d_cache.find(key);
+    if (it != g_weight3d_cache.end()) {
+        if (it->second.src != kernel->data) {
+            if (cudnn_weight_trace()) cudnn_weight_trace_log("conv3d", "moved", key, kernel->data);
+            it->second.src = kernel->data;
+        }
+        return it->second.d;
+    }
+    if (cudnn_weight_trace()) cudnn_weight_trace_log("conv3d", "build", key, kernel->data);
 
     const long n = (long)OC * IC * KD * KH * KW;
     half * d = nullptr;
@@ -621,16 +645,25 @@ static half * get_or_build_weight3d(const ggml_tensor * kernel, int OC, int IC,
     } else {
         kcrs3d_to_krsc3d_f16<float><<<gs, bs, 0, stream>>>((const float *)kernel->data, d, OC, IC, KD, KH, KW);
     }
-    g_weight3d_cache[kernel->data] = {d, (size_t)n};
+    g_weight3d_cache[key] = {d, (size_t)n, kernel->data};
     return d;
 }
 
 // fp32 variant for the full-F32-IO head.2 plan (KRSC-3d fp32). Cached separately from the fp16
 // weights; head.2's weight is tiny (256*12*27 = ~83k elems) so the extra device buffer is trivial.
-static float * get_or_build_weight3d_f32(const ggml_tensor * kernel, int OC, int IC,
+static float * get_or_build_weight3d_f32(const ggml_tensor * kernel, int device, int OC, int IC,
                                          int KD, int KH, int KW, cudaStream_t stream) {
-    auto it = g_weight3d_f32_cache.find(kernel->data);
-    if (it != g_weight3d_f32_cache.end()) return it->second.d;
+    const cudnn_weight_id key = cudnn_make_weight_id(kernel, device);
+
+    auto it = g_weight3d_f32_cache.find(key);
+    if (it != g_weight3d_f32_cache.end()) {
+        if (it->second.src != kernel->data) {
+            if (cudnn_weight_trace()) cudnn_weight_trace_log("conv3d-f32", "moved", key, kernel->data);
+            it->second.src = kernel->data;
+        }
+        return it->second.d;
+    }
+    if (cudnn_weight_trace()) cudnn_weight_trace_log("conv3d-f32", "build", key, kernel->data);
 
     const long n = (long)OC * IC * KD * KH * KW;
     float * d = nullptr;
@@ -643,7 +676,7 @@ static float * get_or_build_weight3d_f32(const ggml_tensor * kernel, int OC, int
     } else {
         kcrs3d_to_krsc3d_f32<float><<<gs, bs, 0, stream>>>((const float *)kernel->data, d, OC, IC, KD, KH, KW);
     }
-    g_weight3d_f32_cache[kernel->data] = {d, (size_t)n};
+    g_weight3d_f32_cache[key] = {d, (size_t)n, kernel->data};
     return d;
 }
 
@@ -730,8 +763,8 @@ bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
     // Weight (KRSC-3d), reordered + cached per ptr: fp32 for the hi_prec full-F32-IO plan, else fp16.
     void * w_ptr = hi_prec
-        ? (void *) get_or_build_weight3d_f32(kernel, oc, c, KD, KH, KW, stream)
-        : (void *) get_or_build_weight3d    (kernel, oc, c, KD, KH, KW, stream);
+        ? (void *) get_or_build_weight3d_f32(kernel, ctx.device, oc, c, KD, KH, KW, stream)
+        : (void *) get_or_build_weight3d    (kernel, ctx.device, oc, c, KD, KH, KW, stream);
 
     // X: NCDHW (ggml) -> NDHWC (cuDNN), tiled transpose with S = D*H*W. fp32 for hi_prec, else fp16.
     const int S_in = D * H * W;
@@ -853,6 +886,7 @@ bool ggml_cuda_conv3d_cudnn_available() { return false; }
 void ggml_cuda_cudnn_conv3d_release_plans() {}
 void ggml_cuda_cudnn_conv3d_release_handle() {}
 void ggml_cuda_cudnn_conv3d_release_weights() {}
+bool ggml_cuda_cudnn_conv3d_has_cached_weights() { return false; }
 
 bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED(ctx);

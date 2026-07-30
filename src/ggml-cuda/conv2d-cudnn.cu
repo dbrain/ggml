@@ -4,12 +4,15 @@
 // flux2.cpp/spike_cutlass_fp4/conv_golden.cu (3x3 s1 p1, NHWC fp16, cosine 1.0 on the
 // flux2-klein VAE decoder shapes). Graph is built once per (N,C,H,W,Cout,KH,KW,stride,
 // pad,dil) shape-key and cached; weight is reordered KCRS->KRSC f16 once per weight
-// (cached by device ptr). Activations are transposed/cast NCHW-f32 <-> NHWC-f16 around
+// (cached by STABLE IDENTITY -- tensor name + buffer + shape + type + device, NOT the
+// device pointer; see cudnn-weight-key.cuh). Activations are transposed/cast NCHW-f32 <-> NHWC-f16 around
 // the call (transpose cost measured; cuDNN is ~3.6x so there is headroom).
 
 #include "conv2d-cudnn.cuh"
 
 #ifdef GGML_CUDNN
+
+#include "cudnn-weight-key.cuh"
 
 #include <cuda_fp16.h>
 #include <cudnn.h>
@@ -194,25 +197,36 @@ struct conv_key_hash {
 static std::mutex g_conv_mtx;
 static std::unordered_map<conv_key, conv_plan, conv_key_hash> g_conv_cache;
 
-// Weight cache: reordered KRSC f16 buffer per source weight device ptr.
+// Weight cache: reordered KRSC f16 buffer per source weight, keyed by STABLE IDENTITY
+// (tensor name + buffer + shape + type + device) — see cudnn-weight-key.cuh for why an
+// address is the wrong key here. `src` is the device pointer the entry was built from and
+// is diagnostic only: under weight offload it moves every render, which is precisely the
+// thing that used to corrupt this cache.
 struct weight_buf {
-    half * d = nullptr;
-    size_t n = 0;
+    half *       d   = nullptr;
+    size_t       n   = 0;
+    const void * src = nullptr;
 };
-static std::unordered_map<const void *, weight_buf> g_weight_cache;
+static std::unordered_map<cudnn_weight_id, weight_buf, cudnn_weight_id_hash> g_weight_cache;
 
 // Free the raw-cudaMalloc'd reordered conv-weight buffers and drop the cache. Mirrors
-// ggml_cuda_cudnn_conv3d_release_weights (see conv3d-cudnn.cu): g_weight_cache is keyed by
-// the weight DEVICE pointer, so any boundary that re-offloads / frees + reloads the VAE
-// params invalidates every key. The old buffers are then orphaned (nothing else frees them
-// — this TU has no other cudaFree) and, worse, a recycled address can produce a STALE HIT
-// that silently returns another tensor's reordered weights. Call at such a boundary right
-// after the params are released. Zero perf cost: the reorder is recomputed on next use.
+// ggml_cuda_cudnn_conv3d_release_weights (see conv3d-cudnn.cu).
+//
+// Since the cache became identity-keyed this is NO LONGER load-bearing for address churn:
+// staging can recycle addresses freely without corrupting anything. It is the invalidation
+// for a WEIGHT-CONTENT change under an unchanged name — a LoRA epoch change, or a different
+// checkpoint loaded into the same registered tensor names — plus plain lifecycle hygiene
+// (these buffers are raw cudaMalloc and nothing else in this TU frees them).
 // Caller must ensure no conv2d op is in flight (the public wrapper syncs first).
 void ggml_cuda_cudnn_conv2d_release_weights() {
     std::lock_guard<std::mutex> lk(g_conv_mtx);
     for (auto & kv : g_weight_cache) cudaFree(kv.second.d);
     g_weight_cache.clear();
+}
+
+bool ggml_cuda_cudnn_conv2d_has_cached_weights() {
+    std::lock_guard<std::mutex> lk(g_conv_mtx);
+    return !g_weight_cache.empty();
 }
 
 static conv_plan build_conv_plan_once(cudnnHandle_t handle, const conv_key & k, bool apply_filter) {
@@ -329,9 +343,20 @@ void ggml_cuda_cudnn_conv2d_release_handle() {
 }
 
 // Reorder + cache the KRSC f16 weight for this source weight tensor.
-static half * get_or_build_weight(const ggml_tensor * kernel, cudaStream_t stream) {
-    auto it = g_weight_cache.find(kernel->data);
-    if (it != g_weight_cache.end()) return it->second.d;
+static half * get_or_build_weight(const ggml_tensor * kernel, int device, cudaStream_t stream) {
+    const cudnn_weight_id key = cudnn_make_weight_id(kernel, device);
+
+    auto it = g_weight_cache.find(key);
+    if (it != g_weight_cache.end()) {
+        if (it->second.src != kernel->data) {
+            // The weight moved (weight offload re-staged it) but it is the same weight, so
+            // the reorder is still valid. This is the hit the old pointer key could not take.
+            if (cudnn_weight_trace()) cudnn_weight_trace_log("conv2d", "moved", key, kernel->data);
+            it->second.src = kernel->data;
+        }
+        return it->second.d;
+    }
+    if (cudnn_weight_trace()) cudnn_weight_trace_log("conv2d", "build", key, kernel->data);
 
     const int KW = kernel->ne[0], KH = kernel->ne[1], IC = kernel->ne[2], OC = kernel->ne[3];
     const long n = (long)OC * IC * KH * KW;
@@ -345,7 +370,7 @@ static half * get_or_build_weight(const ggml_tensor * kernel, cudaStream_t strea
     } else {
         kcrs_to_krsc_f16<float><<<gs, bs, 0, stream>>>((const float *)kernel->data, d, OC, IC, KH, KW);
     }
-    g_weight_cache[kernel->data] = {d, (size_t)n};
+    g_weight_cache[key] = {d, (size_t)n, kernel->data};
     return d;
 }
 
@@ -397,7 +422,7 @@ bool ggml_cuda_op_conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     }
 
     // weight (cached, reordered once)
-    half * w_krsc = get_or_build_weight(kernel, stream);
+    half * w_krsc = get_or_build_weight(kernel, ctx.device, stream);
 
     // X: NCHW f32 -> NHWC f16 (pool temp), tiled transpose (coalesced both sides)
     ggml_cuda_pool_alloc<half> x_nhwc(ctx.pool(), (size_t)N * IC * IH * IW);
@@ -475,6 +500,7 @@ bool ggml_cuda_conv2d_cudnn_available() { return false; }
 
 void ggml_cuda_cudnn_conv2d_release_handle() {}
 void ggml_cuda_cudnn_conv2d_release_weights() {}
+bool ggml_cuda_cudnn_conv2d_has_cached_weights() { return false; }
 
 bool ggml_cuda_op_conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED(ctx);
