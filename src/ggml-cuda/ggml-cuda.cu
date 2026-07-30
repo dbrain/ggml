@@ -3240,6 +3240,297 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// Defined further down next to supports_op; forward-declared so the MUL_MAT+ADD fusion can ask
+// "will a cuBLASLt route claim this GEMM?" before deciding how to accumulate.
+static bool ggml_cuda_nvfp4_fp4_gemm_serves(int device, const ggml_tensor * op);
+static bool ggml_cuda_nvfp4_fp8_gemm_serves(int device, const ggml_tensor * op);
+
+// Proof-of-fire for the MUL_MAT+ADD accumulate fusion. Without it, "the fusion bought nothing"
+// and "the fusion never matched" are indistinguishable from a wall-clock number alone -- and
+// those call for opposite next steps. Same idiom as the [NVFP4_CUBLASLT] trace: silent by
+// default except for a single first-hit line per route, everything under GGML_CUDA_MM_ACC_TRACE.
+static void ggml_cuda_mm_acc_trace(const char * route, const ggml_tensor * mm, const ggml_tensor * src0) {
+    static std::atomic<int> n_a{0};
+    static std::atomic<int> n_b{0};
+    const bool route_a = route[5] == 'A';
+    const int  n       = (route_a ? n_a : n_b).fetch_add(1) + 1;
+    static const bool trace = getenv("GGML_CUDA_MM_ACC_TRACE") != nullptr;
+    if (n == 1 || trace) {
+        fprintf(stderr, "[MM_ACC] %s fused #%d  node='%s' weight='%s' [%lldx%lld] dst_type=%s\n",
+                route, n, mm->name, src0->name,
+                (long long) mm->ne[0], (long long) mm->ne[1], ggml_type_name(mm->type));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// MUL_MAT + in-place ADD  ->  the GEMM accumulates straight into the ADD's destination.
+//
+// A runtime LoRA emits, per patched Linear per step:
+//     out_diff = MUL_MAT(lora_up, lx)          // [out_width, tokens] F32, full width
+//     out      = ADD_INPLACE(out, out_diff)
+// so a full-width tensor is written out, read straight back, added, and discarded. At the krea2
+// edit sequence length that pair alone is ~70% of the adapter's entire memory traffic (224 of
+// 318 GB/step). Pointing the GEMM at the ADD's destination with a `+=` write-back removes the
+// write and one of the two reads, and out_diff is never touched.
+//
+// The same shape occurs in ordinary residual streams (an o_proj / down_proj immediately followed
+// by an in-place residual add). That is a genuine win too, not an accident.
+//
+// NUMERICS -- two different stories, do not conflate them:
+//
+//   F32 destination (Route B always; Route A on an F32 stream): same arithmetic at the same
+//   precision, only the ADDITION ORDER changes. Unfused, dst holds the GEMM sum and `out` is
+//   added last; fused, `out` seeds the accumulator. Under stream-k the partial sums still
+//   arrive afterwards through the fixup kernel's own `+=`, exactly as before.
+//
+//   F16 destination (Route A on an F16 residual stream): this REMOVES A ROUNDING POINT, which
+//   is a real numeric change and NOT mere reassociation. Unfused the GEMM accumulates in F32,
+//   rounds to F16 on store, and the ADD then re-widens, adds and rounds again --
+//   half(float(half(AB)) + float(C)). Fused, cuBLASLt keeps AB + C in the F32 compute type and
+//   rounds ONCE -- half(float(AB) + float(C)). Almost certainly more accurate, but it is
+//   reachable by any F16 residual stream with an NVFP4 projection, so the F16 configuration
+//   needs its own image validation and cannot ride on an F32 arm's result.
+//
+// TWO accumulating routes, picked by whichever backend ggml_cuda_mul_mat() would have used:
+//
+//   Route A -- cuBLASLt FP4 (NVFP4 weight, Blackwell, GGML_NVFP4_CUBLASLT armed).
+//     Zero kernel work: that GEMM already runs with C == D == dst, so beta = 1 turns it into
+//     D = alpha*A*B + C natively. This is the route that matters for an NVFP4 adapter -- the
+//     same configuration that keeps the DiT's F16 residual stream. Without it this fusion and
+//     an NVFP4 adapter would be mutually exclusive on Blackwell, which is the one combination
+//     worth having.
+//     REVOCABLE: ggml_cuda_nvfp4_cublaslt_mul_mat_ex separates DECLINED (dst provably
+//     untouched -> just do not fuse, both nodes then run normally) from FAILED (matmul was
+//     submitted and returned non-SUCCESS, so dst is undefined and the addend is unrecoverable).
+//
+//   Route B -- MMQ (any other quantised weight), via the `accumulate` write-back in mmq.cuh.
+//     F32 only, because MMQ can only write an F32 destination.
+//
+// Always DECLINED when the FP8 FFN route would claim the GEMM: it slices over tokens and breaks
+// out mid-loop on failure (so there is no untouched-dst outcome), and in its default F16 mode it
+// GEMMs into scratch and overwrites dst from a clamp kernel (so beta cannot express the add at
+// all). See the comment above ggml_cuda_fp8_cublaslt_mul_mat. That route is dispatched FIRST in
+// ggml_cuda_mul_mat(), so deferring to it is also the correct dispatch answer.
+//
+// Declines unless ALL of the following hold:
+//   - the two nodes are adjacent, the MUL_MAT has exactly one use and is not a view or a graph
+//     output (ggml_can_fuse), and the two nodes have the same shape;
+//   - exactly one operand of the ADD is the MUL_MAT;
+//   - the ADD is genuinely in place on the other operand -- it is a view, same buffer, same data
+//     pointer, same shape, both contiguous -- so its destination already holds the addend;
+//   - MUL_MAT, ADD and the addend all share one type, and it is F32 or F16 (F16 only reaches
+//     Route A; Route B additionally demands F32 everywhere);
+//   - for Route B, the destination overlaps neither GEMM operand (x/y/dst are __restrict__ in
+//     the MMQ kernel and accumulate makes dst a read operand too). Route A does not need this:
+//     cuBLASLt reads repacked/quantised POOL COPIES of both operands, never src0/src1 directly;
+//   - ggml_cuda_mul_mat() would have dispatched this MUL_MAT to the chosen route. Route A uses
+//     ggml_cuda_nvfp4_fp4_gemm_serves(); Route B replays the mmvf/mmf/mmvq/mmq ladder in order.
+//
+// GGML_CUDA_MMQ_ACC selects which routes are live (the name predates Route A):
+//   unset / 1  Route A only  -- the shipping default
+//   2          Route A + Route B
+//   0          both off      -- the reference arm every A/B is measured against
+// GGML_CUDA_DISABLE_FUSION=1 also disables both.
+//
+// ★ ROUTE B IS OFF BY DEFAULT BECAUSE IT MEASURED SLOWER. Do not re-enable it hopefully.
+// Measured on krea2 edit shape, 1024^2/10 steps, r256 Q8_0 adapter, 5060 Ti, fresh container,
+// arms compared at MATCHED job index:
+//     job 0   47.15 s -> 48.65 s   (+1.50)
+//     job 1   43.22 s -> 45.22 s   (+2.00)
+// Output was bit-identical, and the [MM_ACC] trace proved the fusion fired on every LoRA
+// up-projection, so this is a real slowdown and not a missed match.
+//
+// WHY, and why Route A does the opposite: the byte-count model that motivated this treated all
+// bytes as equal. The ADD that Route B removes is a streaming, fully-coalesced, vectorised
+// binbcast kernel running near peak bandwidth. The bytes it adds are a read-modify-write in the
+// MMQ epilogue -- scalar, strided by tile, and issued at the very END of the tile's work, where
+// there is nothing left to overlap the dependent load against. Route A wins on the identical
+// transformation because cuBLASLt's beta epilogue is a tuned, pipelined library path rather than
+// a hand-rolled scalar RMW. A tuned epilogue beats a hand-rolled one; that is the whole result.
+//
+// KEPT, not deleted, because the conclusion is shape-specific and ltx-video is the counter-case:
+// far larger M (video), and its rank-32 adapters CANNOT use NVFP4 at all (shapes_ok needs
+// ne[0] % 64 == 0, and for lora_up ne[0] IS the rank), so Route B is the only route LTX has.
+// Re-measure there before assuming this result transfers.
+static bool ggml_cuda_try_fuse_mul_mat_acc(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    // 0 = off, 1 = Route A only, 2 = Route A + Route B.
+    static const int mmq_acc_mode = [] {
+        const char * e = getenv("GGML_CUDA_MMQ_ACC");
+        if (e == nullptr || e[0] == '\0') {
+            return 1;
+        }
+        if (strcmp(e, "mmq") == 0) {
+            return 2;
+        }
+        const int v = std::atoi(e);
+        return (v < 0 || v > 2) ? 1 : v;
+    }();
+    if (mmq_acc_mode == 0) {
+        return false;
+    }
+    const bool route_b_enabled = mmq_acc_mode >= 2;
+
+    if (!ggml_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
+        return false;
+    }
+
+    ggml_tensor * mm  = cgraph->nodes[i];
+    ggml_tensor * add = cgraph->nodes[i + 1];
+
+    const bool lhs_is_mm = add->src[0] == mm;
+    const bool rhs_is_mm = add->src[1] == mm;
+    if (lhs_is_mm == rhs_is_mm) {  // neither operand is the matmul, or both are
+        return false;
+    }
+    const ggml_tensor * acc = lhs_is_mm ? add->src[1] : add->src[0];
+
+    // The ADD must be in place on `acc`: nothing else seeds dst with the addend.
+    if (add->view_src == nullptr || add->data == nullptr || acc->data == nullptr || add->data != acc->data) {
+        return false;
+    }
+    if (add->buffer == nullptr || add->buffer != acc->buffer) {
+        return false;
+    }
+    // One shared type across the ADD, its addend and the GEMM result. F16 is only reachable via
+    // Route A (the F16 residual stream); Route B re-checks for F32 below.
+    if (add->type != mm->type || acc->type != mm->type) {
+        return false;
+    }
+    if (mm->type != GGML_TYPE_F32 && mm->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (!ggml_are_same_shape(add, acc) || !ggml_are_same_shape(add, mm)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(add) || !ggml_is_contiguous(acc) || ggml_nbytes(add) != ggml_nbytes(acc)) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (src0 == nullptr || src1 == nullptr || mm->src[2] != nullptr) {
+        return false;
+    }
+    if (src0->buffer == nullptr || src1->buffer == nullptr || mm->buffer == nullptr) {
+        return false;
+    }
+    if (!ggml_is_quantized(src0->type)) {
+        return false;
+    }
+
+    // Byte-range overlap on a shared buffer. Pointer equality is not enough: two DIFFERENT
+    // tensors can be backed by the same (or partially the same) range.
+    auto ranges_overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        if (a->buffer == nullptr || b->buffer == nullptr) {
+            return true;   // unknown extent -> assume the worst
+        }
+        const char * a_beg = (const char *) a->data;
+        const char * a_end = a_beg + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
+        const char * b_beg = (const char *) b->data;
+        const char * b_end = b_beg + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
+        return a_beg < b_end && b_beg < a_end;
+    };
+
+    // The destination must NOT overlap the MUL_MAT's own result.
+    //
+    // Skipping the ADD is only sound if the ADD's two inputs are (GEMM result) and (something
+    // else). If `acc` shares storage with `mm`, the unfused graph writes the GEMM into that
+    // shared range and then adds it TO ITSELF -- it computes 2*GEMM, not acc + GEMM. Accumulating
+    // into the range instead yields old + GEMM, silently wrong.
+    //
+    // The `add->data == acc->data` test above cannot catch this: with mm, acc and add all backed
+    // by one range, every pointer matches and the XOR test still sees exactly one operand that is
+    // the MUL_MAT node. gallocr will not normally produce it (out_diff and out are simultaneously
+    // live, so they get disjoint ranges), but externally assigned or explicitly aliased buffers
+    // can, and "decline when in doubt" is the rule this whole function is built on.
+    if (ranges_overlap(add, mm) || ranges_overlap(acc, mm)) {
+        return false;
+    }
+
+    // ggml_cuda_mul_mat() checks this before anything else.
+    if (ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+
+    const int cc        = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const int warp_size = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
+
+    // The FP8 FFN route is dispatched first and cannot accumulate revocably -- see the header.
+    if (ggml_cuda_nvfp4_fp8_gemm_serves(cuda_ctx->device, mm)) {
+        return false;
+    }
+
+    // ---------------- Route A: cuBLASLt FP4, beta = 1 ----------------
+    // The predicate is evaluated against `mm`, but everything it asserts about the destination
+    // (type in {F32,F16}, contiguous, ne[0] == src0->ne[1], ne[1] == src1->ne[1]) transfers to
+    // `add` verbatim, because we have already required add->type == mm->type,
+    // ggml_are_same_shape(add, mm) and ggml_is_contiguous(add).
+    if (ggml_cuda_nvfp4_fp4_gemm_serves(cuda_ctx->device, mm)) {
+        const ggml_cuda_lt_result r =
+            ggml_cuda_nvfp4_cublaslt_mul_mat_ex(*cuda_ctx, src0, src1, add, /*accumulate =*/ true);
+        if (r == GGML_CUDA_LT_OK) {
+            ggml_cuda_mm_acc_trace("routeA-fp4", mm, src0);
+            return true;
+        }
+        if (r == GGML_CUDA_LT_DECLINED) {
+            return false;   // dst untouched: run the MUL_MAT and the ADD unfused
+        }
+        // GGML_CUDA_LT_FAILED. The matmul was submitted and reported an error, so `add`'s buffer
+        // -- which held the residual/base output we were accumulating into -- may have been
+        // partially overwritten. There is nothing left to recompute it from: falling back here
+        // would silently produce a graph whose residual stream is part garbage, or double-count
+        // the delta. Refuse to continue rather than ship a wrong image.
+        GGML_ABORT("%s: accumulating cuBLASLt FP4 GEMM failed (node '%s', weight '%s'); the "
+                   "destination is unrecoverable. Re-run with GGML_CUDA_MMQ_ACC=0 to disable "
+                   "MUL_MAT+ADD accumulation.\n",
+                   __func__, mm->name, src0->name);
+    }
+
+    // ---------------- Route B: MMQ, accumulating write-back ----------------
+    if (!route_b_enabled) {
+        return false;   // measured slower -- see the header. Opt in with GGML_CUDA_MMQ_ACC=2.
+    }
+    if (mm->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) {
+        return false;   // MMQ only writes F32, and only takes an F32 activation
+    }
+    if (src0->type == GGML_TYPE_NVFP4) {
+        // fp4_gemm_serves() said no, but only for THIS shape / this env. Rather than reason
+        // about why, keep NVFP4 exclusively on Route A.
+        return false;
+    }
+
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    if (bad_padding_clear) {
+        return false;
+    }
+
+    const int64_t ne11 = src1->ne[1];
+    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
+        return false;
+    }
+    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+        return false;
+    }
+    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+        return false;
+    }
+    if (!ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+        return false;
+    }
+
+    // accumulate makes dst a read operand; x/y/dst are all __restrict__ inside the MMQ kernel.
+    // (Route A needs no equivalent: cuBLASLt reads repacked/quantised POOL COPIES of both
+    // operands, never src0/src1 themselves.)
+    if (ranges_overlap(add, src0) || ranges_overlap(add, src1)) {
+        return false;
+    }
+
+    ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, /*ids =*/ nullptr, add, /*accumulate =*/ true);
+    ggml_cuda_mm_acc_trace("routeB-mmq", mm, src0);
+    return true;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3918,6 +4209,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    // MUL_MAT + in-place ADD: let MMQ accumulate into the ADD's destination and drop the ADD.
+    // Sits after every mul_mat_vec fusion above, all of which require ncols_dst == 1 and so
+    // decline the wide GEMMs this targets.
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_try_fuse_mul_mat_acc(cuda_ctx, cgraph, i)) {
+        return 1;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
@@ -4860,9 +5158,13 @@ bool ggml_cuda_nvfp4_weight_global_folded(ggml_backend_t backend, const char * n
 }
 
 // Shape/type bail list shared by BOTH cuBLASLt GEMM entry points. The FP4 path
-// (ggml_cuda_nvfp4_cublaslt_mul_mat) and the FP8 FFN path (ggml_cuda_fp8_cublaslt_mul_mat)
-// open with byte-for-byte the same guard sequence; keeping one copy here is what stops the
+// (ggml_cuda_nvfp4_cublaslt_mul_mat_ex) and the FP8 FFN path (ggml_cuda_fp8_cublaslt_mul_mat)
+// OPEN with byte-for-byte the same guard sequence; keeping one copy here is what stops the
 // supports_op promise from drifting away from either implementation.
+//
+// It mirrors the opening guards ONLY. Both implementations keep bailing after them (handle
+// creation, kernel launch errors, descriptor creation, heuristic failure). See the note on
+// ggml_cuda_nvfp4_fp4_gemm_serves() for what that does and does not promise.
 static bool ggml_cuda_nvfp4_cublaslt_shapes_ok(const ggml_tensor * op) {
     const ggml_tensor * a = op->src[0];
     const ggml_tensor * b = op->src[1];
@@ -4895,8 +5197,19 @@ static bool ggml_cuda_nvfp4_cublaslt_shapes_ok(const ggml_tensor * op) {
 }
 
 // Will a mul_mat node be served by the cuBLASLt FP4 GEMM on `device`?
-// Mirrors the dispatch gate in ggml_cuda_mul_mat() AND the bail list at the top of
-// ggml_cuda_nvfp4_cublaslt_mul_mat(), so a `true` here is a promise the fast path runs.
+// Mirrors the dispatch gate in ggml_cuda_mul_mat() AND the OPENING bail list of
+// ggml_cuda_nvfp4_cublaslt_mul_mat_ex().
+//
+// PRECISION OF THE PROMISE (read this before relying on it): `false` is exact -- the FP4 route
+// will decline without touching dst. `true` is NOT a guarantee that the GEMM runs; it only says
+// no shape/type/env guard rejects it. The implementation has five further bail points after
+// those guards -- get_lt(), two kernel-launch error checks, cublasLtMatmulDescCreate(), and the
+// heuristic returning no algo -- every one of which is still side-effect-free on dst, plus a
+// sixth (cublasLtMatmul returning non-SUCCESS) which is not. That is exactly why the
+// accumulating caller uses the DECLINED/FAILED result instead of trusting this predicate.
+// For supports_op()'s purposes `true` is still the right answer: the concern there is only that
+// SOME cuBLASLt route can write an F16 dst, and the late bails all fall back to a path that
+// overwrites dst wholesale.
 static bool ggml_cuda_nvfp4_fp4_gemm_serves(int device, const ggml_tensor * op) {
     if (!ggml_cuda_nvfp4_cublaslt_enabled() ||
         !blackwell_mma_available(ggml_cuda_info().devices[device].cc)) {

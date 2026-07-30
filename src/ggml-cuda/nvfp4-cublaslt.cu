@@ -417,10 +417,16 @@ static size_t ggml_cuda_nvfp4_act_cache_budget_bytes() {
     return b;
 }
 
-bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
-                                      const ggml_tensor * src0,
-                                      const ggml_tensor * src1,
-                                      ggml_tensor * dst) {
+// Real implementation. See the header for the DECLINED/FAILED contract; the short version is
+// that EVERY return before the cublasLtMatmul at the bottom leaves `dst` byte-untouched, which
+// is what lets an accumulating caller fall back safely. That property is load-bearing now, not
+// merely nice: with `accumulate` the destination is the caller's addend, so a bail that had
+// scribbled on it would be unrecoverable.
+ggml_cuda_lt_result ggml_cuda_nvfp4_cublaslt_mul_mat_ex(ggml_backend_cuda_context & ctx,
+                                                        const ggml_tensor * src0,
+                                                        const ggml_tensor * src1,
+                                                        ggml_tensor * dst,
+                                                        bool accumulate) {
     // only the simple 2D linear-layer case (NVFP4 weight, f32 act, f32 out)
     static int dbgn = 0;
     const bool dbg = getenv("GGML_NVFP4_CUBLASLT_TRACE") && dbgn < 12;
@@ -435,26 +441,26 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     // Accept F32 OR F16 dst: cuBLASLt accumulates in F32 and can store F16 directly
     // (stage 2 — F16 Linear output so the residual/glue stays pure-F16 half-width).
     if (src0->type != GGML_TYPE_NVFP4)
-        return false;
+        return GGML_CUDA_LT_DECLINED;
     if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16)
-        return false;
+        return GGML_CUDA_LT_DECLINED;
     if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16)
-        return false;
+        return GGML_CUDA_LT_DECLINED;
     if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1)
-        return false;
+        return GGML_CUDA_LT_DECLINED;
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst))
-        return false;
+        return GGML_CUDA_LT_DECLINED;
 
     const int K = src0->ne[0];   // contraction
     const int N = src0->ne[1];   // out features
     const int M = src1->ne[1];   // tokens
-    if (src1->ne[0] != K) return false;
-    if (K % 64 != 0)      return false;   // need full 64-elem blocks
-    if (dst->ne[0] != N || dst->ne[1] != M) return false;
+    if (src1->ne[0] != K) return GGML_CUDA_LT_DECLINED;
+    if (K % 64 != 0)      return GGML_CUDA_LT_DECLINED;   // need full 64-elem blocks
+    if (dst->ne[0] != N || dst->ne[1] != M) return GGML_CUDA_LT_DECLINED;
 
     cudaStream_t stream = ctx.stream();
     cublasLtHandle_t lt = get_lt();
-    if (!lt) return false;
+    if (!lt) return GGML_CUDA_LT_DECLINED;
 
     // 1) repack weight into TRANSIENT pool buffers, per-call (no cache, no in-place).
     // The prior cache-by-ptr + in-place path was unsafe: in-place corrupted the weight, and
@@ -474,7 +480,7 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
         const int total   = N*(K/16);
         repack_weight_kernel<<<(total+threads-1)/threads, threads, 0, stream>>>(
             (const block_nvfp4*)src0->data, w_data.get(), w_scales.get(), N, K);
-        if (cudaPeekAtLastError() != cudaSuccess) return false;
+        if (cudaPeekAtLastError() != cudaSuccess) return GGML_CUDA_LT_DECLINED;
     }
 
     // 2) quantize activation into cuBLASLt layout (pool scratch, or the owned reuse cache)
@@ -641,7 +647,7 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
             if (s_norefine || pt > 0.f) quant_act_kernel<float,false><<<blocks, threads, 0, stream>>>((const float*)src1->data, a_data_ptr, a_scales_ptr, M, K, pt);
             else                        quant_act_kernel<float,true ><<<blocks, threads, 0, stream>>>((const float*)src1->data, a_data_ptr, a_scales_ptr, M, K, pt);
         }
-        if (cudaPeekAtLastError() != cudaSuccess) return false;
+        if (cudaPeekAtLastError() != cudaSuccess) return GGML_CUDA_LT_DECLINED;
         // Quant enqueued on `stream` -> the entry is now valid for any later GEMM in this same
         // compute (which necessarily runs after it on the same stream). Publishing here, not at
         // the miss, is what makes every early return above safe.
@@ -664,10 +670,25 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     // byte-identical to before.
     const float w_global = nvfp4_weight_global_for(src0->name);
     float alpha_h = (a_per_tensor > 0.f ? a_per_tensor : 1.0f) * w_global;
-    static float beta_h = 0.0f;
+    // beta selects D = alpha*A*B + beta*C with C == D == dst. beta = 1 is the whole of the
+    // accumulate feature: cuBLASLt does natively, in the epilogue, what the MMQ path needed a
+    // hand-rolled `+=` write-back for, so the caller's ADD node disappears and the full-width
+    // out_diff is never materialised.
+    //
+    // Accumulation happens in the F32 compute type and only the final store is narrowed to
+    // out_dt. For an F16 dst that is one rounding where the unfused GEMM-then-ADD had two --
+    // a genuine numeric change (see the NUMERICS note on ggml_cuda_try_fuse_mul_mat_acc), not
+    // just a reassociation.
+    //
+    // Was a function-local `static` initialised once to 0.0f. That was race-FREE while it was
+    // effectively a constant -- read-only after init. It has to become a plain local now for
+    // the ordinary reason that it VARIES PER CALL, and a shared mutable object written by every
+    // caller would be a race on the offload path's worker threads (see the thread_local algo
+    // cache below).
+    const float beta_h = accumulate ? 1.0f : 0.0f;
 
     cublasLtMatmulDesc_t op = nullptr;
-    if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS) return false;
+    if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS) return GGML_CUDA_LT_DECLINED;
     cublasLtMatmulMatrixScale_t sm = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
     cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &sm, sizeof(sm));
     cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &sm, sizeof(sm));
@@ -725,11 +746,15 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
         }
     }
 
-    bool ok = have_algo;
+    // `submitted` is the DECLINED/FAILED discriminator: no heuristic => the matmul was never
+    // issued and dst is still pristine; issued-but-non-SUCCESS => dst's state is unknown.
+    bool ok        = have_algo;
+    bool submitted = false;
     if (ok) {
         cublasStatus_t ms = cublasLtMatmul(lt, op, &alpha_h, w_data.get(), Ad, a_data_ptr, Bd,
                                            &beta_h, dst->data, Cd, dst->data, Dd,
                                            &algo, ws.get(), wsz, stream);
+        submitted = true;
         ok = (ms == CUBLAS_STATUS_SUCCESS);
     }
 
@@ -756,7 +781,20 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     if (Cd) cublasLtMatrixLayoutDestroy(Cd);
     if (Dd) cublasLtMatrixLayoutDestroy(Dd);
     if (op) cublasLtMatmulDescDestroy(op);
-    return ok;
+    if (ok) {
+        return GGML_CUDA_LT_OK;
+    }
+    return submitted ? GGML_CUDA_LT_FAILED : GGML_CUDA_LT_DECLINED;
+}
+
+// Legacy bool entry point. Both non-OK outcomes collapse to `false`, which is exactly the old
+// contract: the caller falls through to MMQ / dequant-cuBLAS, and that fallback OVERWRITES dst,
+// so a FAILED matmul that had partially written it was — and still is — harmless here.
+bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
+                                      const ggml_tensor * src0,
+                                      const ggml_tensor * src1,
+                                      ggml_tensor * dst) {
+    return ggml_cuda_nvfp4_cublaslt_mul_mat_ex(ctx, src0, src1, dst, /*accumulate =*/ false) == GGML_CUDA_LT_OK;
 }
 
 // ============================ FP8 (e4m3) FFN path ============================
@@ -1120,6 +1158,17 @@ void ggml_cuda_fp8_act_cache_new_generation(void) {
 // this box, so the weight requant stays per-call. If it is ever wanted, it must come with an
 // eviction policy and a budget well under 1 GiB.
 
+// NO accumulate variant here, deliberately. Three structural reasons, any one of them fatal:
+//   1. This path SLICES over tokens (`for c0 ... nc`) and breaks out of the loop on the first
+//      failure. With beta = 1 an aborted run would have already accumulated the earlier slices,
+//      so there is no "dst untouched" outcome to fall back from — it is not revocable.
+//   2. In the default F16-dst mode (use_f32_temp) the GEMM writes an F32 SCRATCH buffer and
+//      fp8_clamp_f32_to_f16 then OVERWRITES dst. beta would accumulate into the scratch, not
+//      into dst; making it work needs a new clamp-and-add kernel, not a scalar.
+//   3. Even in clamp_inplace mode the epilogue would clamp (out + delta) rather than
+//      out + clamp(delta), which is not what the unfused graph computes.
+// The MUL_MAT+ADD fusion therefore declines outright whenever this route would claim the GEMM
+// (ggml_cuda_nvfp4_fp8_gemm_serves), which is correct because this path is dispatched FIRST.
 bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
                                     const ggml_tensor * src0,
                                     const ggml_tensor * src1,
