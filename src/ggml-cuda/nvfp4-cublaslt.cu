@@ -378,8 +378,27 @@ static bool get_repacked_weight(const ggml_tensor * src0, int N, int K, cudaStre
 //
 // Default OFF (GGML_NVFP4_ACT_QUANT_CACHE=1 to enable) — mirrors how the FP8 sibling is
 // gated, and keeps every existing render byte-untouched unless the flag is set.
+//
+// N-WAY, not one slot. The single-entry design above assumed the emission order krea2 has with
+// NO adapter attached: wq/wk/wv/gate all read the same `x`, so 8 GEMMs quantize 4 distinct
+// activations and one slot is exactly enough. Attach a runtime LoRA and the order becomes
+//   base_wq(x), lora_down_wq(x), lora_up_wq(lx), base_wk(x), lora_down_wk(x), lora_up_wk(lx'), ...
+// where every `lx` is a DIFFERENT node. With one slot each up-GEMM evicts `x`, and the next base
+// Linear re-quantizes the full [6144 x 8797] activation from scratch — order 15 GB/step of
+// avoidable traffic that exists ONLY because an adapter is attached, and that every measurement
+// so far has charged to "LoRA cost".
+//
+// LRU is what makes 2 slots already sufficient for that pattern: `x` is read repeatedly and each
+// `lx` exactly once, so the single-use entry is always the eviction victim and `x` never leaves.
+// The default is 4 for headroom (nested adapters, fused stacks).
+//
+// VRAM IS NOT INCREASED. GGML_NVFP4_ACT_CACHE_MB stays the budget, but it is now enforced as an
+// AGGREGATE over all slots rather than per entry, so the peak owned bytes are the same number
+// they were with one slot — the cache just splits that budget over more tensors. A big enough
+// activation therefore self-limits to one or two live slots instead of blowing past the cap.
 struct nvfp4_act_quant_cache {
     uint64_t            gen        = (uint64_t)-1;   // generation filled at; -1 == empty
+    uint64_t            stamp      = 0;              // LRU tick of the last hit/fill; 0 == never
     const ggml_tensor * node       = nullptr;        // src1 node identity (unique in a graph)
     const void *        data       = nullptr;
     int64_t             ne0        = 0;
@@ -393,7 +412,10 @@ struct nvfp4_act_quant_cache {
     size_t              cap_scales = 0;
     float               per_tensor = 0.f;            // host two-level global (feeds alpha)
 };
-static thread_local nvfp4_act_quant_cache g_nvfp4_act_cache;
+#define NVFP4_ACT_CACHE_MAX_SLOTS 8
+static thread_local nvfp4_act_quant_cache g_nvfp4_act_cache[NVFP4_ACT_CACHE_MAX_SLOTS];
+static thread_local uint64_t              g_nvfp4_act_cache_tick  = 0;   // LRU clock
+static thread_local size_t                g_nvfp4_act_cache_bytes = 0;   // owned across slots
 // Bumped from ggml_cuda_fp8_act_cache_new_generation() (below), which
 // ggml_backend_cuda_graph_compute() already calls once per graph compute. A hit requires the
 // stored generation to equal the current one, so a new compute can never reuse a previous
@@ -405,6 +427,17 @@ static bool ggml_cuda_nvfp4_act_cache_enabled() {
     if (v < 0) { const char * e = getenv("GGML_NVFP4_ACT_QUANT_CACHE"); v = (e && atoi(e)) ? 1 : 0; }
     return v == 1;
 }
+static int ggml_cuda_nvfp4_act_cache_slots() {
+    static int n = -1;
+    if (n < 0) {
+        const char * e = getenv("GGML_NVFP4_ACT_CACHE_SLOTS");
+        long v = (e && *e) ? atol(e) : 4;
+        if (v < 1) v = 1;
+        if (v > NVFP4_ACT_CACHE_MAX_SLOTS) v = NVFP4_ACT_CACHE_MAX_SLOTS;
+        n = (int)v;
+    }
+    return n;
+}
 static size_t ggml_cuda_nvfp4_act_cache_budget_bytes() {
     static size_t b = 0; static int init = 0;
     if (!init) {
@@ -415,6 +448,19 @@ static size_t ggml_cuda_nvfp4_act_cache_budget_bytes() {
         init = 1;
     }
     return b;
+}
+// Release a slot's owned buffers and give its bytes back to the aggregate budget. cudaFree is
+// device-synchronizing, so any in-flight GEMM still reading them has retired before they go.
+static void ggml_cuda_nvfp4_act_cache_release(nvfp4_act_quant_cache & C) {
+    if (C.d_data)   { cudaFree(C.d_data);   C.d_data   = nullptr; }
+    if (C.d_scales) { cudaFree(C.d_scales); C.d_scales = nullptr; }
+    const size_t held = C.cap_data + C.cap_scales;
+    g_nvfp4_act_cache_bytes = held <= g_nvfp4_act_cache_bytes ? g_nvfp4_act_cache_bytes - held : 0;
+    C.cap_data   = 0;
+    C.cap_scales = 0;
+    C.gen        = (uint64_t)-1;
+    C.node       = nullptr;
+    C.stamp      = 0;
 }
 
 // Real implementation. See the header for the DECLINED/FAILED contract; the short version is
@@ -521,49 +567,117 @@ ggml_cuda_lt_result ggml_cuda_nvfp4_cublaslt_mul_mat_ex(ggml_backend_cuda_contex
     // TRAP 1: budget the ACTUAL BYTES this activation occupies (packed nibbles + padded
     // swizzled scale plane), not an element count. See the struct header.
     const size_t a_cache_bytes = a_data_bytes + a_scale_bytes;
+    const size_t act_budget    = ggml_cuda_nvfp4_act_cache_budget_bytes();
     bool act_cache_use = ggml_cuda_nvfp4_act_cache_enabled() && !nv_capturing &&
-                         a_cache_bytes <= ggml_cuda_nvfp4_act_cache_budget_bytes();
+                         a_cache_bytes <= act_budget;
+    nvfp4_act_quant_cache * act_slot = nullptr;   // slot to publish to once the quant is enqueued
     if (act_cache_use) {
-        nvfp4_act_quant_cache & C = g_nvfp4_act_cache;
-        const uint64_t cur = g_nvfp4_act_cache_gen.load(std::memory_order_relaxed);
-        const bool hit = C.gen == cur && C.node == src1 && C.data == src1->data &&
-                         C.ne0 == src1->ne[0] && C.ne1 == src1->ne[1] &&
-                         C.nb1 == src1->nb[1] && C.type == (int)src1->type &&
-                         C.device == ctx.device && C.d_data != nullptr &&
-                         C.d_scales != nullptr && C.cap_data >= a_data_bytes &&
-                         C.cap_scales >= a_scale_bytes;
-        if (hit) {
-            a_data_ptr        = C.d_data;
-            a_scales_ptr      = C.d_scales;
-            cached_per_tensor = C.per_tensor;
-            act_reused        = true;
-        } else {
-            // MISS: (re)quantize into the OWNED persistent buffers (grow-only). cudaFree is
-            // device-synchronizing, so any in-flight GEMM still reading the old buffer has
-            // retired before it is released; growth only happens on the first calls.
-            if (C.device != ctx.device && (C.d_data != nullptr || C.d_scales != nullptr)) {
-                if (C.d_data)   { cudaFree(C.d_data);   C.d_data   = nullptr; C.cap_data   = 0; }
-                if (C.d_scales) { cudaFree(C.d_scales); C.d_scales = nullptr; C.cap_scales = 0; }
+        const int      n_slots = ggml_cuda_nvfp4_act_cache_slots();
+        const uint64_t cur     = g_nvfp4_act_cache_gen.load(std::memory_order_relaxed);
+        const uint64_t tick    = ++g_nvfp4_act_cache_tick;
+
+        for (int s = 0; s < n_slots && !act_reused; ++s) {
+            nvfp4_act_quant_cache & C = g_nvfp4_act_cache[s];
+            const bool hit = C.gen == cur && C.node == src1 && C.data == src1->data &&
+                             C.ne0 == src1->ne[0] && C.ne1 == src1->ne[1] &&
+                             C.nb1 == src1->nb[1] && C.type == (int)src1->type &&
+                             C.device == ctx.device && C.d_data != nullptr &&
+                             C.d_scales != nullptr && C.cap_data >= a_data_bytes &&
+                             C.cap_scales >= a_scale_bytes;
+            if (hit) {
+                C.stamp           = tick;
+                a_data_ptr        = C.d_data;
+                a_scales_ptr      = C.d_scales;
+                cached_per_tensor = C.per_tensor;
+                act_reused        = true;
             }
+        }
+
+        if (!act_reused) {
+            // MISS. Victim = strict LRU. `stamp` is 0 for a slot that has never been filled, so
+            // untouched slots are consumed before any live entry, and the repeatedly-read
+            // activation (`x`) is never the victim while single-use LoRA intermediates are —
+            // which is the whole reason 2 slots already fix the adapter interleave.
+            //
+            // Deliberately NOT "prefer a slot whose buffers already fit": that would evict a hot
+            // entry to avoid one cudaMalloc, and the buffers are grow-only against repeating
+            // shapes, so the malloc happens once per slot per render anyway.
+            int victim = 0;
+            {
+                uint64_t best_stamp = (uint64_t)-1;
+                for (int s = 0; s < n_slots; ++s) {
+                    if (g_nvfp4_act_cache[s].stamp < best_stamp) {
+                        best_stamp = g_nvfp4_act_cache[s].stamp;
+                        victim     = s;
+                    }
+                }
+            }
+            nvfp4_act_quant_cache & C = g_nvfp4_act_cache[victim];
+
+            // A slot never holds another device's memory.
+            if (C.device != ctx.device && (C.d_data != nullptr || C.d_scales != nullptr)) {
+                ggml_cuda_nvfp4_act_cache_release(C);
+            }
+
+            // AGGREGATE BUDGET. Buffers stay grow-only within a slot, exactly as before — an
+            // existing buffer that is already big enough is kept. The one exception is a slot
+            // whose ALREADY-OWNED buffers would on their own exceed the cap (it was filled by a
+            // much larger activation earlier): release it and size down to what this call needs,
+            // rather than letting one stale slot lock up the whole budget.
+            size_t want_data   = C.cap_data   >= a_data_bytes  ? C.cap_data   : a_data_bytes;
+            size_t want_scales = C.cap_scales >= a_scale_bytes ? C.cap_scales : a_scale_bytes;
+            if (want_data + want_scales > act_budget) {
+                ggml_cuda_nvfp4_act_cache_release(C);
+                want_data   = a_data_bytes;    // a_cache_bytes <= act_budget was checked above
+                want_scales = a_scale_bytes;
+            }
+            // Free OTHER slots (LRU first, never the victim) until the victim's post-growth size
+            // fits the same GGML_NVFP4_ACT_CACHE_MB the single-slot cache used. Terminates: in
+            // the worst case every other slot is freed, leaving want_data + want_scales, which
+            // the clamp above guarantees fits.
+            {
+                const size_t held = C.cap_data + C.cap_scales;
+                auto projected    = [&]() {
+                    const size_t others = g_nvfp4_act_cache_bytes >= held ? g_nvfp4_act_cache_bytes - held : 0;
+                    return others + want_data + want_scales;
+                };
+                while (projected() > act_budget) {
+                    int      evict       = -1;
+                    uint64_t evict_stamp = (uint64_t)-1;
+                    for (int s = 0; s < n_slots; ++s) {
+                        if (s == victim) continue;
+                        nvfp4_act_quant_cache & E = g_nvfp4_act_cache[s];
+                        if (E.cap_data == 0 && E.cap_scales == 0) continue;
+                        if (E.stamp < evict_stamp) { evict_stamp = E.stamp; evict = s; }
+                    }
+                    if (evict < 0) break;   // nothing left to give back
+                    ggml_cuda_nvfp4_act_cache_release(g_nvfp4_act_cache[evict]);
+                }
+            }
+
             if (C.cap_data < a_data_bytes) {
-                if (C.d_data != nullptr) cudaFree(C.d_data);
+                if (C.d_data != nullptr) { cudaFree(C.d_data);
+                    g_nvfp4_act_cache_bytes -= C.cap_data <= g_nvfp4_act_cache_bytes ? C.cap_data : g_nvfp4_act_cache_bytes; }
                 if (cudaMalloc((void**)&C.d_data, a_data_bytes) != cudaSuccess) { C.d_data = nullptr; C.cap_data = 0; }
-                else                                                            C.cap_data = a_data_bytes;
+                else { C.cap_data = a_data_bytes; g_nvfp4_act_cache_bytes += a_data_bytes; }
             }
             if (C.cap_scales < a_scale_bytes) {
-                if (C.d_scales != nullptr) cudaFree(C.d_scales);
+                if (C.d_scales != nullptr) { cudaFree(C.d_scales);
+                    g_nvfp4_act_cache_bytes -= C.cap_scales <= g_nvfp4_act_cache_bytes ? C.cap_scales : g_nvfp4_act_cache_bytes; }
                 if (cudaMalloc((void**)&C.d_scales, a_scale_bytes) != cudaSuccess) { C.d_scales = nullptr; C.cap_scales = 0; }
-                else                                                               C.cap_scales = a_scale_bytes;
+                else { C.cap_scales = a_scale_bytes; g_nvfp4_act_cache_bytes += a_scale_bytes; }
             }
             if (C.d_data != nullptr && C.d_scales != nullptr) {
                 a_data_ptr   = C.d_data;
                 a_scales_ptr = C.d_scales;
                 C.gen  = (uint64_t)-1;    // stays EMPTY until the quant is enqueued (below)
+                C.stamp = tick;
                 C.node = src1;            C.data   = src1->data;
                 C.ne0  = src1->ne[0];     C.ne1    = src1->ne[1];  C.nb1 = src1->nb[1];
                 C.type = (int)src1->type; C.device = ctx.device;
                 C.per_tensor = 0.f;
                 act_publish_gen = cur;
+                act_slot        = &C;
             } else {
                 C.gen = (uint64_t)-1; C.node = nullptr;   // alloc failed -> invalidate, use pool
                 act_cache_use = false;
@@ -651,9 +765,9 @@ ggml_cuda_lt_result ggml_cuda_nvfp4_cublaslt_mul_mat_ex(ggml_backend_cuda_contex
         // Quant enqueued on `stream` -> the entry is now valid for any later GEMM in this same
         // compute (which necessarily runs after it on the same stream). Publishing here, not at
         // the miss, is what makes every early return above safe.
-        if (act_publish_gen != (uint64_t)-1) {
-            g_nvfp4_act_cache.per_tensor = a_per_tensor;
-            g_nvfp4_act_cache.gen        = act_publish_gen;
+        if (act_publish_gen != (uint64_t)-1 && act_slot != nullptr) {
+            act_slot->per_tensor = a_per_tensor;
+            act_slot->gen        = act_publish_gen;
         }
     }
 
