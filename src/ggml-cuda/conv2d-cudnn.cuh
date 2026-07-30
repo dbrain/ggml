@@ -31,9 +31,16 @@ bool ggml_cuda_conv2d_cudnn_available();
 void ggml_cuda_cudnn_conv2d_release_handle();
 
 // Free the raw-cudaMalloc'd reordered conv-weight buffers (g_weight_cache) and clear the
-// cache. Twin of ggml_cuda_cudnn_conv3d_release_weights. The cache is keyed by the weight
-// DEVICE pointer, so a boundary that re-offloads or frees+reloads the params invalidates
-// every key: the old buffers leak (nothing else frees them) and a recycled address can
-// stale-hit and return the WRONG weights. Call at such a boundary, with no conv2d op in
-// flight. No-op stub when built without GGML_CUDNN.
+// cache. Twin of ggml_cuda_cudnn_conv3d_release_weights.
+//
+// The cache is keyed by STABLE IDENTITY (tensor name + buffer + shape + type + device, see
+// cudnn-weight-key.cuh), NOT by the weight's device address, so re-offloading or otherwise
+// moving the weights does NOT invalidate it and this need not be called for that. What it
+// is for: the weight CONTENT changing under an unchanged tensor name (a LoRA epoch change,
+// a different checkpoint loaded into the same names), and freeing the buffers when the
+// model goes away. Call with no conv2d op in flight. No-op stub without GGML_CUDNN.
 void ggml_cuda_cudnn_conv2d_release_weights();
+
+// True when the reorder cache holds anything. Lets a caller skip the device synchronize
+// that must precede a release. No-op stub (false) without GGML_CUDNN.
+bool ggml_cuda_cudnn_conv2d_has_cached_weights();

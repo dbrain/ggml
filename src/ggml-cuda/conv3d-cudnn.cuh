@@ -52,9 +52,18 @@ void ggml_cuda_cudnn_conv3d_release_plans();
 void ggml_cuda_cudnn_conv3d_release_handle();
 
 // Free the raw-cudaMalloc'd reordered conv-weight buffers (g_weight3d_cache /
-// g_weight3d_f32_cache) and clear the caches. Required on a continuation because
-// LTXAV_VAE_LAZY re-offloads the VAE params each segment -> weights get a fresh device
-// address -> old reorder buffers orphaned (~1.4 GB/segment leak). Call at a segment
-// boundary after the VAE params are released, with no conv3d op in flight. No-op stub
-// when built without GGML_CUDNN.
+// g_weight3d_f32_cache) and clear the caches.
+//
+// These are keyed by STABLE IDENTITY (tensor name + buffer + shape + type + device, see
+// cudnn-weight-key.cuh), NOT by the weight's device address, so LTXAV_VAE_LAZY re-offloading
+// the VAE params each segment no longer invalidates them (it used to orphan ~1.4 GB/segment
+// and could stale-hit another tensor's weights). Existing segment-boundary callers stay
+// correct; they now merely pay a rebuild. What this is still REQUIRED for: the weight
+// CONTENT changing under an unchanged tensor name (LoRA epoch change, different checkpoint
+// into the same names), and freeing the buffers when the VAE goes away. Call with no conv3d
+// op in flight. No-op stub when built without GGML_CUDNN.
 void ggml_cuda_cudnn_conv3d_release_weights();
+
+// True when either reorder cache holds anything. Lets a caller skip the device synchronize
+// that must precede a release. No-op stub (false) without GGML_CUDNN.
+bool ggml_cuda_cudnn_conv3d_has_cached_weights();

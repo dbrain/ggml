@@ -41,10 +41,18 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
 GGML_BACKEND_API void ggml_backend_cuda_trim_memory(ggml_backend_t backend);
 
 // Free cuDNN's cached reordered 3D-convolution weights. These allocations are
-// external to ggml's VMM pool and are keyed by temporary staged weight pointers,
-// so a video-window boundary must release them after those staging buffers go
-// away. No-op when ggml-cuda was built without cuDNN.
+// external to ggml's VMM pool, so somebody has to free them; see the note on the 2-D
+// twin below for what does and does not require a release now that the caches are
+// identity-keyed. No-op when ggml-cuda was built without cuDNN.
 GGML_BACKEND_API void ggml_backend_cuda_release_cudnn_conv3d_weights(void);
+
+// Same, for the 2-D cuDNN conv reorder cache (conv2d-cudnn.cu g_weight_cache).
+// Both caches are keyed by STABLE IDENTITY (tensor name + backend buffer + shape +
+// type + device), so moving a weight -- staging it, re-offloading it -- does NOT
+// require a release and the reorder survives. Release when the CONTENT behind a
+// tensor name changes (LoRA epoch, different checkpoint into the same names) or when
+// the model goes away. No-op when built without cuDNN.
+GGML_BACKEND_API void ggml_backend_cuda_release_cudnn_conv2d_weights(void);
 
 // Register a per-tensor NVFP4 weight global scale (ModelOpt weight_scale_2) of an
 // UNFOLDED import, keyed by the ggml tensor name of the weight it belongs to. The FP4

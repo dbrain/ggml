@@ -17,6 +17,7 @@
 #include "ggml-cuda/conv2d.cuh"
 #include "ggml-cuda/conv2d-dw.cuh"
 #include "ggml-cuda/conv2d-transpose.cuh"
+#include "ggml-cuda/conv2d-cudnn.cuh"
 #include "ggml-cuda/conv3d-cudnn.cuh"
 #include "ggml-cuda/convert.cuh"
 #include "ggml-cuda/count-equal.cuh"
@@ -5287,8 +5288,25 @@ void ggml_backend_cuda_release_cudnn_conv3d_weights(void) {
     // The reorder cache owns raw cudaMalloc allocations rather than ggml VMM
     // pages. Synchronize so no queued convolution can retain one while it is
     // released; the helper is a no-op in a non-cuDNN build.
+    //
+    // Skip the synchronize entirely when there is nothing cached. Since the caches
+    // became identity-keyed (cudnn-weight-key.cuh) this is called from lifecycle /
+    // content-change boundaries that fire whether or not any conv ever ran, and a
+    // cudaDeviceSynchronize on a torn-down or never-used context is both wasteful
+    // and a needless failure mode.
+    if (!ggml_cuda_cudnn_conv3d_has_cached_weights()) {
+        return;
+    }
     CUDA_CHECK(cudaDeviceSynchronize());
     ggml_cuda_cudnn_conv3d_release_weights();
+}
+
+void ggml_backend_cuda_release_cudnn_conv2d_weights(void) {
+    if (!ggml_cuda_cudnn_conv2d_has_cached_weights()) {
+        return;
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    ggml_cuda_cudnn_conv2d_release_weights();
 }
 
 int ggml_backend_cuda_get_device_count() {
