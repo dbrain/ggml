@@ -14,6 +14,28 @@ bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
                                       const ggml_tensor * src1,
                                       ggml_tensor * dst);
 
+// Outcome of an attempted cuBLASLt GEMM.
+//
+// The bool entry point above cannot express the distinction an ACCUMULATING caller needs:
+// "declined, dst is untouched, fall back freely" vs "the GEMM was submitted and failed, dst's
+// contents are now unknown". With beta = 0 that difference is invisible, because every fallback
+// overwrites dst anyway. With beta = 1 the destination IS the addend, so a scribbled-on dst
+// cannot be repaired by re-running anything — the addend is gone.
+enum ggml_cuda_lt_result {
+    GGML_CUDA_LT_OK       = 0,  // handled; dst written (accumulate: dst += A*B)
+    GGML_CUDA_LT_DECLINED = 1,  // not handled; dst PROVABLY untouched -> safe to fall back
+    GGML_CUDA_LT_FAILED   = 2,  // matmul submitted and returned non-SUCCESS; dst UNDEFINED
+};
+
+// `accumulate == true` sets cuBLASLt beta = 1 with C == D == dst, i.e. dst += alpha*A*B.
+// The caller must guarantee dst already holds the addend. Used by the MUL_MAT + in-place-ADD
+// fusion in ggml-cuda.cu, which is why the DECLINED/FAILED split exists.
+ggml_cuda_lt_result ggml_cuda_nvfp4_cublaslt_mul_mat_ex(ggml_backend_cuda_context & ctx,
+                                                        const ggml_tensor * src0,
+                                                        const ggml_tensor * src1,
+                                                        ggml_tensor * dst,
+                                                        bool accumulate);
+
 // True iff a per-tensor NVFP4 weight global (ModelOpt weight_scale_2) was registered for
 // `name` via ggml_cuda_nvfp4_register_weight_global (declared in ggml-cuda.h). Used by
 // ggml_cuda_nvfp4_weight_global_folded() to prove to the graph builder that this weight's
