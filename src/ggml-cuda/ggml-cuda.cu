@@ -4530,6 +4530,156 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// GGML_CUDA_NODE_NANSCAN=1 — find the node where a NaN is BORN.  Diagnostic, default off.
+//
+// "Is there a NaN" is never the question; the output already answers it.  The question is
+// which node first manufactured one, because a single NaN propagates through every
+// downstream matmul and softmax, so by the time a result is inspected thousands of nodes
+// carry it and all of them look equally guilty.  So after each node: if its output has NaN
+// but none of its sources did, this node is the origin.
+//
+// NaN AND Inf ARE COUNTED SEPARATELY, DELIBERATELY.  The first version of this probe tested
+// !isfinite() and immediately "found" a dirty leaf feeding the very first block — which was
+// an attention mask legitimately full of -inf.  Masks make -inf an ordinary intended value,
+// so folding it in with NaN yields a confident false positive on every graph, passing or
+// failing, and it exhausts the report budget long before the real origin is reached.  NaN is
+// the pathology; Inf is reported only as context, and on its own first appearance, since an
+// F16 store that overflows shows up as Inf before anything turns it into NaN.
+//
+// Detection runs ON DEVICE, reducing to two ints, rather than copying each node to the host:
+// on a video-sized graph a per-node D2H costs more than the render.  The counters are "how
+// many threads observed at least one", not a census — each thread stops at its first hit.
+// Presence is what matters here; an exact tally would only cost bandwidth.
+//
+// Inert unless the env var is set, and skipped while a CUDA graph is capturing: the memset /
+// memcpy / sync below are illegal during capture and would abort it rather than report.
+static __global__ void ggml_cuda_nanscan_kernel_f32(const float * __restrict__ x, const int64_t n, int * __restrict__ out) {
+    for (int64_t i = blockIdx.x*(int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x*blockDim.x) {
+        const float v = x[i];
+        if (isnan(v)) { atomicAdd(out + 0, 1); return; }
+        if (isinf(v)) { atomicAdd(out + 1, 1); return; }
+    }
+}
+
+static __global__ void ggml_cuda_nanscan_kernel_f16(const half * __restrict__ x, const int64_t n, int * __restrict__ out) {
+    for (int64_t i = blockIdx.x*(int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x*blockDim.x) {
+        const float v = __half2float(x[i]);
+        if (isnan(v)) { atomicAdd(out + 0, 1); return; }
+        if (isinf(v)) { atomicAdd(out + 1, 1); return; }
+    }
+}
+
+// Returns >0 when NaN was seen, 0 when clean, and -1 when the tensor CANNOT BE SCANNED
+// (quantised, non-contiguous, or unallocated).  -1 is absence of evidence, not evidence of
+// absence — a caller must never fold it in with "clean", or it will name a node as the
+// origin on the strength of a source it never actually looked at.  Inf comes back via n_inf.
+static int ggml_cuda_nanscan_count(ggml_backend_cuda_context & ctx, const ggml_tensor * t, int * n_inf = nullptr) {
+    if (n_inf) {
+        *n_inf = 0;
+    }
+    if (t == nullptr || t->data == nullptr || t->buffer == nullptr) {
+        return -1;
+    }
+    if (!ggml_is_contiguous(t) || (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16)) {
+        return -1;
+    }
+    const int64_t n = ggml_nelements(t);
+    if (n <= 0) {
+        return -1;
+    }
+
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool_alloc<int> flags(ctx.pool(), 2);
+    CUDA_CHECK(cudaMemsetAsync(flags.get(), 0, 2*sizeof(int), stream));
+
+    const int64_t block = 256;
+    const int64_t grid  = std::min<int64_t>((n + block - 1) / block, 1024);
+    if (t->type == GGML_TYPE_F32) {
+        ggml_cuda_nanscan_kernel_f32<<<grid, block, 0, stream>>>((const float *) t->data, n, flags.get());
+    } else {
+        ggml_cuda_nanscan_kernel_f16<<<grid, block, 0, stream>>>((const half *) t->data, n, flags.get());
+    }
+
+    int host[2] = {0, 0};
+    CUDA_CHECK(cudaMemcpyAsync(host, flags.get(), 2*sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (n_inf) {
+        *n_inf = host[1];
+    }
+    return host[0];
+}
+
+static void ggml_cuda_nanscan_check_node(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * node) {
+    static const bool enabled = getenv("GGML_CUDA_NODE_NANSCAN") != nullptr;
+    if (!enabled) {
+        return;
+    }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cuda_ctx->stream(), &capture) != cudaSuccess || capture != cudaStreamCaptureStatusNone) {
+        return;
+    }
+
+    int       dst_inf = 0;
+    const int dst_nan = ggml_cuda_nanscan_count(*cuda_ctx, node, &dst_inf);
+
+    // Earliest useful signal: an overflow surfaces as Inf one op before it becomes NaN.
+    static int inf_reports = 0;
+    if (dst_nan == 0 && dst_inf > 0 && inf_reports++ < 6) {
+        GGML_LOG_INFO("[nanscan] Inf (no NaN yet) in '%s' op=%s type=%s ne=[%lld,%lld,%lld,%lld]\n",
+                      node->name[0] ? node->name : "(unnamed)", ggml_op_name(node->op),
+                      ggml_type_name(node->type),
+                      (long long) node->ne[0], (long long) node->ne[1],
+                      (long long) node->ne[2], (long long) node->ne[3]);
+    }
+    if (dst_nan <= 0) {
+        return;
+    }
+
+    int  nan_src     = 0;
+    int  unknown_src = 0;
+    int  off         = 0;
+    char srcs[768];
+    srcs[0] = '\0';
+    for (int j = 0; j < GGML_MAX_SRC; j++) {
+        const ggml_tensor * s = node->src[j];
+        if (s == nullptr) {
+            continue;
+        }
+        int       s_inf = 0;
+        const int s_nan = ggml_cuda_nanscan_count(*cuda_ctx, s, &s_inf);
+        if (s_nan > 0) {
+            nan_src++;
+        } else if (s_nan < 0) {
+            unknown_src++;
+        }
+        if (off < (int) sizeof(srcs) - 112) {
+            off += snprintf(srcs + off, sizeof(srcs) - off, " src%d=%s[%s ne=%lldx%lld]%s%s",
+                            j, s->name[0] ? s->name : "(unnamed)", ggml_type_name(s->type),
+                            (long long) s->ne[0], (long long) s->ne[1],
+                            s_nan > 0 ? "=NaN" : (s_nan < 0 ? "=unscannable" : "=clean"),
+                            s_inf > 0 ? "+Inf" : "");
+        }
+    }
+
+    // Report budgets: the origin is what matters, and a poisoned graph produces thousands of
+    // propagation lines that would bury it.
+    static int origin_reports = 0;
+    static int prop_reports   = 0;
+    if (nan_src == 0) {
+        if (origin_reports++ < 16) {
+            GGML_LOG_ERROR("[nanscan] *** NaN ORIGIN%s: '%s' op=%s type=%s ne=[%lld,%lld,%lld,%lld] <- no source held NaN.%s\n",
+                           unknown_src ? " (UNVERIFIED: a source could not be scanned)" : "",
+                           node->name[0] ? node->name : "(unnamed)", ggml_op_name(node->op),
+                           ggml_type_name(node->type),
+                           (long long) node->ne[0], (long long) node->ne[1],
+                           (long long) node->ne[2], (long long) node->ne[3], srcs);
+        }
+    } else if (prop_reports++ < 4) {
+        GGML_LOG_INFO("[nanscan] propagated through '%s' op=%s (%d NaN source(s)) -- not the origin.%s\n",
+                      node->name[0] ? node->name : "(unnamed)", ggml_op_name(node->op), nan_src, srcs);
+    }
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4700,6 +4850,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                ggml_cuda_nanscan_check_node(cuda_ctx, node);  // no-op unless GGML_CUDA_NODE_NANSCAN
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
