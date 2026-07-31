@@ -68,6 +68,51 @@ GGML_BACKEND_API void ggml_cuda_nvfp4_register_weight_global(const char * name, 
 // either double-scale a folded gguf or mis-scale a different unfolded one.
 GGML_BACKEND_API void ggml_cuda_nvfp4_clear_weight_globals(void);
 
+// ---------------------------------------------------------------------------
+// WEIGHT-CONTENT EPOCH.
+//
+// Some CUDA-side caches hold a value DERIVED FROM A WEIGHT'S BYTES under a key that is only
+// the weight's IDENTITY (its ggml name). Identity is the right key for an ADDRESS change --
+// that is what cudnn-weight-key.cuh fixed -- but it is NOT sufficient when the bytes
+// themselves are rewritten while the name stays the same. That happens on every LoRA
+// fold-at-load (SD_LORA_FOLD=1 merges the delta into the params copy in place) and on every
+// unfold (MADV_DONTNEED restores the pristine file bytes at the same address, under the same
+// name). A cache keyed on identity alone serves the pre-fold value to a post-fold weight.
+//
+// ggml cannot observe those mutations. Under weight offload the device bytes are re-uploaded
+// from the host params copy EVERY graph, so "a write happened" is not a usable signal --
+// keying on it would invalidate everything, every graph, for a zero hit rate. The only thing
+// that knows whether a re-upload carried the SAME values is the caller, and it already tracks
+// it: ModelManager::current_lora_epoch_.
+//
+// So the caller registers a PROVIDER once and ggml PULLS the epoch when it needs a key.
+// Deliberately pull, not push: a push API is one more invalidation call at every mutation
+// site that somebody has to remember (the discipline that already failed once here --
+// ggml_cuda_cudnn_conv2d_release_weights() is called from nowhere at all). A provider is
+// registered in one place and thereafter cannot be forgotten.
+//
+// FAIL CLOSED: with no provider registered the epoch is UNKNOWN, and every cache that needs
+// it DISABLES ITSELF rather than risk a stale hit. That costs recomputation, never
+// correctness, and it is logged once so the cost is never silent.
+#define GGML_CUDA_WEIGHT_EPOCH_UNKNOWN ((uint64_t) -1)
+
+typedef uint64_t (*ggml_cuda_weight_epoch_fn)(void * user_data);
+
+// Register (or, with fn == NULL, unregister) the provider. Registration is expected once, at
+// context creation; it is safe to call again to re-point it at another owner.
+GGML_BACKEND_API void ggml_cuda_set_weight_content_epoch_provider(ggml_cuda_weight_epoch_fn fn,
+                                                                  void * user_data);
+
+// Current epoch, or GGML_CUDA_WEIGHT_EPOCH_UNKNOWN when no provider is registered. Mixes the
+// provider's value with ggml's own count of weight mutations it performed itself (see
+// ggml_cuda_weight_content_bump), so the fold entry points below are self-invalidating.
+GGML_BACKEND_API uint64_t ggml_cuda_weight_content_epoch(void);
+
+// Declare that some weight's bytes have just been rewritten. The ggml_cuda_lora_fold_* entry
+// points call this themselves; it is public only for callers that mutate weight bytes WITHOUT
+// going through ggml (a CPU-side fold, or restoring pristine bytes into a mapping).
+GGML_BACKEND_API void ggml_cuda_weight_content_bump(void);
+
 // True iff a mul_mat of the NVFP4 weight named `name` on `backend` is GUARANTEED to be
 // served by the cuBLASLt FP4 path AND that path will apply the registered weight global
 // through the GEMM alpha. Only then may a caller elide its own compensating multiply.

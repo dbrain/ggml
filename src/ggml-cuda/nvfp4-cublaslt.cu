@@ -6,7 +6,9 @@
 //   the stored bytes ARE the standard-e4m3 * standard-e2m1 values cuBLASLt expects.
 //   => alpha = 1.0, weight bytes reused verbatim (only re-laid-out).
 //
-// Repacks (one-time per weight tensor, cached by device pointer):
+// Repacks (per matmul call, into transient pool scratch — NOT cached; the cache this
+// comment used to describe was keyed by device pointer and is gone, see the tombstone
+// above get_lt()):
 //   - scales: contiguous block_nvfp4.d[4] -> cuBLASLt SWIZZLE_32_4_4 layout.
 //   - nibbles: ggml (elem j low / j+8 high within each 16-sub) -> consecutive (2j,2j+1).
 // Activation (src1 f32) is quantized per matmul into the same cuBLASLt layout.
@@ -247,98 +249,76 @@ static float nvfp4_weight_global_for(const char * name) {
     return it == g_wglobal.end() ? 1.0f : it->second;
 }
 
-struct nvfp4_weight_repacked {
-    uint8_t * data   = nullptr;   // consecutive E2M1   (in-place: offset 0 of src0->data)
-    uint8_t * scales = nullptr;   // swizzled UE4M3      (in-place: offset data_bytes)
-    bool      in_place = false;   // true => data/scales alias the ggml-owned src0 buffer
-                                  //         (teardown must NOT cudaFree them)
-};
+// ---------------------------------------------------------------------------
+// Weight-content epoch (see the long rationale in ggml-cuda.h).
+//
+// Two atomics rather than a mutex: this is read once per cached lookup on the GEMM hot path
+// (order 1.3k reads per DiT forward) and written once per context creation. `ud` is stored
+// BEFORE `fn` with release/acquire ordering, so a reader that sees a non-null `fn` is
+// guaranteed to see the matching user data.
+static std::atomic<ggml_cuda_weight_epoch_fn> g_weight_epoch_fn{nullptr};
+static std::atomic<void *>                    g_weight_epoch_ud{nullptr};
 
-static std::mutex                                   g_repack_mtx;
-static std::unordered_map<const void*, nvfp4_weight_repacked> g_repack_cache;
+// Mutations ggml PERFORMS ITSELF do not need the caller's cooperation at all: every
+// ggml_cuda_lora_fold_* entry point bumps this on success, at the exact instruction that
+// rewrites the weight. It is mixed into the epoch below, so a fold invalidates the derived
+// caches whether or not the caller's own bookkeeping noticed. The caller's provider is still
+// required for the mutations ggml cannot see — the CPU fold, and the MADV_DONTNEED unfold,
+// which restores file bytes without going through any ggml call at all.
+static std::atomic<uint64_t> g_weight_content_bumps{0};
 
-// in-place repack default-ON; escape hatch GGML_NVFP4_CUBLASLT_INPLACE=0 forces the
-// old out-of-place (duplicate-buffer) path for debugging / fallback.
-static bool nvfp4_inplace_enabled() {
-    static int v = -1;
-    if (v < 0) { const char* e = getenv("GGML_NVFP4_CUBLASLT_INPLACE"); v = (e && atoi(e)==0) ? 0 : 1; }
-    return v == 1;
+extern "C" void ggml_cuda_weight_content_bump(void) {
+    g_weight_content_bumps.fetch_add(1, std::memory_order_acq_rel);
 }
+
+extern "C" void ggml_cuda_set_weight_content_epoch_provider(ggml_cuda_weight_epoch_fn fn, void * ud) {
+    g_weight_epoch_ud.store(ud, std::memory_order_relaxed);
+    g_weight_epoch_fn.store(fn, std::memory_order_release);
+}
+
+extern "C" uint64_t ggml_cuda_weight_content_epoch(void) {
+    const ggml_cuda_weight_epoch_fn fn = g_weight_epoch_fn.load(std::memory_order_acquire);
+    if (fn == nullptr) {
+        return GGML_CUDA_WEIGHT_EPOCH_UNKNOWN;
+    }
+    const uint64_t caller = fn(g_weight_epoch_ud.load(std::memory_order_relaxed));
+    const uint64_t mine   = g_weight_content_bumps.load(std::memory_order_acquire);
+    // Any injective-enough mix; both halves only ever need to CHANGE, never to be recovered.
+    uint64_t e = caller ^ (mine * 0x9E3779B97F4A7C15ull);
+    if (e == GGML_CUDA_WEIGHT_EPOCH_UNKNOWN) {
+        e = 0;   // never collide with the "no provider" sentinel
+    }
+    return e;
+}
+
+// ---------------------------------------------------------------------------
+// ☠ REMOVED: the pointer-keyed, IN-PLACE weight-repack cache (g_repack_cache +
+// get_repacked_weight() + GGML_NVFP4_CUBLASLT_INPLACE).
+//
+// It had the exact shape of the two caches that later bit us for real -- an
+// std::unordered_map<const void*, ...> keyed on src0->data, with no erase, clear or
+// invalidation anywhere in the tree -- and it was strictly WORSE than either, because a
+// hit did not hand back a side buffer, it ASSERTED that src0's own bytes had already been
+// rewritten into swizzled layout. A recycled staging address, a LoRA fold, or the
+// MADV_DONTNEED unfold would all have made a hit re-read original-layout bytes as if they
+// were swizzled.
+//
+// It never fired: 4fcdd28c ("NVFP4 cuBLASLt repack into transient pool per-call") moved the
+// live path to a per-call pool repack (see step 1 of ggml_cuda_nvfp4_cublaslt_mul_mat_ex)
+// and orphaned this one -- `static`, zero call sites, dead in every build since. The env
+// escape hatch GGML_NVFP4_CUBLASLT_INPLACE was likewise inert: it gated nothing but this
+// dead function, so setting it to 0 changed no behaviour whatsoever.
+//
+// Deleted rather than fixed, so it cannot be re-armed by a future edit that "restores the
+// cache for performance". If a cached repack is ever wanted back, it needs the same
+// treatment cudnn-weight-key.cuh applies -- a stable identity, NOT an address -- PLUS a
+// content epoch, because an in-place repack is invalidated by a content change even under
+// an unchanged identity. See the fp8 weight-scale cache below for that pattern.
 
 static thread_local cublasLtHandle_t g_lt = nullptr;
 static cublasLtHandle_t get_lt() {
     if (!g_lt) { if (cublasLtCreate(&g_lt) != CUBLAS_STATUS_SUCCESS) return nullptr; }
     return g_lt;
-}
-
-// per-tensor weight repack (cached). Returns false on failure.
-static bool get_repacked_weight(const ggml_tensor * src0, int N, int K, cudaStream_t stream,
-                                nvfp4_weight_repacked & out) {
-    const void * key = src0->data;
-    // Hold the lock across the whole (one-time, warmup) repack: the in-place path overwrites
-    // src0->data, so two threads repacking the SAME key concurrently would corrupt each other.
-    // Cached entries (the hot per-step path) return early in the caller-visible fast path below.
-    std::lock_guard<std::mutex> lk(g_repack_mtx);
-    {
-        auto it = g_repack_cache.find(key);
-        if (it != g_repack_cache.end()) { out = it->second; return true; }
-    }
-    const int nsub = K/16;
-    const size_t data_bytes  = (size_t)N*(K/2);
-    const size_t rb_p = ((size_t)(N+127)/128)*128;
-    const size_t cb_p = ((size_t)(nsub+3)/4)*4;
-    const size_t scale_bytes = rb_p*cb_p;
-    const size_t repack_bytes = data_bytes + scale_bytes;
-
-    // The DiT runs 100% on cuBLASLt (no MMQ fallback), so once a weight is repacked its
-    // original block_nvfp4 layout is never read again -> the repacked bytes can live in the
-    // ggml-owned buffer, eliminating the duplicate. Repack is a re-layout of the SAME values,
-    // so data+scales should fit in ggml_nbytes(src0); VERIFY at runtime per-weight.
-    const size_t orig_bytes = ggml_nbytes(src0);
-    const bool   fits = (repack_bytes <= orig_bytes);
-    const bool   want_inplace = nvfp4_inplace_enabled() && fits;
-
-    nvfp4_weight_repacked rp;
-    const int threads = 256;
-    const int total   = N*nsub;
-
-    if (want_inplace) {
-        // read-after-write hazard (repack permutes both nibbles & scales) forces a transient
-        // scratch: original -> scratch, then scratch -> src0->data in-place. The scratch is
-        // freed immediately (never accumulates), so net VRAM cost over baseline is ~0.
-        uint8_t * scratch = nullptr;
-        if (cudaMalloc(&scratch, repack_bytes) != cudaSuccess) return false; // OOM: caller falls back
-        uint8_t * s_data   = scratch;
-        uint8_t * s_scales = scratch + data_bytes;
-        cudaMemsetAsync(s_scales, 0, scale_bytes, stream);
-        repack_weight_kernel<<<(total+threads-1)/threads, threads, 0, stream>>>(
-            (const block_nvfp4*)src0->data, s_data, s_scales, N, K);
-        if (cudaPeekAtLastError() != cudaSuccess) { cudaFree(scratch); return false; }
-        // copy repacked bytes back into the ORIGINAL ggml buffer (data@0, scales@data_bytes).
-        cudaMemcpyAsync(src0->data, scratch, repack_bytes, cudaMemcpyDeviceToDevice, stream);
-        cudaStreamSynchronize(stream);   // must finish before scratch is freed
-        cudaFree(scratch);
-        rp.data     = (uint8_t*)src0->data;
-        rp.scales   = (uint8_t*)src0->data + data_bytes;
-        rp.in_place = true;
-    } else {
-        // out-of-place fallback (env-forced, or repack doesn't fit the original buffer):
-        // hold a duplicate persistent buffer for this weight.
-        if (cudaMalloc(&rp.data, data_bytes)   != cudaSuccess) return false;
-        if (cudaMalloc(&rp.scales, scale_bytes)!= cudaSuccess) { cudaFree(rp.data); return false; }
-        cudaMemsetAsync(rp.scales, 0, scale_bytes, stream);
-        repack_weight_kernel<<<(total+threads-1)/threads, threads, 0, stream>>>(
-            (const block_nvfp4*)src0->data, rp.data, rp.scales, N, K);
-        if (cudaPeekAtLastError() != cudaSuccess) { cudaFree(rp.data); cudaFree(rp.scales); return false; }
-        cudaStreamSynchronize(stream);
-        rp.in_place = false;
-        if (getenv("GGML_NVFP4_CUBLASLT_TRACE"))
-            fprintf(stderr, "[NVFP4_CUBLASLT] out-of-place weight N=%d K=%d (repack %zu > orig %zu, "
-                            "or inplace disabled)\n", N, K, repack_bytes, orig_bytes);
-    }
-    g_repack_cache[key] = rp;   // lock held for the whole function (see top)
-    out = rp;
-    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,9 +1039,59 @@ static __global__ void fp8_set_scalar_kernel(float * __restrict__ p, float v) { 
 // address. `w_global` is folded into the amax, so the cache must die whenever the registered
 // globals do — it is cleared from ggml_cuda_nvfp4_clear_weight_globals(), the existing
 // model-load / variant-swap hook.
-// Off-switch: GGML_FP8_WEIGHT_SCALE_CACHE=0 (then every call recomputes the amax as before).
-static std::mutex                             g_fp8_wscale_mtx;
-static std::unordered_map<std::string, float> g_fp8_wscale;
+//
+// ★ NAME IS NOT ENOUGH ON ITS OWN, and that is the whole point of the epoch below.
+// The amax is a function of the weight's BYTES; the name is a function of its identity. Those
+// come apart the moment anything rewrites a weight in place under an unchanged name, which is
+// exactly what SD_LORA_FOLD=1 does (ModelManager::fold_loras_into_params merges the delta into
+// the params copy) and what the unfold does in reverse (MADV_DONTNEED restores the pristine
+// file bytes). Order the two and the bug is plain: a worker serves one render with no adapter
+// (this cache fills from PRISTINE weights), then a render WITH one (fold rewrites the bytes,
+// the name is unchanged, every GEMM replays the pristine scale over folded weights).
+//
+// The NVFP4 fold freezes the UE4M3 block-scale grid — see ggml_cuda_lora_fold_nvfp4 — so the
+// error is BOUNDED, not unbounded: the amax can only move by whichever E2M1 code the argmax
+// block's largest element lands on, so the stale scale is wrong by at most one code step. Too
+// small and the largest weights clamp at 448 on promotion; too large and every weight loses a
+// fraction of a bit. It is a numeric drift, not the magenta-noise class of failure the cuDNN
+// twin produced. It is still ORDER-DEPENDENT — the same request returns different pixels
+// depending on what the worker rendered before it — which is precisely the property that makes
+// a fold-vs-runtime A/B unreadable, so it is fixed rather than tolerated.
+//
+// The epoch is PULLED from the caller (ggml_cuda_weight_content_epoch), not pushed by it, and
+// it is stored ON the entry rather than concatenated into the key — so a new epoch OVERWRITES
+// the entry it invalidates instead of accumulating a fresh copy of the whole map per epoch.
+//
+// FAIL CLOSED: no provider => epoch UNKNOWN => the cache is not used at all. The cost is one
+// extra full read of the weight per GEMM, i.e. what this path did before the cache existed;
+// it is warned about once so it can never be a silent regression.
+//
+// Off-switch:   GGML_FP8_WEIGHT_SCALE_CACHE=0  — recompute the amax every call, as before.
+// Control arm:  GGML_FP8_WSCALE_NOEPOCH=1      — restore the OLD name-only key exactly (pins the
+//               epoch to 0 for both store and compare). This is the arm that REPRODUCES the
+//               staleness across a fold/unfold boundary; it is not a supported configuration,
+//               it exists so the fix can be A/B'd against the bug.
+// Counters:     GGML_FP8_WSCALE_STATS=1        — dump hit/miss on every epoch change, on clear
+//               and at exit. >1 additionally dumps every N lookups.
+struct fp8_wscale_entry {
+    uint64_t epoch = GGML_CUDA_WEIGHT_EPOCH_UNKNOWN;
+    float    scale = 0.0f;
+};
+
+static std::mutex                                        g_fp8_wscale_mtx;
+static std::unordered_map<std::string, fp8_wscale_entry> g_fp8_wscale;
+
+static std::atomic<uint64_t> g_fp8_wscale_hits      {0};
+static std::atomic<uint64_t> g_fp8_wscale_miss_cold {0};   // name never seen (or evicted by a clear)
+static std::atomic<uint64_t> g_fp8_wscale_miss_epoch{0};   // name seen, but its bytes have changed
+static std::atomic<uint64_t> g_fp8_wscale_bypass    {0};   // epoch UNKNOWN => cache refused
+// Of the epoch misses, how many actually produced a DIFFERENT scalar -- i.e. how many stale
+// hits the old key would have served that were numerically wrong, not merely unproven. Own
+// mutex (a double cannot ride an atomic here), taken INSIDE g_fp8_wscale_mtx on the write
+// path and alone on the dump path, so the order is always wscale -> moved.
+static std::mutex g_fp8_wscale_moved_mtx;
+static uint64_t   g_fp8_wscale_moved         = 0;
+static double     g_fp8_wscale_moved_max_rel = 0.0;
 
 static bool ggml_cuda_fp8_wscale_cache_enabled() {
     static int v = -1;
@@ -1069,9 +1099,92 @@ static bool ggml_cuda_fp8_wscale_cache_enabled() {
     return v == 1;
 }
 
-void ggml_cuda_fp8_weight_scale_cache_clear(void) {
+// Control arm only — see the header above.
+static bool ggml_cuda_fp8_wscale_noepoch() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_FP8_WSCALE_NOEPOCH"); v = (e && atoi(e) != 0) ? 1 : 0; }
+    return v == 1;
+}
+
+static uint64_t ggml_cuda_fp8_wscale_stats(void) {
+    static uint64_t v = (uint64_t) -1;
+    if (v == (uint64_t) -1) {
+        const char * e = getenv("GGML_FP8_WSCALE_STATS");
+        const long   n = (e && *e) ? atol(e) : 0;
+        v = n > 0 ? (uint64_t) n : 0;
+    }
+    return v;
+}
+
+// `entries` is passed in rather than read here so this function never needs g_fp8_wscale_mtx:
+// its callers already know the size (they were just holding the lock), and keeping the two
+// locks disjoint means a dump can never be the thing that deadlocks a render.
+static void ggml_cuda_fp8_wscale_dump(const char * why, size_t entries) {
+    if (ggml_cuda_fp8_wscale_stats() == 0) {
+        return;
+    }
+    const uint64_t h  = g_fp8_wscale_hits.load(std::memory_order_relaxed);
+    const uint64_t mc = g_fp8_wscale_miss_cold.load(std::memory_order_relaxed);
+    const uint64_t me = g_fp8_wscale_miss_epoch.load(std::memory_order_relaxed);
+    const uint64_t bp = g_fp8_wscale_bypass.load(std::memory_order_relaxed);
+    const uint64_t n  = h + mc + me + bp;
+    uint64_t moved     = 0;
+    double   moved_rel = 0.0;
+    {
+        std::lock_guard<std::mutex> lk(g_fp8_wscale_moved_mtx);
+        moved     = g_fp8_wscale_moved;
+        moved_rel = g_fp8_wscale_moved_max_rel;
+    }
+    fprintf(stderr,
+            "[fp8-wscale] %-14s lookups=%llu hit=%llu (%.1f%%) miss_cold=%llu miss_epoch=%llu "
+            "bypass_unknown_epoch=%llu entries=%zu epoch=%llu | scalar_moved=%llu max_rel=%.6g\n",
+            why, (unsigned long long) n, (unsigned long long) h,
+            n ? 100.0 * (double) h / (double) n : 0.0,
+            (unsigned long long) mc, (unsigned long long) me, (unsigned long long) bp,
+            entries, (unsigned long long) ggml_cuda_weight_content_epoch(),
+            (unsigned long long) moved, moved_rel);
+}
+
+static size_t ggml_cuda_fp8_wscale_size(void) {
     std::lock_guard<std::mutex> lk(g_fp8_wscale_mtx);
-    g_fp8_wscale.clear();
+    return g_fp8_wscale.size();
+}
+
+// Called after every lookup, with the cache mutex NOT held. Installs the at-exit dump on first
+// use, and — with GGML_FP8_WSCALE_STATS=N, N>1 — prints a running line every N lookups. The
+// server is long-lived and usually dies by signal, so the epoch-change and periodic dumps are
+// the ones a GPU run can actually rely on seeing.
+static void ggml_cuda_fp8_wscale_stats_tick(void) {
+    const uint64_t every = ggml_cuda_fp8_wscale_stats();
+    if (every == 0) {
+        return;
+    }
+    static std::atomic<bool> at_installed{false};
+    if (!at_installed.exchange(true)) {
+        atexit([] { ggml_cuda_fp8_wscale_dump("exit", ggml_cuda_fp8_wscale_size()); });
+    }
+    if (every < 2) {
+        return;
+    }
+    static std::atomic<uint64_t> last{0};
+    const uint64_t n = g_fp8_wscale_hits.load(std::memory_order_relaxed) +
+                       g_fp8_wscale_miss_cold.load(std::memory_order_relaxed) +
+                       g_fp8_wscale_miss_epoch.load(std::memory_order_relaxed) +
+                       g_fp8_wscale_bypass.load(std::memory_order_relaxed);
+    uint64_t prev = last.load(std::memory_order_relaxed);
+    if (n >= prev + every && last.compare_exchange_strong(prev, n, std::memory_order_relaxed)) {
+        ggml_cuda_fp8_wscale_dump("periodic", ggml_cuda_fp8_wscale_size());
+    }
+}
+
+void ggml_cuda_fp8_weight_scale_cache_clear(void) {
+    size_t entries = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_fp8_wscale_mtx);
+        entries = g_fp8_wscale.size();
+        g_fp8_wscale.clear();
+    }
+    ggml_cuda_fp8_wscale_dump("clear", entries);
 }
 
 bool ggml_cuda_fp8_ffn_enabled() {
@@ -1585,13 +1698,64 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
         if (grid > 65535u) grid = 65535u;
         if (grid == 0)     grid = 1;
 
-        const bool   wsc_cache = ggml_cuda_fp8_wscale_cache_enabled() && !capturing && src0->name[0] != '\0';
+        // Content epoch: the second half of this cache's key. See the block header above --
+        // the name says WHICH weight, the epoch says WHICH BYTES, and a LoRA fold/unfold
+        // changes the second without touching the first.
+        const bool     wsc_noepoch = ggml_cuda_fp8_wscale_noepoch();
+        const uint64_t wsc_epoch   = wsc_noepoch ? 0 : ggml_cuda_weight_content_epoch();
+        const bool     wsc_known   = wsc_epoch != GGML_CUDA_WEIGHT_EPOCH_UNKNOWN;
+
+        // FAIL CLOSED, LOUDLY ONCE: nobody registered a provider, so we cannot tell a
+        // re-upload of the same values from a fold that changed them. Recompute every time.
+        if (!wsc_known && ggml_cuda_fp8_wscale_cache_enabled()) {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                fprintf(stderr,
+                        "[fp8-wscale] no weight-content-epoch provider registered -- the per-tensor "
+                        "e4m3 weight-scale cache is DISABLED (one extra full read of every weight "
+                        "per GEMM). Call ggml_cuda_set_weight_content_epoch_provider() at context "
+                        "creation to re-enable it.\n");
+            }
+        }
+
+        const bool   wsc_cache = ggml_cuda_fp8_wscale_cache_enabled() && !capturing &&
+                                 src0->name[0] != '\0' && wsc_known;
         bool         wsc_have  = false;
         float        wsc_val   = 0.0f;
+        // Set on an epoch miss so the recompute below can be COMPARED with the value the old
+        // epoch's bytes produced. That comparison is the whole measurement: it says, per
+        // tensor, whether a fold/unfold actually moved this scalar, i.e. whether the stale hit
+        // this fix prevents would have been numerically wrong or merely theoretically wrong.
+        bool  wsc_prev_valid = false;
+        float wsc_prev       = 0.0f;
         if (wsc_cache) {
-            std::lock_guard<std::mutex> lk(g_fp8_wscale_mtx);
-            auto it = g_fp8_wscale.find(src0->name);
-            if (it != g_fp8_wscale.end()) { wsc_val = it->second; wsc_have = true; }
+            size_t   dump_entries = 0;
+            bool     dump_epoch   = false;
+            {
+                std::lock_guard<std::mutex> lk(g_fp8_wscale_mtx);
+                auto it = g_fp8_wscale.find(src0->name);
+                if (it == g_fp8_wscale.end()) {
+                    g_fp8_wscale_miss_cold.fetch_add(1, std::memory_order_relaxed);
+                } else if (it->second.epoch != wsc_epoch) {
+                    // The bytes behind this name were rewritten (fold, unfold, or a re-fold at a
+                    // new multiplier). The scalar it produced no longer describes them.
+                    g_fp8_wscale_miss_epoch.fetch_add(1, std::memory_order_relaxed);
+                    wsc_prev_valid = true;
+                    wsc_prev       = it->second.scale;
+                    dump_epoch     = true;
+                    dump_entries   = g_fp8_wscale.size();
+                } else {
+                    wsc_val  = it->second.scale;
+                    wsc_have = true;
+                    g_fp8_wscale_hits.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            if (dump_epoch) {
+                ggml_cuda_fp8_wscale_dump("epoch-change", dump_entries);
+            }
+            ggml_cuda_fp8_wscale_stats_tick();
+        } else if (ggml_cuda_fp8_wscale_cache_enabled() && !capturing && src0->name[0] != '\0') {
+            g_fp8_wscale_bypass.fetch_add(1, std::memory_order_relaxed);
         }
         if (wsc_have) {
             // replay the byte-identical scalar; skips a full read of the NVFP4 weight
@@ -1601,13 +1765,28 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
             fp8_w_amax_kernel<<<grid, threads, 0, stream>>>((const block_nvfp4*)src0->data, w_amax_d, N, K, w_global);
             fp8_scale_from_amax<<<1, 1, 0, stream>>>(w_amax_d, w_scale_d);
             if (wsc_cache) {
-                // one-off readback per weight (~1.3k over a render) so every later call replays
-                // the SAME bits instead of re-deriving them.
+                // one-off readback per weight per epoch (~1.3k over a render) so every later call
+                // replays the SAME bits instead of re-deriving them. Stamped with the epoch these
+                // bytes belong to; the next epoch overwrites this entry rather than adding one.
                 float h = 0.0f;
                 if (cudaMemcpyAsync(&h, w_scale_d, sizeof(float), cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
                     cudaStreamSynchronize(stream) == cudaSuccess) {
                     std::lock_guard<std::mutex> lk(g_fp8_wscale_mtx);
-                    g_fp8_wscale[src0->name] = h;
+                    g_fp8_wscale[src0->name] = fp8_wscale_entry{ wsc_epoch, h };
+                    if (wsc_prev_valid && h != wsc_prev) {
+                        // The old epoch's scalar was NOT the new epoch's scalar. Under the old
+                        // name-only key this weight would have been promoted to e4m3 with the
+                        // wrong scale for the rest of the render.
+                        const double denom = std::fabs((double) wsc_prev);
+                        const double rel   = denom > 0.0
+                                                 ? std::fabs((double) h - (double) wsc_prev) / denom
+                                                 : 1.0;
+                        std::lock_guard<std::mutex> mlk(g_fp8_wscale_moved_mtx);
+                        g_fp8_wscale_moved++;
+                        if (rel > g_fp8_wscale_moved_max_rel) {
+                            g_fp8_wscale_moved_max_rel = rel;
+                        }
+                    }
                 }
             }
         }
