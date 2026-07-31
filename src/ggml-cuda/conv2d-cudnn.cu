@@ -12,6 +12,7 @@
 
 #ifdef GGML_CUDNN
 
+#include "cudnn-conv-gate.cuh"
 #include "cudnn-weight-key.cuh"
 
 #include <cuda_fp16.h>
@@ -380,7 +381,9 @@ bool ggml_cuda_op_conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     // supports_op already gate on the pair. Without CONV3D here, a GGML_OP_CONV_2D emitted
     // under GGML_CUDNN_CONV3D (e.g. explicit vae_conv_direct) fell through to the naive
     // conv2d_kernel instead of this validated cuDNN implicit-GEMM path.
-    if (!getenv("GGML_CUDNN_CONV") && !getenv("GGML_CUDNN_CONV3D")) return false;
+    // Value-honouring, not presence-only: GGML_CUDNN_CONV=0 must actually turn this off. See
+    // cudnn-conv-gate.cuh -- the presence test this replaces meant `=0` ENABLED the borrow.
+    if (!ggml_cudnn_conv2d_enabled()) return false;
 
     const ggml_tensor * kernel = dst->src[0];
     const ggml_tensor * input  = dst->src[1];

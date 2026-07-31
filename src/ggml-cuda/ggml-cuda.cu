@@ -20,6 +20,7 @@
 #include "ggml-cuda/conv2d-transpose.cuh"
 #include "ggml-cuda/conv3d.cuh"
 #include "ggml-cuda/conv2d-cudnn.cuh"
+#include "ggml-cuda/cudnn-conv-gate.cuh"
 #include "ggml-cuda/conv3d-cudnn.cuh"
 #include "ggml-cuda/convert.cuh"
 #include "ggml-cuda/count-equal.cuh"
@@ -7104,7 +7105,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]));
         case GGML_OP_CONV_3D:
             if (ggml_cuda_conv3d_cudnn_available() &&
-                (getenv("GGML_CUDNN_CONV3D") || getenv("GGML_CUDNN_CONV")) &&
+                ggml_cudnn_conv3d_enabled() &&
                 ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
                 (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
                 (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32) &&
