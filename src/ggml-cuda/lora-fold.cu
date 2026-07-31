@@ -323,6 +323,10 @@ bool ggml_cuda_lora_fold_nvfp4_dev(void * d_blocks, int64_t in, int64_t out, flo
     }
     LF_TOCK(g_prof.kern_ms, t);
     g_prof.n++;
+    // This weight's bytes are now DIFFERENT under the SAME name. Anything caching a value
+    // derived from them (the e4m3 weight-scale cache) must not serve its old answer. Bumped
+    // here rather than left to the caller: this is the instruction that changed the bytes.
+    ggml_cuda_weight_content_bump();
     return true;
 }
 
@@ -396,6 +400,7 @@ bool ggml_cuda_lora_fold_dense_dev(void * d_weight, enum ggml_type type, int64_t
     }
     LF_TOCK(g_prof.kern_ms, t);
     g_prof.n++;
+    ggml_cuda_weight_content_bump();   // same reason as the NVFP4 fold above
     return true;
 }
 
