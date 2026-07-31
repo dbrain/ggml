@@ -16,6 +16,7 @@
 
 #ifdef GGML_CUDNN
 
+#include "cudnn-conv-gate.cuh"
 #include "cudnn-weight-key.cuh"
 
 #include <cuda_fp16.h>
@@ -681,7 +682,9 @@ static float * get_or_build_weight3d_f32(const ggml_tensor * kernel, int device,
 }
 
 bool ggml_cuda_op_conv3d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    if (!getenv("GGML_CUDNN_CONV3D") && !getenv("GGML_CUDNN_CONV")) return false;
+    // Value-honouring, not presence-only: GGML_CUDNN_CONV3D=0 must actually turn this off.
+    // See cudnn-conv-gate.cuh.
+    if (!ggml_cudnn_conv3d_enabled()) return false;
 
     const ggml_tensor * kernel = dst->src[0];   // ne=[KW,KH,KD,c*oc]
     const ggml_tensor * input  = dst->src[1];   // ne=[W,H,D,c*n]
