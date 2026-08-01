@@ -20,7 +20,17 @@ __global__ void sa3_cast_q_f32(const float * in, half * out, size_t n) {
     if (i < n) out[i] = __float2half_rn(in[i]);
 }
 
-__global__ void sa3_cast_q_f32_pad(const float * in, half * out, int l, int lr, int heads) {
+// GQA source-head map. The adapter always works on a contiguous run of `head_group` QUERY
+// heads starting at `head_start`, and materialises one padded plane per query head. Q reads
+// its own head (gqa_ratio == 1); K/V read the KV head that query head shares, which is
+// (head_start + h) / gqa_ratio. Callers therefore pass the UNOFFSET tensor base — offsetting
+// the pointer by a query-head index is exactly the out-of-bounds read that this replaces.
+__device__ __forceinline__ int sa3_src_head(int h, int head_start, int gqa_ratio) {
+    return (head_start + h) / gqa_ratio;
+}
+
+__global__ void sa3_cast_q_f32_pad(const float * in, half * out, int l, int lr, int heads,
+                                   int head_start, int gqa_ratio) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     const size_t n = (size_t) heads * lr * kHeadDim;
     if (i < n) {
@@ -28,11 +38,13 @@ __global__ void sa3_cast_q_f32_pad(const float * in, half * out, int l, int lr, 
         const size_t token = i / kHeadDim;
         const int h = token / lr;
         const int t = token % lr;
-        out[i] = __float2half_rn(t < l ? in[((size_t) h * l + t) * kHeadDim + d] : 0.0f);
+        const int sh = sa3_src_head(h, head_start, gqa_ratio);
+        out[i] = __float2half_rn(t < l ? in[((size_t) sh * l + t) * kHeadDim + d] : 0.0f);
     }
 }
 
-__global__ void sa3_pad_f16(const half * in, half * out, int l, int lr, int heads) {
+__global__ void sa3_pad_f16(const half * in, half * out, int l, int lr, int heads,
+                            int head_start, int gqa_ratio) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     const size_t n = (size_t) heads * lr * kHeadDim;
     if (i < n) {
@@ -40,16 +52,21 @@ __global__ void sa3_pad_f16(const half * in, half * out, int l, int lr, int head
         const size_t token = i / kHeadDim;
         const int h = token / lr;
         const int t = token % lr;
-        out[i] = t < l ? in[((size_t) h * l + t) * kHeadDim + d] : __float2half(0.0f);
+        const int sh = sa3_src_head(h, head_start, gqa_ratio);
+        out[i] = t < l ? in[((size_t) sh * l + t) * kHeadDim + d] : __float2half(0.0f);
     }
 }
 
-__global__ void sa3_k_mean(const half * k, float * mean, int l) {
+// `mean` is indexed by the OUTPUT (query) head h, so under GQA the same KV head's mean is
+// recomputed gqa_ratio times. That redundancy is the deliberate cost of keeping the CUTLASS
+// launch strictly h == h_k; see the h_h_k_ratio note in sa3_run().
+__global__ void sa3_k_mean(const half * k, float * mean, int l, int head_start, int gqa_ratio) {
     const int d = blockIdx.x;
     const int h = blockIdx.y;
+    const int sh = sa3_src_head(h, head_start, gqa_ratio);
     float sum = 0.0f;
     for (int t = threadIdx.x; t < l; t += blockDim.x) {
-        sum += __half2float(k[((size_t) h * l + t) * kHeadDim + d]);
+        sum += __half2float(k[((size_t) sh * l + t) * kHeadDim + d]);
     }
     __shared__ float partial[256];
     partial[threadIdx.x] = sum;
@@ -70,7 +87,8 @@ __global__ void sa3_center_k(const half * in, const float * mean, half * out, si
     }
 }
 
-__global__ void sa3_center_k_pad(const half * in, const float * mean, half * out, int l, int lr, int heads) {
+__global__ void sa3_center_k_pad(const half * in, const float * mean, half * out, int l, int lr, int heads,
+                                 int head_start, int gqa_ratio) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     const size_t n = (size_t) heads * lr * kHeadDim;
     if (i < n) {
@@ -78,13 +96,20 @@ __global__ void sa3_center_k_pad(const half * in, const float * mean, half * out
         const size_t token = i / kHeadDim;
         const int h = token / lr;
         const int t = token % lr;
-        out[i] = t < l ? __float2half_rn(__half2float(in[((size_t) h * l + t) * kHeadDim + d]) - mean[h * kHeadDim + d]) : __float2half(0.0f);
+        const int sh = sa3_src_head(h, head_start, gqa_ratio);
+        out[i] = t < l ? __float2half_rn(__half2float(in[((size_t) sh * l + t) * kHeadDim + d]) - mean[h * kHeadDim + d]) : __float2half(0.0f);
     }
 }
 
 // One CTA computes a Q mean for one [head, 128-token block, channel].  The
 // subsequent centering pass preserves the original BHSD physical layout.
-__global__ void sa3_q_block_mean(const half * q, half * mean, int l, int blocks) {
+//
+// `valid_l` is the UNPADDED query length. `q` here is the already-padded scratch plane, so the
+// tail block is backed by real zeros; dividing that block by the full kTokenBlock would shrink
+// its mean toward zero and defeat the whole point of the block mean (narrowing Q's FP4 dynamic
+// range). LTX never noticed: 32,640 / 128 = 255 exactly, so it has no tail block. Krea-2 does —
+// 4,125 = 32*128 + 29 — and that tail block is the TEXT tokens.
+__global__ void sa3_q_block_mean(const half * q, half * mean, int l, int blocks, int valid_l) {
     const int d = blockIdx.x;
     const int qb = blockIdx.y;
     const int h = blockIdx.z;
@@ -98,7 +123,8 @@ __global__ void sa3_q_block_mean(const half * q, half * mean, int l, int blocks)
         __syncthreads();
     }
     if (threadIdx.x == 0) {
-        mean[((size_t) h * blocks + qb) * kHeadDim + d] = __float2half_rn(partial[0] / kTokenBlock);
+        const int valid = min(kTokenBlock, max(1, valid_l - qb * kTokenBlock));
+        mean[((size_t) h * blocks + qb) * kHeadDim + d] = __float2half_rn(partial[0] / valid);
     }
 }
 
@@ -286,12 +312,44 @@ __global__ void sa3_lse_to_dst(const float * __restrict__ lse_src, const TQ * __
 // The shape/dtype contract. `allow_rect` relaxes ONLY the Lq == Lkv requirement and is set
 // exclusively by the LSE entry point, so the production GGML_OP_FLASH_ATTN_EXT route keeps
 // rejecting precisely what it rejected before (notably LTX's cross-attention).
+// Minimum K/V sequence length SA3 will accept. See the scope note inside sa3_contract_ok().
+//
+// ⚠️ 768, NOT a rounder-looking 2048, and the difference is a MEASURED LTX regression. A 1280x704
+// 97-frame LTX render dispatches its DiT attention at L=11440 but ALSO issues D=128, 32-head,
+// mask-free, contiguous F16 attentions at **L=1024** — which satisfy every other clause here, so
+// they were served by SA3 before this gate existed. A 2048 floor silently moved them to cuDNN and
+// made LTX output non-identical for no reason. 768 clears every krea2 shape we mean to exclude
+// (text tower L=29, Qwen3-VL vision tower L=580) while leaving LTX exactly as it was.
+//
+// Verify after ANY change here by counting "[sa3] reject" against a real LTX render: a reject at
+// an L that LTX previously served is a regression, not a tightening.
+static int sa3_min_lkv() {
+    static const int v = [] {
+        const char * e = getenv("GGML_LTX_SA3_MIN_LKV");
+        const int parsed = e ? atoi(e) : 0;
+        return parsed > 0 ? parsed : 768;
+    }();
+    return v;
+}
+
 static bool sa3_contract_ok(int cc, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v,
                             const ggml_tensor * mask, ggml_type o_type, bool o_contiguous,
                             float max_bias, float softcap, bool allow_rect) {
+    // ⚠️ `q->ne[2] == 32` used to stand here, and it was doing TWO jobs: matching the kernel's
+    // (nonexistent) head requirement, and — accidentally — scoping SA3 to the LTX DiT. The
+    // CUTLASS kernel never templated on head count, so the first job was imaginary; the second
+    // was real. Widening this to GQA therefore has to REPLACE the accidental scope with a
+    // deliberate one, or SA3 starts capturing every other D=128 attention in the process —
+    // notably Krea-2's own text tower (20 heads, L~29), where padding 29 tokens to a 128-token
+    // block and running the full quantise/delta/copy pipeline is a guaranteed net loss.
+    // Hence the minimum-Lkv gate: SA3 only pays off once the O(L^2) attention it replaces
+    // dominates its own O(L*H) preprocessing.
+    const int min_lkv = sa3_min_lkv();
     return cc >= GGML_CUDA_CC_BLACKWELL && mask == nullptr &&
         q->ne[0] == kHeadDim && (allow_rect || q->ne[1] == k->ne[1]) && k->ne[1] == v->ne[1] &&
-        q->ne[2] == 32 && k->ne[2] == 32 && v->ne[2] == 32 && q->ne[3] == 1 &&
+        k->ne[1] >= min_lkv &&
+        q->ne[2] >= 1 && k->ne[2] >= 1 && k->ne[2] == v->ne[2] &&
+        q->ne[2] % k->ne[2] == 0 && q->ne[3] == 1 &&
         k->ne[3] == 1 && v->ne[3] == 1 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
         (q->type == GGML_TYPE_F16 || q->type == GGML_TYPE_F32) && (o_type == GGML_TYPE_F16 || o_type == GGML_TYPE_F32) &&
         max_bias == 0.0f && softcap == 0.0f && ggml_is_contiguous(q) && ggml_is_contiguous(k) &&
@@ -306,7 +364,8 @@ static bool sa3_contract_ok(int cc, const ggml_tensor * q, const ggml_tensor * k
 static void sa3_run(ggml_backend_cuda_context & ctx,
                     const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v,
                     void * o, bool o_f32, float * lse_dst, float scale) {
-    const int total_h = 32;
+    const int total_h   = (int) q->ne[2];
+    const int gqa_ratio = (int) (q->ne[2] / k->ne[2]);
     // Q and K/V lengths are independent: the relay's segment merge calls this with a full
     // query set against one slice of the keys. Each side is padded to its own multiple of
     // the 128-token block; the CUTLASS kernel already grids M over ceil(seqlen_q/kBlockM)
@@ -317,7 +376,18 @@ static void sa3_run(ggml_backend_cuda_context & ctx,
     int head_group = total_h;
     if (const char * e = getenv("GGML_LTX_SA3_HEAD_GROUP")) {
         const int requested = atoi(e);
-        if (requested > 0 && requested <= total_h && total_h % requested == 0) head_group = requested;
+        if (requested > 0 && requested <= total_h && total_h % requested == 0) {
+            head_group = requested;
+        } else {
+            // Silently falling back to total_h is a VRAM cliff, not a nicety: at 48 heads that
+            // is ~280 MiB of scratch instead of ~47 MiB. Say so.
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                fprintf(stderr, "[sa3] GGML_LTX_SA3_HEAD_GROUP=%d ignored (must divide %d); using %d\n",
+                        requested, total_h, total_h);
+            }
+        }
     }
     const size_t elems_q        = (size_t) head_group * lq  * kHeadDim;   // unpadded Q/O
     const size_t elems_q_padded = (size_t) head_group * lqr * kHeadDim;
@@ -360,23 +430,30 @@ static void sa3_run(ggml_backend_cuda_context & ctx,
     q4.alloc((size_t) head_group * lqr * kHeadDim / 2); k4.alloc((size_t) head_group * lkr * kHeadDim / 2); v4.alloc((size_t) head_group * kHeadDim * lkr / 2);
     sfq.alloc((size_t) head_group * lqr * kHeadDim / 16); sfk.alloc((size_t) head_group * lkr * kHeadDim / 16); sfv.alloc((size_t) head_group * kHeadDim * lkr / 16);
     for (int head_start = 0; head_start < total_h; head_start += head_group) {
+        // ⚠️ The tensor bases are passed UNOFFSET and the per-head source index is resolved
+        // inside each kernel by sa3_src_head(). Offsetting k/v by a QUERY-head index (what this
+        // did before) is correct only when H_kv == H_q; under GQA it walks gqa_ratio times past
+        // the end of K and V. Out-of-range TMA reads are clamped, not trapped, so that bug
+        // produces wrong pixels at a plausible speed rather than a crash.
+        const float * q_f32 = static_cast<const float *>(q->data);
+        const half * k_f16 = static_cast<const half *>(k->data);
+        const half * v_f16 = static_cast<const half *>(v->data);
+        // Q alone may still be offset by a query-head index — that IS its own head index. Used
+        // only by the LSE tail below, which indexes Q with a group-local head. K/V must never
+        // be offset this way; that is what sa3_src_head() exists for.
         const size_t q_head_offset = (size_t) head_start * lq * kHeadDim;
-        const size_t k_head_offset = (size_t) head_start * lk * kHeadDim;
-        const float * q_f32 = static_cast<const float *>(q->data) + q_head_offset;
-        const half * k_f16 = static_cast<const half *>(k->data) + k_head_offset;
-        const half * v_f16 = static_cast<const half *>(v->data) + k_head_offset;
-        if (q->type == GGML_TYPE_F32) sa3_cast_q_f32_pad<<<(elems_q_padded + 255) / 256, 256, 0, stream>>>(q_f32, scratch.get(), lq, lqr, head_group);
-        else sa3_pad_f16<<<(elems_q_padded + 255) / 256, 256, 0, stream>>>((const half *) q->data + q_head_offset, scratch.get(), lq, lqr, head_group);
+        if (q->type == GGML_TYPE_F32) sa3_cast_q_f32_pad<<<(elems_q_padded + 255) / 256, 256, 0, stream>>>(q_f32, scratch.get(), lq, lqr, head_group, head_start, 1);
+        else sa3_pad_f16<<<(elems_q_padded + 255) / 256, 256, 0, stream>>>((const half *) q->data, scratch.get(), lq, lqr, head_group, head_start, 1);
         check_stage("Q cast");
-        sa3_k_mean<<<dim3(kHeadDim, head_group), 256, 0, stream>>>(k_f16, k_mean.get(), lk);
-        sa3_q_block_mean<<<dim3(kHeadDim, qblocks, head_group), kTokenBlock, 0, stream>>>(scratch.get(), q_mean.get(), lqr, qblocks);
+        sa3_k_mean<<<dim3(kHeadDim, head_group), 256, 0, stream>>>(k_f16, k_mean.get(), lk, head_start, gqa_ratio);
+        sa3_q_block_mean<<<dim3(kHeadDim, qblocks, head_group), kTokenBlock, 0, stream>>>(scratch.get(), q_mean.get(), lqr, qblocks, lq);
         sa3_center_q<<<(elems_q_padded + 255) / 256, 256, 0, stream>>>(scratch.get(), q_mean.get(), scratch.get(), elems_q_padded, lqr, qblocks);
         check_stage("centering");
         sa3_quant_qk<false><<<dim3(qblocks, 1, head_group), 1024, 0, stream>>>(scratch.get(), q4.get(), sfq.get(), lqr, lqr, false);
         check_stage("Q FP4 quantization");
 
         // Q is quantized, so its scratch storage can become centered K.
-        sa3_center_k_pad<<<(elems_k_padded + 255) / 256, 256, 0, stream>>>(k_f16, k_mean.get(), scratch.get(), lk, lkr, head_group);
+        sa3_center_k_pad<<<(elems_k_padded + 255) / 256, 256, 0, stream>>>(k_f16, k_mean.get(), scratch.get(), lk, lkr, head_group, head_start, gqa_ratio);
         // The long-resolution delta GEMM can otherwise select an atomic
         // reduction algorithm.  Those reductions are order-dependent on
         // Blackwell, so exclude them for this reproducibility-critical path.
@@ -399,7 +476,7 @@ static void sa3_run(ggml_backend_cuda_context & ctx,
         sa3_quant_qk<true><<<dim3(kblocks, 1, head_group), 1024, 0, stream>>>(scratch.get(), k4.get(), sfk.get(), lkr, lkr, false);
         check_stage("K FP4 quantization");
         // K is quantized, so the same scratch storage can become padded V.
-        sa3_pad_f16<<<(elems_k_padded + 255) / 256, 256, 0, stream>>>(v_f16, scratch.get(), lk, lkr, head_group);
+        sa3_pad_f16<<<(elems_k_padded + 255) / 256, 256, 0, stream>>>(v_f16, scratch.get(), lk, lkr, head_group, head_start, gqa_ratio);
         sa3_quant_vt<<<dim3(kblocks, 1, head_group), 1024, 0, stream>>>(scratch.get(), v4.get(), sfv.get(), lkr, lkr, false);
         check_stage("V FP4 quantization");
         Flash_fwd_params p = {};
@@ -408,6 +485,16 @@ static void sa3_run(ggml_backend_cuda_context & ctx,
         // so production SA3 executes exactly the instructions it did before.
         p.softmax_lse_ptr = lse_dst != nullptr ? static_cast<void *>(lse.get()) : nullptr;
         p.b=1; p.h=head_group; p.h_k=head_group; p.h_h_k_ratio=1; p.seqlen_q=lqr; p.seqlen_k=lkr; p.unpadded_seqlen_k=lk; p.seqlen_q_rounded=lqr; p.seqlen_k_rounded=lkr; p.d=kHeadDim; p.d_rounded=kHeadDim; p.head_divmod=cutlass::FastDivmod(head_group);
+        // ⚠️ ARMED TRAP. GQA is handled entirely by REPLICATION during preprocessing, so every
+        // plane handed to the kernel carries one KV head per QUERY head and the launch must stay
+        // h == h_k. `p.h_h_k_ratio` is NOT a working knob: it is assigned here and in api.cu and
+        // then read NOWHERE under sageattention3/ (grep it). Anyone who "enables GQA natively" by
+        // setting h_k < h will get silently wrong pixels, because mainloop_tma_ws.h indexes
+        // K/V/SFK/SFVt with bidh (a QUERY head) and launch.h:61 sizes shape_ds from h_k while
+        // mDS is indexed by bidh — and out-of-range TMA is clamped, not trapped. Doing it
+        // properly means patching those five sites together; until then, fail loudly here.
+        GGML_ASSERT(p.h == p.h_k && p.h_h_k_ratio == 1 &&
+                    "SA3: KV is replicated per query head; native GQA needs the mainloop/shape_ds fixes");
     // FP4 pointer arithmetic is in nibbles (cutlass::float_e2m1_t), whereas
     // the backing buffers above are byte-addressed.  The upstream adapter
     // therefore multiplies every Q/K/V stride by two.
@@ -428,7 +515,7 @@ static void sa3_run(ggml_backend_cuda_context & ctx,
             // 8 warps per block, one query row each.
             const dim3 grid((unsigned) ((lq + 7) / 8), (unsigned) head_group);
             if (q->type == GGML_TYPE_F32) {
-                sa3_lse_to_dst<float><<<grid, 256, 0, stream>>>(lse.get(), q_f32, k_mean.get(), lse_dst, lq, lqr, head_start, scale);
+                sa3_lse_to_dst<float><<<grid, 256, 0, stream>>>(lse.get(), q_f32 + q_head_offset, k_mean.get(), lse_dst, lq, lqr, head_start, scale);
             } else {
                 sa3_lse_to_dst<half><<<grid, 256, 0, stream>>>(lse.get(), (const half *) q->data + q_head_offset, k_mean.get(), lse_dst, lq, lqr, head_start, scale);
             }
@@ -447,8 +534,8 @@ static void sa3_run(ggml_backend_cuda_context & ctx,
     // confirmed to be on SA3 at all, so LSE calls must not consume that budget.
     static int calls = 0, lse_calls = 0;
     if ((lse_dst != nullptr ? lse_calls++ : calls++) < 4) {
-        fprintf(stderr, "[sa3%s] dispatch B=1 H=32 group=%d Lq=%d Lkv=%d D=128 Q=%s delta=%s\n",
-                lse_dst != nullptr ? "-lse" : "", head_group, lq, lk,
+        fprintf(stderr, "[sa3%s] dispatch B=1 H=%d Hkv=%d group=%d Lq=%d Lkv=%d D=128 Q=%s delta=%s\n",
+                lse_dst != nullptr ? "-lse" : "", total_h, total_h / gqa_ratio, head_group, lq, lk,
                 q->type == GGML_TYPE_F32 ? "f32" : "f16", delta_f16 ? "f16" : "f32");
     }
     if (lse_dst != nullptr) {
