@@ -11,8 +11,9 @@ static __forceinline__ __device__ int64_t wrap_index(const int64_t idx, const in
     return idx;
 }
 
-static __global__ void roll_f32_cuda(const float * __restrict__ src,
-                                     float * __restrict__ dst,
+template <typename T>
+static __global__ void roll_f32_cuda(const T * __restrict__ src,
+                                     T * __restrict__ dst,
                                      const int64_t ne00,
                                      const int64_t ne01,
                                      const int64_t ne02,
@@ -43,7 +44,7 @@ static __global__ void roll_f32_cuda(const float * __restrict__ src,
     const int64_t d3 = wrap_index(i3 - s3, ne03);
 
     dst[i3 * (ne00 * ne01 * ne02) + i2 * (ne01 * ne00) + i1 * ne00 + i0] =
-        src[(d3 * nb03 + d2 * nb02 + d1 * nb01 + d0 * nb00) / sizeof(float)];
+        src[(d3 * nb03 + d2 * nb02 + d1 * nb01 + d0 * nb00) / sizeof(T)];
 }
 
 void ggml_cuda_op_roll(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -53,12 +54,11 @@ void ggml_cuda_op_roll(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     int s3 = dst->op_params[3];
 
     const ggml_tensor * src0   = dst->src[0];
-    const float *       src0_d = (const float *) dst->src[0]->data;
-    float *             dst_d  = (float *) dst->data;
 
     GGML_TENSOR_UNARY_OP_LOCALS;
 
-    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+    GGML_ASSERT(src0->type == dst->type);
     GGML_ASSERT(ggml_are_same_shape(dst->src[0], dst));
 
     cudaStream_t stream = ctx.stream();
@@ -66,6 +66,11 @@ void ggml_cuda_op_roll(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     int64_t sz         = (ne00 * ne01 * ne02 * ne03);
     int64_t num_blocks = (sz + CUDA_ROLL_BLOCK_SIZE - 1) / CUDA_ROLL_BLOCK_SIZE;
 
-    roll_f32_cuda<<<num_blocks, CUDA_ROLL_BLOCK_SIZE, 0, stream>>>(
-        src0_d, dst_d, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03, s0, s1, s2, s3);
+    if (src0->type == GGML_TYPE_F16) {
+        roll_f32_cuda<<<num_blocks, CUDA_ROLL_BLOCK_SIZE, 0, stream>>>(
+            (const half *) src0->data, (half *) dst->data, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03, s0, s1, s2, s3);
+    } else {
+        roll_f32_cuda<<<num_blocks, CUDA_ROLL_BLOCK_SIZE, 0, stream>>>(
+            (const float *) src0->data, (float *) dst->data, ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03, s0, s1, s2, s3);
+    }
 }
