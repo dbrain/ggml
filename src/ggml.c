@@ -1051,6 +1051,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CONV_2D",
     "CONV_3D",
     "CONV_2D_DW",
+    "CONV_2D_DEFORM",
     "CONV_TRANSPOSE_2D",
     "POOL_1D",
     "POOL_2D",
@@ -1105,7 +1106,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_EXT_LSE",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1171,6 +1172,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "conv_2d(x)",
     "conv_3d(x)",
     "conv_2d_dw(x)",
+    "conv_2d_deform(x)",
     "conv_transpose_2d(x)",
     "pool_1d(x)",
     "pool_2d(x)",
@@ -1225,7 +1227,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "flash_attn_ext_lse(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5003,6 +5005,65 @@ struct ggml_tensor * ggml_conv_2d_direct(
     result->src[0] = a;
     result->src[1] = b;
 
+    return result;
+}
+
+// ggml_conv_2d_deform
+
+// CWHN inputs arrive as WHCN-logical views; the kernel writes the result
+// channel-innermost, so the result must carry matching permuted strides.
+static void ggml_set_permuted_strides(struct ggml_tensor * a, int axis0, int axis1, int axis2, int axis3) {
+    a->nb[axis0] = ggml_type_size(a->type);
+    a->nb[axis1] = a->nb[axis0] * (a->ne[axis0] / ggml_blck_size(a->type));
+    a->nb[axis2] = a->nb[axis1] * a->ne[axis1];
+    a->nb[axis3] = a->nb[axis2] * a->ne[axis2];
+}
+
+struct ggml_tensor * ggml_conv_2d_deform(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kernel,
+        struct ggml_tensor  * input,
+        struct ggml_tensor  * offset,
+        struct ggml_tensor  * mask,
+        int                   stride0,
+        int                   stride1,
+        int                   pad0,
+        int                   pad1) {
+
+    GGML_ASSERT(kernel->ne[2] == input->ne[2]);
+    GGML_ASSERT(offset->ne[2] == 2 * kernel->ne[0] * kernel->ne[1]);
+    GGML_ASSERT(!mask || mask->ne[2] == kernel->ne[0] * kernel->ne[1]);
+
+    const int64_t ne[4] = {
+        ggml_calc_conv_output_size(input->ne[0], kernel->ne[0], stride0, pad0, 1),
+        ggml_calc_conv_output_size(input->ne[1], kernel->ne[1], stride1, pad1, 1),
+        kernel->ne[3],
+        input->ne[3]
+    };
+
+    GGML_ASSERT(offset->ne[0] == ne[0] && offset->ne[1] == ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, input->type, 4, ne);
+
+    if (!(ggml_is_contiguous(input) && ggml_is_contiguous(kernel))) {
+        GGML_ASSERT(ggml_is_contiguous_channels(input));
+        // A 1x1 kernel is channel-packed but has nb[1] == nb[0], which
+        // ggml_is_contiguous_channels rejects. Matches the CPU op's own assert.
+        GGML_ASSERT(ggml_is_contiguous_channels(kernel)
+                || (kernel->ne[0] == 1 && kernel->ne[1] == 1));
+        GGML_ASSERT(ggml_is_contiguous_channels(offset));
+        GGML_ASSERT(!mask || ggml_is_contiguous_channels(mask) || mask->ne[2] == 1);
+        ggml_set_permuted_strides(result, 2, 0, 1, 3);
+    }
+
+    int32_t params[] = { stride0, stride1, pad0, pad1, 1, 1 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_CONV_2D_DEFORM;
+    result->src[0] = kernel;
+    result->src[1] = input;
+    result->src[2] = offset;
+    result->src[3] = mask;
     return result;
 }
 

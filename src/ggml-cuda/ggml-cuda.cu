@@ -16,6 +16,7 @@
 #include "ggml-cuda/conv-transpose-1d.cuh"
 #include "ggml-cuda/conv2d.cuh"
 #include "ggml-cuda/conv2d-dw.cuh"
+#include "ggml-cuda/conv2d-deform.cuh"
 #include "ggml-cuda/conv2d-transpose.cuh"
 #include "ggml-cuda/conv2d-cudnn.cuh"
 #include "ggml-cuda/cudnn-conv-gate.cuh"
@@ -2363,6 +2364,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_CONV_2D_DW:
             ggml_cuda_op_conv2d_dw(ctx, dst);
+            break;
+        case GGML_OP_CONV_2D_DEFORM:
+            ggml_cuda_op_conv2d_deform(ctx, dst);
             break;
         case GGML_OP_CONV_TRANSPOSE_2D:
             ggml_cuda_conv_2d_transpose_p0(ctx, dst);
@@ -6186,6 +6190,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CONV_TRANSPOSE_2D:
         case GGML_OP_POOL_2D:
             return true;
+        case GGML_OP_CONV_2D_DEFORM:
+            // CUDA kernel implements the whcn path only; cwhn falls back to CPU.
+            return ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[0]) &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32;
         case GGML_OP_ACC:
             // TODO: extend support like so:
             //return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]);
