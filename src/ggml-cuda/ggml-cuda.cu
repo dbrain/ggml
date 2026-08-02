@@ -1876,6 +1876,161 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+
+// ADDITIVE: mul_mat with an F16 destination (output) tensor.
+// Computes A^T * B using a cuBLAS GEMM with F16 inputs and F32 ACCUMULATION
+// (CUBLAS_COMPUTE_32F), storing the result directly as F16 (CUDA_R_16F) into
+// dst->data -- so an encoder can keep activations in F16 across matmuls without a
+// separate F32->F16 cast. NO F16 accumulation is used (precision). Handles both
+// the 2D case and 3D+ batched/broadcast case (attention). This path is only ever
+// reached when dst->type == GGML_TYPE_F16; the F32-dst dispatch above is untouched.
+static void ggml_cuda_mul_mat_f16_dst(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(!ggml_is_transposed(src0));
+    GGML_ASSERT(!ggml_is_transposed(src1));
+    // (the original asserted !ggml_backend_buft_is_cuda_split here; v0.18 dropped
+    //  CUDA split buffers from this backend entirely, so there is nothing to guard)
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    cudaStream_t main_stream = ctx.stream();
+    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), main_stream));
+
+    // src0 -> F16 (weights are usually already F16)
+    ggml_cuda_pool_alloc<half> src0_alloc(ctx.pool());
+    const half * src0_ptr;
+    if (src0->type == GGML_TYPE_F16) {
+        src0_ptr = (const half *) src0->data;
+    } else {
+        // contiguous-only F32->F16 convert: a contiguous src0 has nb00==ts(F32) so
+        // the original nb01/nb00, nb0X/nb00 element strides used in the GEMM below
+        // describe the contiguous F16 temp exactly.
+        GGML_ASSERT(ggml_is_contiguous(src0));
+        const to_fp16_cuda_t to_fp16_cuda = ggml_get_to_fp16_cuda(src0->type);
+        GGML_ASSERT(to_fp16_cuda != nullptr);
+        const int64_t ne_src0 = ggml_nelements(src0);
+        src0_alloc.alloc(ne_src0);
+        to_fp16_cuda(src0->data, src0_alloc.get(), ne_src0, main_stream);
+        src0_ptr = src0_alloc.get();
+    }
+
+    // src1 -> F16 (activations); convert (incl. de-stride) if not already F16
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    GGML_ASSERT(nb10 == ts_src1);
+    int64_t s11 = nb11 / ts_src1;
+    int64_t s12 = nb12 / ts_src1;
+    int64_t s13 = nb13 / ts_src1;
+
+    ggml_cuda_pool_alloc<half> src1_alloc(ctx.pool());
+    const half * src1_ptr;
+    if (src1->type == GGML_TYPE_F16) {
+        src1_ptr = (const half *) src1->data;
+    } else {
+        const auto convert_func = ggml_get_to_fp16_nc_cuda(src1->type);
+        GGML_ASSERT(convert_func != nullptr);
+        const int64_t ne_src1 = ggml_nelements(src1);
+        src1_alloc.alloc(ne_src1);
+        convert_func(src1->data, src1_alloc.get(), ne10, ne11, ne12, ne13, s11, s12, s13, main_stream);
+        src1_ptr = src1_alloc.get();
+        s11 = ne10;
+        s12 = ne11*s11;
+        s13 = ne12*s12;
+    }
+
+    half * dst_ptr = (half *) dst->data;
+
+    // F32 accumulation, F16 inputs, F16 store
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    const cublasComputeType_t cu_compute_type = CUBLAS_COMPUTE_32F;
+
+    GGML_ASSERT(ne12 % ne02 == 0);
+    GGML_ASSERT(ne13 % ne03 == 0);
+    const int64_t r2 = ne12/ne02;
+    const int64_t r3 = ne13/ne03;
+
+    const bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
+    const bool is_src1_cont_2 = (src1->type == GGML_TYPE_F16) ? ggml_is_contiguous_2(src1) : true;
+
+    // dst is contiguous F16: strides in elements
+    const int64_t nbd2 = ne0*ne1;
+    const int64_t nbd3 = ne0*ne1*ne2;
+
+    // FAST PATH: a single 2D weight (ne02==ne03==1) broadcast over the batch (r2>1, r3==1)
+    // is mathematically ONE 2D GEMM with the batch folded into N: W is identical for every
+    // batch, so mul_mat(W, x[k,n,B]) == mul_mat(W, x_2d[k, n*B]). The generic 484-way
+    // batched-pointer path below is ~35x slower at COMPUTE_32F (measured: 130ms vs ~4ms);
+    // collapsing to one cublasGemmEx keeps F32 accumulation AND hits the fast GEMM kernel.
+    // Requires src1/dst contiguous so n*B is one packed N dim (ne13==1 -> no dim-3 batch).
+    {
+        // Collapse is valid when the ne11*ne12 columns are one packed N dim: rows
+        // contiguous (nb10==ts, asserted above) + the batch packs (s12 == ne11*s11).
+        // (Full ggml_is_contiguous is too strict — the full-res src1 is a contiguous-2
+        // view whose batch is still packed.) For F32 src1 the convert temp sets these.
+        const bool src1_packed = (s12 == ne11*s11);
+        if (ne02 == 1 && ne03 == 1 && ne13 == 1 && r2 > 1 && is_src0_cont_2 && src1_packed) {
+            CUBLAS_CHECK(
+            cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                    ne01, ne11*ne12, ne10,
+                    &alpha, src0_ptr, CUDA_R_16F, nb01/nb00,
+                            src1_ptr, CUDA_R_16F, s11,
+                    &beta,  dst_ptr,  CUDA_R_16F, ne0,
+                    cu_compute_type,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            return;
+        }
+    }
+
+    if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
+        const int64_t sma = ne02 == 1 ? nb03/nb00 : nb02/nb00;
+        const int64_t smb = ne12 == 1 ? s13       : s12;
+        CUBLAS_CHECK(
+        cublasGemmStridedBatchedEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                ne01, ne11, ne10,
+                &alpha, src0_ptr, CUDA_R_16F, nb01/nb00, sma,
+                        src1_ptr, CUDA_R_16F, s11,       smb,
+                &beta,  dst_ptr,  CUDA_R_16F, ne0,       ne1*ne0,
+                ne12*ne13,
+                cu_compute_type,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    } else {
+        const int64_t ne23 = ne12*ne13;
+        ggml_cuda_pool_alloc<const void *> ptrs_src(ctx.pool(), 2*ne23);
+        ggml_cuda_pool_alloc<      void *> ptrs_dst(ctx.pool(), 1*ne23);
+
+        const int threads_x = 16;
+        const int threads_y = 16;
+        dim3 block_dims(threads_x, threads_y);
+        dim3 grid_dims(
+            (ne13 + threads_x - 1) / threads_x,
+            (ne12 + threads_y - 1) / threads_y);
+        k_compute_batched_ptrs<<<grid_dims, block_dims, 0, main_stream>>>(
+                src0_ptr, src1_ptr, (char *) dst_ptr,
+                ptrs_src.get(), ptrs_dst.get(),
+                ne12, ne13,
+                ne23,
+                nb02, nb03,
+                (src1->type == GGML_TYPE_F16) ? nb12 : s12*sizeof(half),
+                (src1->type == GGML_TYPE_F16) ? nb13 : s13*sizeof(half),
+                nbd2*sizeof(half), nbd3*sizeof(half),
+                r2, r3);
+        CUDA_CHECK(cudaGetLastError());
+
+        CUBLAS_CHECK(
+        cublasGemmBatchedEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                ne01, ne11, ne10,
+                &alpha, (const void **) (ptrs_src.get() + 0*ne23), CUDA_R_16F, nb01/nb00,
+                        (const void **) (ptrs_src.get() + 1*ne23), CUDA_R_16F, s11,
+                &beta,  (      void **) (ptrs_dst.get() + 0*ne23), CUDA_R_16F, ne0,
+                ne23,
+                cu_compute_type,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1905,6 +2060,20 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             && ggml_cuda_nvfp4_cublaslt_mul_mat(ctx, src0, src1, dst)) {
         return;
     }
+    // ADDITIVE F16-dst path (F16 inputs, F32 accumulation, F16 store). Placed AFTER
+    // the NVFP4/FP8 cuBLASLt GEMMs so their routing is untouched, and BEFORE the
+    // generic non-F32-dst fallback below — that fallback does run, but it is not an
+    // equivalent substitute: routing an F16-dst encoder matmul through it yields a
+    // silently near-empty result (matting matte alpha RMSE 203/255, no assert).
+    if (dst->type == GGML_TYPE_F16
+            && (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32)
+            && (src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_F32)
+            && !ggml_is_transposed(src0) && !ggml_is_transposed(src1)
+            && ggml_is_contiguous(dst)) {
+        ggml_cuda_mul_mat_f16_dst(ctx, src0, src1, dst);
+        return;
+    }
+
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.
