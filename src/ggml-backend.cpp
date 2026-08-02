@@ -906,26 +906,35 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
     }
 
     // operations with weights are preferably run on the same backend as the weights
-    for (int i = 0; i < GGML_MAX_SRC; i++) {
-        const struct ggml_tensor * src = tensor->src[i];
-        if (src == NULL) {
-            continue;
-        }
-        // skip ROPE since the rope freqs tensor is too small to choose a backend based on it
-        // not an ideal solution
-        if (tensor->op != GGML_OP_ROPE && src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-            int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
-            // check if a backend with higher prio wants to offload the op
-            if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
-                for (int b = 0; b < src_backend_id; b++) {
-                    if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
-                        SET_CAUSE(tensor, "1.off");
-                        return b;
+    // TODO: there are exceptions (see below) - not an ideal solution
+    bool allow = true;
+
+    // skip ROPE since the rope freqs tensor is too small to choose a backend based on it
+    allow = allow && tensor->op != GGML_OP_ROPE;
+
+    // skip FLASH_ATTN_EXT since the sinks tensor is too small to choose a based based on it
+    allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT;
+
+    if (allow) {
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            const struct ggml_tensor * src = tensor->src[i];
+            if (src == NULL) {
+                continue;
+            }
+            if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
+                // check if a backend with higher prio wants to offload the op
+                if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                    for (int b = 0; b < src_backend_id; b++) {
+                        if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                            SET_CAUSE(tensor, "1.off");
+                            return b;
+                        }
                     }
                 }
+                SET_CAUSE(tensor, "1.wgt%d", i);
+                return src_backend_id;
             }
-            SET_CAUSE(tensor, "1.wgt%d", i);
-            return src_backend_id;
         }
     }
 
@@ -1238,6 +1247,29 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         // if the node is still unassigned, assign it to the first backend that supports it
         for (int b = 0; b < sched->n_backends && *cur_backend_id == -1; b++) {
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
+        }
+        // Name the node before dying. A bare assert here says only "some op could not be
+        // placed", which is close to useless on a 4000-node diffusion graph -- and this
+        // fires for a REAL class of bug: upstream 25832 stopped FLASH_ATTN_EXT from
+        // inheriting its weights' backend, so any op whose supports_op declines a shape
+        // it previously never had to answer for now lands here instead.
+        if (*cur_backend_id == -1) {
+            GGML_LOG_ERROR("%s: NO BACKEND for node '%s' op=%s type=%s ne=[%ld,%ld,%ld,%ld]\n",
+                __func__, node->name, ggml_op_name(node->op), ggml_type_name(node->type),
+                (long)node->ne[0], (long)node->ne[1], (long)node->ne[2], (long)node->ne[3]);
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                const struct ggml_tensor * src = node->src[s];
+                if (!src) continue;
+                GGML_LOG_ERROR("    src[%d] '%s' type=%s ne=[%ld,%ld,%ld,%ld] buf=%s\n",
+                    s, src->name, ggml_type_name(src->type),
+                    (long)src->ne[0], (long)src->ne[1], (long)src->ne[2], (long)src->ne[3],
+                    src->buffer ? ggml_backend_buffer_name(src->buffer) : "(none)");
+            }
+            for (int b = 0; b < sched->n_backends; b++) {
+                GGML_LOG_ERROR("    backend[%d] %s supports_op=%d\n", b,
+                    ggml_backend_name(sched->backends[b]),
+                    (int) ggml_backend_supports_op(sched->backends[b], node));
+            }
         }
         GGML_ASSERT(*cur_backend_id != -1);
     }
