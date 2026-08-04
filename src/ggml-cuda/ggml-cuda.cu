@@ -4078,7 +4078,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     fused_mul_mat_vec = false;
     fused_node_count  = 0;
 
-    // mul_mat + scale + optional bias
+    // mul_mat + scale + optional bias. MMVQ supports the full pattern; MMQ supports the
+    // bias-free NVFP4 form used by unfolded ModelOpt weights.
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
@@ -4152,6 +4153,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
+                fused_mul_mat_vec = true;
+                fused_node_count  = n_ops;
+                break;
+            }
+            if (!with_bias && op == GGML_OP_MUL_MAT &&
+                    ggml_cuda_should_use_mmq(src0->type,
+                                             ggml_cuda_info().devices[cuda_ctx->device].cc,
+                                             src1->ne[1], /*n_experts=*/0)) {
+                ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, nullptr, out_node,
+                                    /*accumulate=*/false, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = n_ops;
                 break;
