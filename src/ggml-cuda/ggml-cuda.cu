@@ -1725,6 +1725,235 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     }
 }
 
+// Correctness/control route for NVFP4 weights: keep the stored E2M1 values and UE4M3
+// scales unchanged, but decline every FP4/FP8/MMQ shortcut so the ordinary quantized
+// cuBLAS fallback dequantizes the weight first. The explicit .wglobal graph multiply
+// must remain visible on this route; ggml_cuda_nvfp4_weight_global_folded() checks the
+// same gate below. GGML_CUDA_CUBLAS_COMPUTE_TYPE selects F16 (default) or F32 compute.
+static bool ggml_cuda_nvfp4_force_cublas() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_NVFP4_FORCE_CUBLAS");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// Direct Comfy-kitchen TensorWiseINT8Layout with convrot_groupsize=256.
+// H256 = kron(H4,H4,H4,H4)/16, using comfy-kitchen's symmetric regular H4.
+template<typename T>
+__device__ __forceinline__ float int8_convrot_load(const T value) {
+    return static_cast<float>(value);
+}
+
+template<>
+__device__ __forceinline__ float int8_convrot_load<half>(const half value) {
+    return __half2float(value);
+}
+
+template<typename T>
+__global__ void int8_convrot_quantize_rows(
+        const T * __restrict__ x,
+        float * __restrict__ row_scales,
+        int8_t * __restrict__ q,
+        int64_t k) {
+    const int64_t row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float v[256];
+    __shared__ float maxima[256];
+    __shared__ float row_scale;
+
+    float local_max = 0.0f;
+    for (int64_t group = 0; group < k; group += 256) {
+        v[tid] = int8_convrot_load(x[row*k + group + tid]);
+        __syncthreads();
+        #pragma unroll
+        for (int stride = 1; stride < 256; stride *= 4) {
+            const int digit = (tid / stride) & 3;
+            const int base  = tid - digit*stride;
+            const float a = v[base + 0*stride];
+            const float b = v[base + 1*stride];
+            const float c = v[base + 2*stride];
+            const float d = v[base + 3*stride];
+            __syncthreads();
+            float y;
+            if (digit == 0) {
+                y = a + b + c - d;
+            } else if (digit == 1) {
+                y = a + b - c + d;
+            } else if (digit == 2) {
+                y = a - b + c + d;
+            } else {
+                y = -a + b + c + d;
+            }
+            v[tid] = y;
+            __syncthreads();
+        }
+        const float y = v[tid] * (1.0f/16.0f);
+        local_max = fmaxf(local_max, fabsf(y));
+        __syncthreads();
+    }
+
+    maxima[tid] = local_max;
+    __syncthreads();
+    for (int offset = 128; offset != 0; offset >>= 1) {
+        if (tid < offset) {
+            maxima[tid] = fmaxf(maxima[tid], maxima[tid + offset]);
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        row_scale = fmaxf(maxima[0] / 127.0f, 1.0e-30f);
+        row_scales[row] = row_scale;
+    }
+    __syncthreads();
+
+    // Recompute the cheap 256-wide rotation and quantize directly.  The first
+    // pass was needed to obtain a scale across the whole K row; recomputation
+    // avoids materializing and rereading an m*K F32 rotated tensor.
+    for (int64_t group = 0; group < k; group += 256) {
+        v[tid] = int8_convrot_load(x[row*k + group + tid]);
+        __syncthreads();
+        #pragma unroll
+        for (int stride = 1; stride < 256; stride *= 4) {
+            const int digit = (tid / stride) & 3;
+            const int base  = tid - digit*stride;
+            const float a = v[base + 0*stride];
+            const float b = v[base + 1*stride];
+            const float c = v[base + 2*stride];
+            const float d = v[base + 3*stride];
+            __syncthreads();
+            float y;
+            if (digit == 0) {
+                y = a + b + c - d;
+            } else if (digit == 1) {
+                y = a + b - c + d;
+            } else if (digit == 2) {
+                y = a - b + c + d;
+            } else {
+                y = -a + b + c + d;
+            }
+            v[tid] = y;
+            __syncthreads();
+        }
+        int value = __float2int_rn((v[tid] * (1.0f/16.0f)) / row_scale);
+        value = max(-127, min(127, value));
+        q[row*k + group + tid] = (int8_t) value;
+        __syncthreads();
+    }
+}
+
+template<typename T>
+__device__ __forceinline__ T int8_convrot_store(const float value) {
+    return static_cast<T>(value);
+}
+
+template<>
+__device__ __forceinline__ half int8_convrot_store<half>(const float value) {
+    return __float2half_rn(value);
+}
+
+template<typename T>
+__global__ void int8_convrot_dequant_i32(
+        const int32_t * __restrict__ accum,
+        const float * __restrict__ row_scales,
+        const float * __restrict__ weight_scales,
+        const float * __restrict__ bias,
+        T * __restrict__ dst,
+        int64_t n,
+        int64_t out_features) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const int64_t output = i % out_features;
+        float value = (float) accum[i] * row_scales[i / out_features];
+        if (weight_scales != nullptr) {
+            value *= weight_scales[output];
+        }
+        if (bias != nullptr) {
+            value += bias[output];
+        }
+        dst[i] = int8_convrot_store<T>(value);
+    }
+}
+
+static void ggml_cuda_mul_mat_int8_convrot_256(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * weight,
+        const ggml_tensor * activation,
+        ggml_tensor * dst,
+        const ggml_tensor * weight_scales = nullptr,
+        const ggml_tensor * bias = nullptr) {
+    GGML_ASSERT(weight->type == GGML_TYPE_I8);
+    GGML_ASSERT(activation->type == GGML_TYPE_F32 || activation->type == GGML_TYPE_F16);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(weight->ne[2] == 1 && weight->ne[3] == 1);
+    GGML_ASSERT(weight->ne[0] % 256 == 0);
+    GGML_ASSERT(ggml_is_contiguous(weight));
+    GGML_ASSERT(ggml_is_contiguous(activation));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(weight_scales == nullptr ||
+                (weight_scales->type == GGML_TYPE_F32 && ggml_is_contiguous(weight_scales) &&
+                 ggml_nelements(weight_scales) == weight->ne[1]));
+    GGML_ASSERT(bias == nullptr ||
+                (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
+                 ggml_nelements(bias) == weight->ne[1]));
+
+    const int64_t k = weight->ne[0];
+    const int64_t n = weight->ne[1];
+    const int64_t m = ggml_nelements(activation) / k;
+    GGML_ASSERT(ggml_nelements(dst) == n*m);
+
+    cudaStream_t stream = ctx.stream();
+    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+    ggml_cuda_pool_alloc<float> activation_scales(ctx.pool(), m);
+    ggml_cuda_pool_alloc<int8_t> qactivation(ctx.pool(), k*m);
+    ggml_cuda_pool_alloc<int32_t> accum(ctx.pool(), n*m);
+
+    if (activation->type == GGML_TYPE_F32) {
+        int8_convrot_quantize_rows<float><<<m, 256, 0, stream>>>(
+            (const float *) activation->data, activation_scales.get(), qactivation.get(), k);
+    } else {
+        int8_convrot_quantize_rows<half><<<m, 256, 0, stream>>>(
+            (const half *) activation->data, activation_scales.get(), qactivation.get(), k);
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    constexpr int threads = 256;
+    const int32_t alpha = 1;
+    const int32_t beta  = 0;
+    CUBLAS_CHECK(cublasGemmEx(
+        ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+        (int) n, (int) m, (int) k,
+        &alpha,
+        weight->data, CUDA_R_8I, (int) k,
+        qactivation.get(), CUDA_R_8I, (int) k,
+        &beta,
+        accum.get(), CUDA_R_32I, (int) n,
+        CUBLAS_COMPUTE_32I,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    const int64_t output_elements = n*m;
+    if (dst->type == GGML_TYPE_F32) {
+        int8_convrot_dequant_i32<float><<<
+            (output_elements + threads - 1) / threads, threads, 0, stream>>>(
+                accum.get(), activation_scales.get(),
+                weight_scales ? (const float *) weight_scales->data : nullptr,
+                bias ? (const float *) bias->data : nullptr,
+                (float *) dst->data,
+                output_elements, n);
+    } else {
+        int8_convrot_dequant_i32<half><<<
+            (output_elements + threads - 1) / threads, threads, 0, stream>>>(
+                accum.get(), activation_scales.get(),
+                weight_scales ? (const float *) weight_scales->data : nullptr,
+                bias ? (const float *) bias->data : nullptr,
+                (half *) dst->data,
+                output_elements, n);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+#endif
+
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate,
                                           const ggml_tensor * glu,
@@ -1855,7 +2084,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
 
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) &&
+                             !(src0->type == GGML_TYPE_NVFP4 && ggml_cuda_nvfp4_force_cublas()) &&
+                             !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
     // fusion is not universally faster on Pascal
@@ -1879,7 +2110,28 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (hint == GGML_HINT_INT8_CONVROT_256) {
+        ggml_cuda_mul_mat_int8_convrot_256(ctx, src0, src1, dst);
+        return;
+    }
+#endif
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
+        return;
+    }
+
+    if (src0->type == GGML_TYPE_NVFP4 && ggml_cuda_nvfp4_force_cublas()) {
+        static int traced = 0;
+        if (traced++ < 8 || getenv("GGML_NVFP4_FORCE_CUBLAS_TRACE")) {
+            fprintf(stderr,
+                    "[NVFP4_FORCE_CUBLAS] weight='%s' M=%lld K=%lld N=%lld; "
+                    "declining FP8/FP4/MMQ, using generic dequant-cuBLAS\n",
+                    src0->name,
+                    (long long) src1->ne[1],
+                    (long long) src0->ne[0],
+                    (long long) src0->ne[1]);
+        }
+        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
 
@@ -1953,7 +2205,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
-        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+        if (!(src0->type == GGML_TYPE_NVFP4 && ggml_cuda_nvfp4_force_cublas()) &&
+                ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
@@ -1968,7 +2221,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        if (!(src0->type == GGML_TYPE_NVFP4 && ggml_cuda_nvfp4_force_cublas()) &&
+                ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
@@ -3427,6 +3681,9 @@ static bool ggml_cuda_try_fuse_mul_mat_acc(ggml_backend_cuda_context * cuda_ctx,
     if (!ggml_is_quantized(src0->type)) {
         return false;
     }
+    if (src0->type == GGML_TYPE_NVFP4 && ggml_cuda_nvfp4_force_cublas()) {
+        return false;
+    }
 
     // Byte-range overlap on a shared buffer. Pointer equality is not enough: two DIFFERENT
     // tensors can be backed by the same (or partially the same) range.
@@ -3541,6 +3798,73 @@ static bool ggml_cuda_try_fuse_mul_mat_acc(ggml_backend_cuda_context * cuda_ctx,
     return true;
 }
 
+// Direct Comfy INT8 ConvRot linears spell their required per-output weight
+// scale immediately after MUL_MAT. Bias, when present, is often separated by
+// reshape/view/branch nodes (QKV and MLP), so only fuse the always-adjacent
+// scale here. This still removes one full-width graph pass and is safe for
+// every no-LoRA Linear; a later bias fuse needs a separate DAG-aware pass.
+static bool ggml_cuda_try_fuse_int8_convrot_epilogue(
+        ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, int * nodes_to_skip) {
+    const bool trace = getenv("GGML_INT8_CONVROT_EPILOGUE_TRACE") != nullptr;
+    auto reject = [&](const char * why) {
+        if (trace) {
+            fprintf(stderr, "[INT8_CONVROT_EPILOGUE] reject i=%d: %s\n", i, why);
+        }
+        return false;
+    };
+    if (i + 1 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
+        return reject("not enough following nodes or not MUL_MAT");
+    }
+
+    ggml_tensor * mm  = cgraph->nodes[i + 0];
+    ggml_tensor * mul = cgraph->nodes[i + 1];
+    if (mul->op != GGML_OP_MUL || !ggml_node_has_n_uses(cgraph, i, 1)) {
+        return reject("expected immediate one-use scale MUL after MUL_MAT");
+    }
+    const ggml_tensor * weight = mm->src[0];
+    const ggml_tensor * activation = mm->src[1];
+    if (weight == nullptr || activation == nullptr || mm->src[2] != nullptr ||
+        weight->type != GGML_TYPE_I8 ||
+        (activation->type != GGML_TYPE_F32 && activation->type != GGML_TYPE_F16) ||
+        (mm->type != GGML_TYPE_F32 && mm->type != GGML_TYPE_F16) ||
+        ggml_get_op_params_i32(mm, 1) != GGML_HINT_INT8_CONVROT_256) {
+        return reject("MUL_MAT is not the direct F32/F16 I8 ConvRot contract");
+    }
+
+    const ggml_tensor * weight_scales = nullptr;
+    if (mul->src[0] == mm) {
+        weight_scales = mul->src[1];
+    } else if (mul->src[1] == mm) {
+        weight_scales = mul->src[0];
+    } else {
+        return reject("MUL does not consume linear output");
+    }
+
+    const int64_t out_features = weight->ne[1];
+    if (weight_scales == nullptr || weight_scales->type != GGML_TYPE_F32 ||
+        ggml_nelements(weight_scales) != out_features || !ggml_is_contiguous(weight_scales) ||
+        ggml_nelements(mm) != ggml_nelements(mul) ||
+        !ggml_is_contiguous(mm) || !ggml_is_contiguous(mul)) {
+        return reject("scale type, length, contiguity, or output element count mismatch");
+    }
+
+    // The generic MUL is in-place in this graph, but use its own graph output
+    // as destination rather than depending on that allocator alias.
+    if (mul->data == nullptr || mul->buffer == nullptr) {
+        return reject("scale MUL has no allocated output storage");
+    }
+
+    static int traced = 0;
+    if (getenv("GGML_INT8_CONVROT_EPILOGUE_TRACE") != nullptr && traced++ < 8) {
+        fprintf(stderr, "[INT8_CONVROT_EPILOGUE] fused weight='%s' M=%lld K=%lld N=%lld\n",
+                weight->name, (long long) (ggml_nelements(activation) / weight->ne[0]),
+                (long long) weight->ne[0], (long long) out_features);
+    }
+    ggml_cuda_mul_mat_int8_convrot_256(*cuda_ctx, weight, activation, mul, weight_scales);
+    *nodes_to_skip = 1;
+    return true;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3550,6 +3874,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // Diagnostic-only graph dump for the direct Comfy I8 path.  This runs
+    // before the generic fusion attempts, so it distinguishes "dispatcher
+    // never saw the node" from a specific epilogue predicate rejection.
+    if (getenv("GGML_INT8_CONVROT_EPILOGUE_TRACE") != nullptr &&
+        node->op == GGML_OP_MUL_MAT &&
+        ggml_get_op_params_i32(node, 1) == GGML_HINT_INT8_CONVROT_256) {
+        static int candidates_traced = 0;
+        if (candidates_traced++ < 8) {
+            fprintf(stderr, "[INT8_CONVROT_EPILOGUE] candidate i=%d weight='%s' wtype=%s "
+                    "out_type=%s uses=%d view=%p data=%p buffer=%p\n",
+                    i, node->src[0] ? node->src[0]->name : "<null>",
+                    node->src[0] ? ggml_type_name(node->src[0]->type) : "<null>",
+                    ggml_type_name(node->type), ggml_node_get_use_count(cgraph, i),
+                    (void *) node->view_src, node->data, (void *) node->buffer);
+            for (int j = i + 1; j < cgraph->n_nodes && j <= i + 4; ++j) {
+                const ggml_tensor * n = cgraph->nodes[j];
+                fprintf(stderr, "[INT8_CONVROT_EPILOGUE]   +%d op=%s uses=%d type=%s ne=[%lld,%lld,%lld,%lld] "
+                        "view=%p data=%p buffer=%p src0=%p src1=%p\n",
+                        j - i, ggml_op_name(n->op), ggml_node_get_use_count(cgraph, j),
+                        ggml_type_name(n->type), (long long) n->ne[0], (long long) n->ne[1],
+                        (long long) n->ne[2], (long long) n->ne[3], (void *) n->view_src,
+                        n->data, (void *) n->buffer, (void *) n->src[0], (void *) n->src[1]);
+            }
+        }
+    }
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
@@ -4078,7 +4428,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     fused_mul_mat_vec = false;
     fused_node_count  = 0;
 
-    // mul_mat + scale + optional bias
+    // mul_mat + scale + optional bias. MMVQ supports the full pattern; MMQ supports the
+    // bias-free NVFP4 form used by unfolded ModelOpt weights.
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
@@ -4156,6 +4507,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fused_node_count  = n_ops;
                 break;
             }
+            if (!with_bias && op == GGML_OP_MUL_MAT &&
+                    !(src0->type == GGML_TYPE_NVFP4 && ggml_cuda_nvfp4_force_cublas()) &&
+                    ggml_cuda_should_use_mmq(src0->type,
+                                             ggml_cuda_info().devices[cuda_ctx->device].cc,
+                                             src1->ne[1], /*n_experts=*/0)) {
+                ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, nullptr, out_node,
+                                    /*accumulate=*/false, &fusion_data);
+                fused_mul_mat_vec = true;
+                fused_node_count  = n_ops;
+                break;
+            }
         }
         if (fused_mul_mat_vec) {
             break;
@@ -4225,6 +4587,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    int int8_epilogue_nodes_to_skip = 0;
+    if (node->op == GGML_OP_MUL_MAT &&
+        ggml_cuda_try_fuse_int8_convrot_epilogue(cuda_ctx, cgraph, i, &int8_epilogue_nodes_to_skip)) {
+        return int8_epilogue_nodes_to_skip;
     }
 
     // MUL_MAT + in-place ADD: let MMQ accumulate into the ADD's destination and drop the ADD.
@@ -5310,6 +5678,9 @@ bool ggml_cuda_nvfp4_weight_global_folded(ggml_backend_t backend, const char * n
     if (!ggml_backend_is_cuda(backend)) {
         return false;
     }
+    if (ggml_cuda_nvfp4_force_cublas()) {
+        return false;
+    }
     const bool fp4_folds = ggml_cuda_nvfp4_cublaslt_enabled();
     const bool fp8_folds = ggml_cuda_fp8_ffn_enabled() && ggml_cuda_fp8_ffn_name_match(name);
     if (!fp4_folds && !fp8_folds) {
@@ -5379,7 +5750,8 @@ static bool ggml_cuda_nvfp4_cublaslt_shapes_ok(const ggml_tensor * op) {
 // SOME cuBLASLt route can write an F16 dst, and the late bails all fall back to a path that
 // overwrites dst wholesale.
 static bool ggml_cuda_nvfp4_fp4_gemm_serves(int device, const ggml_tensor * op) {
-    if (!ggml_cuda_nvfp4_cublaslt_enabled() ||
+    if (ggml_cuda_nvfp4_force_cublas() ||
+        !ggml_cuda_nvfp4_cublaslt_enabled() ||
         !blackwell_mma_available(ggml_cuda_info().devices[device].cc)) {
         return false;
     }
@@ -5394,7 +5766,8 @@ static bool ggml_cuda_nvfp4_fp8_gemm_serves(int device, const ggml_tensor * op) 
     if (a == nullptr) {
         return false;
     }
-    if (!ggml_cuda_fp8_ffn_enabled() ||
+    if (ggml_cuda_nvfp4_force_cublas() ||
+        !ggml_cuda_fp8_ffn_enabled() ||
         !ggml_cuda_fp8_ffn_name_match(a->name) ||
         !blackwell_mma_available(ggml_cuda_info().devices[device].cc)) {
         return false;
@@ -5434,6 +5807,18 @@ bool ggml_cuda_nvfp4_f16_dst_available(ggml_backend_t backend) {
         return false;
     }
     return blackwell_mma_available(ggml_cuda_info().devices[cuda_ctx->device].cc);
+}
+
+bool ggml_cuda_int8_convrot_f16_dst_available(ggml_backend_t backend) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    (void) backend;
+    return false;
+#else
+    // The direct path below is its own CUDA kernel plus CUBLAS_COMPUTE_32I.
+    // Unlike NVFP4 it has no cuBLASLt/Blackwell dependency; keeping this probe
+    // narrow to CUDA is enough because supports_op re-checks every tensor shape.
+    return ggml_backend_is_cuda(backend);
+#endif
 }
 
 void ggml_backend_cuda_trim_memory(ggml_backend_t backend) {
@@ -5856,9 +6241,18 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
                 }
                 if (op->type == GGML_TYPE_F16) {
-                    // The cuBLASLt FP4/FP8 GEMMs are the ONLY F16-dst producers wired up here;
-                    // deliberately not widened further.
-                    return cublaslt_gemm_serves && b->type == GGML_TYPE_F16;
+                    // F16 graph destinations have two explicitly-served routes:
+                    // NVFP4 FP4/FP8 cuBLASLt and the direct Comfy I8 ConvRot
+                    // kernel.  The latter still accumulates its GEMM in I32 and
+                    // rounds only the dequantized final result to half.
+                    const bool int8_convrot_serves =
+                        a->type == GGML_TYPE_I8 &&
+                        ggml_get_op_params_i32(op, 1) == GGML_HINT_INT8_CONVROT_256 &&
+                        (b->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F16) &&
+                        a->ne[2] == 1 && a->ne[3] == 1 &&
+                        a->ne[0] % 256 == 0 && ggml_is_contiguous(a) &&
+                        ggml_is_contiguous(b) && ggml_is_contiguous(op);
+                    return (cublaslt_gemm_serves && b->type == GGML_TYPE_F16) || int8_convrot_serves;
                 }
 #ifdef GGML_USE_MUSA
                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
@@ -5874,6 +6268,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
 #endif // GGML_USE_MUSA
                 switch (a->type) {
+                    case GGML_TYPE_I8:
+                        return op->op == GGML_OP_MUL_MAT &&
+                               ggml_get_op_params_i32(op, 1) == GGML_HINT_INT8_CONVROT_256 &&
+                               (b->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F16) &&
+                               (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+                               a->ne[2] == 1 && a->ne[3] == 1 &&
+                               a->ne[0] % 256 == 0 &&
+                               ggml_is_contiguous(a) &&
+                               ggml_is_contiguous(b) &&
+                               ggml_is_contiguous(op);
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
                     case GGML_TYPE_Q1_0:

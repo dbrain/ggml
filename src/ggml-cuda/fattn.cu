@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-cudnn.cuh"
+#include "fattn-sol.cuh"
 #if defined(GGML_SAGEATTENTION3)
 #include "fattn-sa3.cuh"
 #endif
@@ -632,6 +633,28 @@ static void ggml_cuda_flash_attn_ext_dispatch(best_fattn_kernel kernel, ggml_bac
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    // Sol-Attn and SA3 each replace softmax(QK^T)V.  Sol gets first refusal
+    // only when explicitly selected; it never feeds SA3 output into itself.
+    const char * sol_env = getenv("GGML_H3_SOL_ATTN");
+    const bool sol_requested = sol_env && atoi(sol_env) != 0;
+    const char * sol_check_env = getenv("GGML_H3_SOL_ATTN_DENSE_CHECK");
+    const bool sol_dense_check = sol_check_env && atoi(sol_check_env) != 0;
+    ggml_cuda_pool_alloc<uint8_t> sol_reference(ctx.pool());
+    bool sol_reference_ready = false;
+    if (sol_requested) {
+        if (sol_dense_check) {
+            // Keep the native all-exact result live while this function sends
+            // the same graph node through the established dense dispatcher.
+            // This is diagnostic-only and intentionally avoids a second model
+            // invocation or a misleading video-level comparison.
+            sol_reference.alloc(ggml_nbytes(dst));
+            ggml_tensor sol_dst = *dst;
+            sol_dst.data = sol_reference.get();
+            sol_reference_ready = ggml_cuda_flash_attn_ext_sol(ctx, &sol_dst);
+        } else if (ggml_cuda_flash_attn_ext_sol(ctx, dst)) {
+            return;
+        }
+    }
 #if defined(GGML_SAGEATTENTION3)
     // SA3 is approximate attention and must remain opt-in. The adapter rejects
     // unsupported shapes and the established ggml kernels remain the fallback.
@@ -711,6 +734,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     ggml_cuda_flash_attn_ext_dispatch(kernel, ctx, dst);
+    if (sol_reference_ready) {
+        ggml_cuda_flash_attn_ext_sol_compare(ctx, dst, sol_reference.get());
+    }
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {

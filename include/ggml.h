@@ -443,6 +443,10 @@ extern "C" {
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,
         GGML_HINT_SRC0_IS_HADAMARD = 1,
+        // src0 is Comfy int8_tensorwise storage quantized after a normalized
+        // regular-Hadamard rotation in groups of 256. CUDA applies the matching
+        // activation ConvRot and dynamic rowwise I8 quantization.
+        GGML_HINT_INT8_CONVROT_256  = 2,
     };
 
     // model file types

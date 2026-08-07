@@ -130,6 +130,13 @@ GGML_BACKEND_API bool ggml_cuda_nvfp4_weight_global_folded(ggml_backend_t backen
 // K % 64 == 0) are still enforced independently by ggml_backend_supports_op().
 GGML_BACKEND_API bool ggml_cuda_nvfp4_f16_dst_available(ggml_backend_t backend);
 
+// True iff `backend` can run the direct Comfy TensorWiseINT8 ConvRot-256 mul_mat
+// with an F16 activation and F16 destination.  The route still rotates and
+// quantizes in F32, uses the same I8xI8->I32 cuBLAS GEMM, and only rounds at the
+// graph boundary.  This is intentionally separate from the NVFP4 probe: an
+// INT8 ConvRot checkpoint must not depend on the FP4 cuBLASLt environment gate.
+GGML_BACKEND_API bool ggml_cuda_int8_convrot_f16_dst_available(ggml_backend_t backend);
+
 // One LoRA module's contribution to one weight, as f32 host arrays.
 // `down` is [rank, in] row-major (== a ggml lora_down with ne = {in, rank}) and `up` is
 // [rows, rank] row-major (== a ggml lora_up with ne = {rank, rows}). row_begin/rows exist

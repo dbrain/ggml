@@ -163,8 +163,69 @@ inline __device__ uint32_t sa3_fp32_to_e2m1(float2 * x) {
     return v;
 }
 
+// Reconstruction error for one 16-value FP4 group at a proposed E4M3 scale. The final pack still
+// uses the hardware cvt below; this scalar oracle is only for choosing the scale. At an exact
+// E2M1 midpoint either neighbouring code has identical squared error, so its tie convention cannot
+// change which scale minimizes MSE.
+inline __device__ float sa3_e2m1_group_mse(const half2 * values, float scale) {
+    constexpr float levels[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    float error = 0.0f;
+    const float inv = scale == 0.0f ? 0.0f : 1.0f / scale;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const float2 pair = __half22float2(values[i]);
+        const float source[2] = {pair.x, pair.y};
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const float magnitude = fabsf(source[j] * inv);
+            int best = 0;
+            float best_distance = fabsf(magnitude - levels[0]);
+            #pragma unroll
+            for (int code = 1; code < 8; ++code) {
+                const float distance = fabsf(magnitude - levels[code]);
+                if (distance < best_distance) {
+                    best = code;
+                    best_distance = distance;
+                }
+            }
+            const float reconstructed = copysignf(levels[best] * scale, source[j]);
+            const float residual = source[j] - reconstructed;
+            error = fmaf(residual, residual, error);
+        }
+    }
+    return error;
+}
+
+inline __device__ uint8_t sa3_mse_refine_scale(const half2 * values, uint8_t baseline_bits, int radius) {
+    if (radius <= 0) {
+        return baseline_bits;
+    }
+    uint8_t best_bits = baseline_bits;
+    const float baseline_scale = float(reinterpret_cast<const __nv_fp8_e4m3 &>(baseline_bits));
+    float best_error = sa3_e2m1_group_mse(values, baseline_scale);
+    // Baseline first and strict improvement preserve it on ties. Alternate lower/higher codes so
+    // equal-distance neighbours have no systematic upward bias.
+    #pragma unroll 1
+    for (int distance = 1; distance <= radius; ++distance) {
+        #pragma unroll
+        for (int direction = -1; direction <= 1; direction += 2) {
+            const int candidate = min(126, max(0, int(baseline_bits) + direction * distance));
+            const uint8_t candidate_bits = static_cast<uint8_t>(candidate);
+            const float candidate_scale =
+                float(reinterpret_cast<const __nv_fp8_e4m3 &>(candidate_bits));
+            const float candidate_error = sa3_e2m1_group_mse(values, candidate_scale);
+            if (candidate_error < best_error) {
+                best_error = candidate_error;
+                best_bits = candidate_bits;
+            }
+        }
+    }
+    return best_bits;
+}
+
 template <bool Permute>
-__global__ void sa3_quant_qk(const half * in, uint8_t * out, uint8_t * sf, int l, int lr, bool clip_input) {
+__global__ void sa3_quant_qk(const half * in, uint8_t * out, uint8_t * sf, int l, int lr,
+                            bool clip_input, int mse_scale_radius) {
     const int tb = blockIdx.x, h = blockIdx.z;
     const int lane = threadIdx.x;
     const int token = tb * kTokenBlock + lane / (kHeadDim / kQuantEltsPerThread);
@@ -195,6 +256,7 @@ __global__ void sa3_quant_qk(const half * in, uint8_t * out, uint8_t * sf, int l
     const float scale_raw = __half2float(__hmax(mx.x, mx.y)) / 6.0f;
     const __nv_fp8_e4m3 fp8_scale(scale_raw);
     uint8_t scale_bits = reinterpret_cast<const uint8_t &>(fp8_scale);
+    scale_bits = sa3_mse_refine_scale(values, scale_bits, mse_scale_radius);
     const float scale = float(reinterpret_cast<const __nv_fp8_e4m3 &>(scale_bits));
     float2 x[8];
     #pragma unroll
@@ -215,7 +277,8 @@ __global__ void sa3_quant_qk(const half * in, uint8_t * out, uint8_t * sf, int l
 }
 
 // V uses the transposed physical layout expected by the Blackwell PV MMA.
-__global__ void sa3_quant_vt(const half * in, uint8_t * out, uint8_t * sf, int l, int lr, bool clip_input) {
+__global__ void sa3_quant_vt(const half * in, uint8_t * out, uint8_t * sf, int l, int lr,
+                            bool clip_input, int mse_scale_radius) {
     const int tb = blockIdx.x, h = blockIdx.z, lane = threadIdx.x;
     const int d = lane / 8;
     const int token0_local = (lane % 8) * kQuantEltsPerThread;
@@ -246,6 +309,7 @@ __global__ void sa3_quant_vt(const half * in, uint8_t * out, uint8_t * sf, int l
     const float raw = __half2float(__hmax(mx.x, mx.y)) / 6.0f;
     const __nv_fp8_e4m3 fp8_scale(raw);
     uint8_t bits = reinterpret_cast<const uint8_t &>(fp8_scale);
+    bits = sa3_mse_refine_scale(v, bits, mse_scale_radius);
     const float scale = float(reinterpret_cast<const __nv_fp8_e4m3 &>(bits));
     float2 x[8]; const float inv = scale == 0.0f ? 0.0f : 1.0f / scale;
     #pragma unroll
@@ -397,6 +461,23 @@ static void sa3_run(ggml_backend_cuda_context & ctx,
     // the core runtime opt-in so other callers retain the original FP32 path.
     const char * delta_f16_env = getenv("GGML_LTX_SA3_DELTA_F16");
     const bool delta_f16 = delta_f16_env != nullptr && atoi(delta_f16_env) != 0;
+    // Radius 1 is the validated common correctness default. Radius 0 remains
+    // available as the byte-for-byte legacy quantizer for regression/bisect.
+    int mse_scale_radius = 1;
+    if (const char * e = getenv("GGML_LTX_SA3_MSE_SCALE_RADIUS")) {
+        char * end = nullptr;
+        const long requested = strtol(e, &end, 10);
+        if (end != e && *end == '\0' && requested >= 0 && requested <= 8) {
+            mse_scale_radius = static_cast<int>(requested);
+        } else {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                fprintf(stderr,
+                        "[sa3] GGML_LTX_SA3_MSE_SCALE_RADIUS=%s ignored (valid range 0..8); using 1\n", e);
+            }
+        }
+    }
     const bool timing = getenv("GGML_LTX_SA3_TIMING") != nullptr;
     static cudaEvent_t timing_begin = nullptr, timing_mha = nullptr, timing_end = nullptr;
     static std::once_flag timing_once;
@@ -449,7 +530,8 @@ static void sa3_run(ggml_backend_cuda_context & ctx,
         sa3_q_block_mean<<<dim3(kHeadDim, qblocks, head_group), kTokenBlock, 0, stream>>>(scratch.get(), q_mean.get(), lqr, qblocks, lq);
         sa3_center_q<<<(elems_q_padded + 255) / 256, 256, 0, stream>>>(scratch.get(), q_mean.get(), scratch.get(), elems_q_padded, lqr, qblocks);
         check_stage("centering");
-        sa3_quant_qk<false><<<dim3(qblocks, 1, head_group), 1024, 0, stream>>>(scratch.get(), q4.get(), sfq.get(), lqr, lqr, false);
+        sa3_quant_qk<false><<<dim3(qblocks, 1, head_group), 1024, 0, stream>>>(
+            scratch.get(), q4.get(), sfq.get(), lqr, lqr, false, mse_scale_radius);
         check_stage("Q FP4 quantization");
 
         // Q is quantized, so its scratch storage can become centered K.
@@ -473,11 +555,13 @@ static void sa3_run(ggml_backend_cuda_context & ctx,
         }
         CUBLAS_CHECK(cublasSetAtomicsMode(ctx.cublas_handle(), previous_atomics_mode));
         check_stage("delta GEMM");
-        sa3_quant_qk<true><<<dim3(kblocks, 1, head_group), 1024, 0, stream>>>(scratch.get(), k4.get(), sfk.get(), lkr, lkr, false);
+        sa3_quant_qk<true><<<dim3(kblocks, 1, head_group), 1024, 0, stream>>>(
+            scratch.get(), k4.get(), sfk.get(), lkr, lkr, false, mse_scale_radius);
         check_stage("K FP4 quantization");
         // K is quantized, so the same scratch storage can become padded V.
         sa3_pad_f16<<<(elems_k_padded + 255) / 256, 256, 0, stream>>>(v_f16, scratch.get(), lk, lkr, head_group, head_start, gqa_ratio);
-        sa3_quant_vt<<<dim3(kblocks, 1, head_group), 1024, 0, stream>>>(scratch.get(), v4.get(), sfv.get(), lkr, lkr, false);
+        sa3_quant_vt<<<dim3(kblocks, 1, head_group), 1024, 0, stream>>>(
+            scratch.get(), v4.get(), sfv.get(), lkr, lkr, false, mse_scale_radius);
         check_stage("V FP4 quantization");
         Flash_fwd_params p = {};
         p.q_ptr=q4.get(); p.k_ptr=k4.get(); p.v_ptr=v4.get(); p.delta_s_ptr=delta_f16 ? static_cast<void *>(delta_f16_buf.get()) : static_cast<void *>(delta.get()); p.sfq_ptr=sfq.get(); p.sfk_ptr=sfk.get(); p.sfv_ptr=sfv.get(); p.o_ptr=scratch.get();
@@ -534,9 +618,10 @@ static void sa3_run(ggml_backend_cuda_context & ctx,
     // confirmed to be on SA3 at all, so LSE calls must not consume that budget.
     static int calls = 0, lse_calls = 0;
     if ((lse_dst != nullptr ? lse_calls++ : calls++) < 4) {
-        fprintf(stderr, "[sa3%s] dispatch B=1 H=%d Hkv=%d group=%d Lq=%d Lkv=%d D=128 Q=%s delta=%s\n",
+        fprintf(stderr, "[sa3%s] dispatch B=1 H=%d Hkv=%d group=%d Lq=%d Lkv=%d D=128 Q=%s delta=%s mse_scale_radius=%d\n",
                 lse_dst != nullptr ? "-lse" : "", total_h, total_h / gqa_ratio, head_group, lq, lk,
-                q->type == GGML_TYPE_F32 ? "f32" : "f16", delta_f16 ? "f16" : "f32");
+                q->type == GGML_TYPE_F32 ? "f32" : "f16", delta_f16 ? "f16" : "f32",
+                mse_scale_radius);
     }
     if (lse_dst != nullptr) {
         // Same brute-force F32 oracle the cuDNN stats were validated with. FP4 QK means the

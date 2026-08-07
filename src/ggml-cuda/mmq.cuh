@@ -19,7 +19,8 @@ typedef void (*ggml_cuda_mmq_vec_dot_t)(const int * __restrict__ x, const int * 
 // every MMQ kernel instantiation. The value is uniform across the whole grid, so the branch is
 // free; when it is false the emitted store is the same one as before.
 typedef void (*ggml_cuda_mmq_write_back_t)(const float * __restrict__ sum, const int32_t * __restrict__ get_rows_to_sorted,
-    float * __restrict__ dst, const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max,
+    float * __restrict__ dst, const float * __restrict__ y_scale, const float * __restrict__ x_scale,
+    const int stride, const int i_max, const int j_max,
     const bool accumulate);
 
 enum mmq_q8_1_ds_layout {
@@ -434,7 +435,8 @@ static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_write_back_dp4a(
         const float * __restrict__ sum, const int32_t * __restrict__ ids_dst, float * __restrict__ dst,
-        const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max,
+        const float * __restrict__ y_scale, const float * __restrict__ x_scale,
+        const int stride, const int i_max, const int j_max,
         const bool accumulate) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
@@ -468,8 +470,12 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
                 if (y_scale_used) {
                     val *= y_scale[j];
                 }
+                if (x_scale != nullptr) {
+                    val *= x_scale[0];
+                }
             } else {
                 GGML_UNUSED(y_scale_used);
+                GGML_UNUSED(x_scale);
             }
 
             if (accumulate) {
@@ -484,7 +490,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 template<ggml_type type, int J, bool fallback>
 static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
             const float * __restrict__ sum, const int * __restrict__ ids_dst, float * __restrict__ dst,
-            const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max,
+            const float * __restrict__ y_scale, const float * __restrict__ x_scale,
+            const int stride, const int i_max, const int j_max,
             const bool accumulate) {
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
@@ -529,8 +536,12 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
                     if (y_scale_used) {
                         val *= y_scale[j];
                     }
+                    if (x_scale != nullptr) {
+                        val *= x_scale[0];
+                    }
                 } else {
                     GGML_UNUSED(y_scale_used);
+                    GGML_UNUSED(x_scale);
                 }
 
                 if (accumulate) {
@@ -893,7 +904,7 @@ template <ggml_type type, int J, bool fallback, bool fixup>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
-        const float * __restrict__ y_scale,
+        const float * __restrict__ y_scale, const float * __restrict__ x_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
         const bool accumulate) {
@@ -963,12 +974,14 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         // The fixup buffer is scratch that mul_mat_q_stream_k_fixup later ADDS into dst, so it is
         // always a plain store — accumulating here would fold in whatever the pool handed us.
         // y_scale still applies: the fixup kernel adds already-scaled partial sums.
-        write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J, /*accumulate =*/ false);
+        write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, x_scale,
+                   I, I, J, /*accumulate =*/ false);
     } else {
         // Exactly one block per output tile takes this path (in stream-k it is the block that
         // computes the tile's final k-chunk), so accumulating here adds the GEMM result into dst
         // once. Partial sums from other blocks arrive afterwards via the fixup kernel's own `+=`.
-        write_back(sum, ids_dst, dst, y_scale, stride_col_dst, tile_x_max_i, tile_y_max_j, accumulate);
+        write_back(sum, ids_dst, dst, y_scale, x_scale,
+                   stride_col_dst, tile_x_max_i, tile_y_max_j, accumulate);
     }
 }
 
@@ -980,7 +993,7 @@ __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_g
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, float * __restrict__ tmp_fixup,
-        const float * __restrict__ y_scale,
+        const float * __restrict__ y_scale, const float * __restrict__ x_scale,
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
@@ -1079,7 +1092,7 @@ static __global__ void mul_mat_q(
 
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, J, fallback, fixup>
-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile, x_scale,
              stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, accumulate);
         return;
@@ -1173,7 +1186,7 @@ static __global__ void mul_mat_q(
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, J, fallback, fixup>
-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile, x_scale,
              stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, accumulate);
 
@@ -1257,7 +1270,7 @@ static __global__ void mul_mat_q(
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, J, fallback, fixup>
-        (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+        (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile, x_scale,
          stride_row_x, ncols_y, stride_col_dst,
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, accumulate);
 }
@@ -1403,6 +1416,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
 struct mmq_args {
     const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds; float * dst;
     const float * y_scale;
+    const float * x_scale;
     int64_t ncols_x; int64_t nrows_x; int64_t ncols_dst; int64_t stride_row_x; int64_t ncols_y; int64_t nrows_dst;
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
@@ -1455,7 +1469,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
         mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
+            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale, args.x_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -1484,7 +1498,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
 
     mul_mat_q<type, J, fallback><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-        (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
+        (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale, args.x_scale,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -1630,6 +1644,6 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 // guarantee that dst already holds the addend and that dst overlaps neither src0 nor src1.
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        bool accumulate = false);
+        bool accumulate = false, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
