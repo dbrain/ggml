@@ -2508,6 +2508,16 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
+    // Exact causal Qwen GQA prefill: Q=[128,T,16], K/V=[128,T,8].
+    // This is deliberately separate from a generic null-mask call, whose
+    // semantics are non-causal.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_qwen_causal_gqa(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            float                 scale);
+
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);

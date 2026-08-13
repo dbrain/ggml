@@ -5583,7 +5583,7 @@ struct ggml_tensor * ggml_arange(
 
 // ggml_flash_attn_ext
 
-struct ggml_tensor * ggml_flash_attn_ext(
+static struct ggml_tensor * ggml_flash_attn_ext_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
@@ -5591,7 +5591,8 @@ struct ggml_tensor * ggml_flash_attn_ext(
         struct ggml_tensor  * mask,
         float                 scale,
         float                 max_bias,
-        float                 logit_softcap) {
+        float                 logit_softcap,
+        bool                  qwen_causal_gqa) {
     GGML_ASSERT(ggml_can_mul_mat(k, q));
     // TODO: check if vT can be multiplied by (k*qT)
 
@@ -5611,12 +5612,31 @@ struct ggml_tensor * ggml_flash_attn_ext(
         GGML_ASSERT(mask);
     }
 
+    // Pixal's source-built FlashAttention v2 bridge writes BF16 directly for
+    // the exact mask-free D=128 self-attention case. Generic flash attention
+    // remains F32 unless this explicit graph-build opt-in is set.
+    // Qwen causal GQA is an operation-local contract. A null mask is normally
+    // non-causal, so this must never be selected by an ambient environment.
+    const bool pixal_self_fa2 = getenv("PIXAL3D_FA2") && !mask &&
+        q->type == GGML_TYPE_BF16 && k->type == GGML_TYPE_BF16 && v->type == GGML_TYPE_BF16 &&
+        q->ne[0] == 128 && k->ne[1] == v->ne[1] &&
+        q->ne[2] == k->ne[2] && q->ne[2] == v->ne[2] && q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1;
+    const bool qwen_fa2_prefill = qwen_causal_gqa && !mask &&
+        q->type == GGML_TYPE_BF16 && k->type == GGML_TYPE_BF16 && v->type == GGML_TYPE_BF16 &&
+        q->ne[0] == 128 && k->ne[1] == v->ne[1] &&
+        q->ne[2] == 16 && k->ne[2] == 8 && v->ne[2] == 8 && q->ne[2] % k->ne[2] == 0;
+    const bool qwen_fa2_decode_swap = !mask && qwen_causal_gqa &&
+        q->type == GGML_TYPE_BF16 && k->type == GGML_TYPE_BF16 && v->type == GGML_TYPE_BF16 &&
+        q->ne[0] == 128 && k->ne[1] == v->ne[1] && q->ne[1] == 2 &&
+        q->ne[2] == 8 && k->ne[2] == 8 && v->ne[2] == 8;
+    const bool pixal_fa2 = pixal_self_fa2 || qwen_fa2_prefill || qwen_fa2_decode_swap;
     // permute(0, 2, 1, 3)
     int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    struct ggml_tensor * result = ggml_new_tensor(ctx, pixal_fa2 ? GGML_TYPE_BF16 : GGML_TYPE_F32, 4, ne);
 
     float params[] = { scale, max_bias, logit_softcap };
     ggml_set_op_params(result, params, sizeof(params));
+    ggml_set_op_params_i32(result, 4, qwen_fa2_prefill ? 1 : qwen_fa2_decode_swap ? 2 : 0);
 
     result->op     = GGML_OP_FLASH_ATTN_EXT;
     result->src[0] = q;
@@ -5627,6 +5647,26 @@ struct ggml_tensor * ggml_flash_attn_ext(
     return result;
 }
 
+struct ggml_tensor * ggml_flash_attn_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap) {
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, scale, max_bias, logit_softcap, false);
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_qwen_causal_gqa(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        float                 scale) {
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, NULL, scale, 0.0f, 0.0f, true);
+}
 
 // ggml_flash_attn_ext_lse
 //

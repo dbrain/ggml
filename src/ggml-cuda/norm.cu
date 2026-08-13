@@ -483,7 +483,10 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     cudaStream_t stream = ctx.stream();
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+    // Low-precision activations retain their storage dtype, while the RMS
+    // reduction itself stays in float. F32 remains byte-identical.
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16 ||  dst->type == GGML_TYPE_BF16);
     GGML_ASSERT(dst->type == src0->type);
 
     GGML_TENSOR_UNARY_OP_LOCALS;
@@ -498,7 +501,9 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s02 = nb02 / ts0;
     const int64_t s03 = nb03 / ts0;
 
-    if (src0->type == GGML_TYPE_F16) {
+    if (src0->type == GGML_TYPE_BF16) {
+        rms_norm_f32_cuda((const nv_bfloat16 *) src0->data, (nv_bfloat16 *) dst->data, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+    } else if (src0->type == GGML_TYPE_F16) {
         rms_norm_f32_cuda((const half *) src0->data, (half *) dst->data, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
     } else {
         rms_norm_f32_cuda((const float *) src0->data, (float *) dst->data, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);

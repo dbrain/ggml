@@ -5,6 +5,7 @@
 #include "fattn-sa3.cuh"
 #endif
 #include "fattn-mma-f16.cuh"
+#include "fattn-pixal-fa2.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -632,6 +633,9 @@ static void ggml_cuda_flash_attn_ext_dispatch(best_fattn_kernel kernel, ggml_bac
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    if (ggml_cuda_flash_attn_ext_pixal_fa2(ctx, dst)) {
+        return;
+    }
 #if defined(GGML_SAGEATTENTION3)
     // SA3 is approximate attention and must remain opt-in. The adapter rejects
     // unsupported shapes and the established ggml kernels remain the fallback.
