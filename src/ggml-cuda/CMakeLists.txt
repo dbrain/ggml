@@ -111,12 +111,14 @@ if (CUDAToolkit_FOUND)
         list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX ".*/fattn-sa3\\.cu$")
     endif()
     # Pixal3D's source-built FlashAttention v2 bridge (BF16 D=128 self-attention and the
-    # Qwen causal-GQA rig decoder kernel). Same treatment as SA3: the TU pulls in the
-    # FlashAttention/CUTLASS headers, so it is excluded unless explicitly enabled.
+    # Qwen causal-GQA rig decoder kernel). NOT the same treatment as SA3 above: unlike
+    # fattn-sa3.cu, whose dispatch site is itself wrapped in #if defined(GGML_SAGEATTENTION3),
+    # fattn-pixal-fa2.cu is called unconditionally from fattn.cu and carries its own #else
+    # definition of ggml_cuda_flash_attn_ext_pixal_fa2(). So the TU is always compiled and the
+    # #ifdef inside it -- which is what guards the FlashAttention/CUTLASS includes -- decides
+    # whether there is a kernel behind it. Filtering the file out here instead dropped the
+    # #else definition too and left the link with an undefined symbol.
     option(GGML_PIXAL_FA2 "ggml: source-built FlashAttention v2 Pixal BF16 D128 bridge" OFF)
-    if (NOT GGML_PIXAL_FA2)
-        list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX ".*/fattn-pixal-fa2\\.cu$")
-    endif()
     option(GGML_CUDA_FATTN_TEMPLATES "ggml: compile generic FlashAttention template variants" ON)
     if (GGML_CUDA_FATTN_TEMPLATES)
         file(GLOB   SRCS "template-instances/fattn-tile*.cu")

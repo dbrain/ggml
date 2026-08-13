@@ -86,5 +86,28 @@ bool ggml_cuda_flash_attn_ext_pixal_fa2(ggml_backend_cuda_context & ctx, ggml_te
     return true;
 }
 #else
-bool ggml_cuda_flash_attn_ext_pixal_fa2(ggml_backend_cuda_context &, ggml_tensor *) { return false; }
+// Built without GGML_PIXAL_FA2: there is no bridge to run.
+//
+// Graphs that never opted in are unaffected -- returning false leaves them on the generic
+// ggml kernels, exactly as if this file did not exist. A graph that DID opt in cannot be
+// served that way, and must not be allowed to look like it was:
+//
+//   * ggml_flash_attn_ext_impl() has already given the node a BF16 dst for both opt-ins
+//     (PIXAL3D_FA2 self-attention and ggml_flash_attn_ext_qwen_causal_gqa). No generic
+//     CUDA kernel writes BF16 -- the F16 backstop in fattn.cu would abort on an assert
+//     about types that says nothing about the real problem.
+//   * Worse, causality for the Qwen contract lives in op_params[4] and is read ONLY by the
+//     bridge above. Every generic kernel takes its causality from an explicit F16 mask, and
+//     this op has none by construction, so any path that did survive the type check would
+//     quietly compute NON-CAUSAL attention and return plausible, wrong numbers.
+//
+// There is no correct fallback to give, so name what is missing instead.
+bool ggml_cuda_flash_attn_ext_pixal_fa2(ggml_backend_cuda_context &, ggml_tensor * dst) {
+    if (dst->type == GGML_TYPE_BF16 || ggml_get_op_params_i32(dst, 4) != 0) {
+        GGML_ABORT("this graph asked for the Pixal FA2 attention contract "
+                   "(ggml_flash_attn_ext_qwen_causal_gqa or PIXAL3D_FA2), but ggml was built "
+                   "with GGML_PIXAL_FA2=OFF; rebuild with -DGGML_PIXAL_FA2=ON");
+    }
+    return false;
+}
 #endif
