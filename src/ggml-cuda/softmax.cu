@@ -123,10 +123,14 @@ static __global__ void soft_max_f32(
         vals[col] = val;
     }
 
-    // buf_iw is reused from the MAX reduction above.  Explicitly synchronize
-    // before the SUM reduction: Blackwell does not provide the implicit warp
-    // reconvergence older kernels happened to rely on here.
+    // buf_iw is reused from the MAX reduction above, so the SUM reduction must not
+    // race it. Upstream (#26385) guards this with `if (block_size > WARP_SIZE)` on the
+    // grounds that block_reduce does not touch buf_iw below a warp. We sync
+    // UNCONDITIONALLY: on Blackwell (sm_120) there is no implicit warp reconvergence
+    // for the sub-warp case to lean on, and this kernel miscomputed on the 5060 Ti
+    // without it. The extra barrier is free relative to being wrong.
     __syncthreads();
+    // find the sum of exps in the block
     tmp = block_reduce<block_reduce_method::SUM, block_size_template>(tmp, buf_iw);
 
     if (sinks) {
@@ -152,6 +156,8 @@ static __device__ void soft_max_f32_parallelize_cols_single_row(const float * __
                                                                 float * __restrict__ dst,
                                                                 float * __restrict__ tmp_maxs,
                                                                 float * __restrict__ tmp_sums,
+                                                                float * shared_vals_max,
+                                                                float * shared_vals_sum,
                                                                 const soft_max_params p) {
     namespace cg = cooperative_groups;
 
@@ -164,7 +170,6 @@ static __device__ void soft_max_f32_parallelize_cols_single_row(const float * __
     float     local_vals[n_elem_per_thread] = { -INFINITY, -INFINITY, -INFINITY, -INFINITY };
     float     local_max                     = -INFINITY;
     const int step_size                     = gridDim.x * blockDim.x;
-    __shared__ float shared_vals[32];
 
     // Compute thread-local max
     for (int col = col_start; col < p.ncols;) {
@@ -181,7 +186,7 @@ static __device__ void soft_max_f32_parallelize_cols_single_row(const float * __
     }
 
     // Compute CTA-level max
-    local_max = block_reduce<block_reduce_method::MAX>(local_max, shared_vals);
+    local_max = block_reduce<block_reduce_method::MAX>(local_max, shared_vals_max);
 
     // Store CTA-level max to GMEM
     if (tid == 0) {
@@ -196,7 +201,7 @@ static __device__ void soft_max_f32_parallelize_cols_single_row(const float * __
     } else {
         local_max = -INFINITY;
     }
-    local_max = block_reduce<block_reduce_method::MAX>(local_max, shared_vals);
+    local_max = block_reduce<block_reduce_method::MAX>(local_max, shared_vals_max);
 
     // Compute softmax dividends, accumulate divisor
     float tmp_expf = 0.0f;
@@ -219,7 +224,7 @@ static __device__ void soft_max_f32_parallelize_cols_single_row(const float * __
     }
 
     // Reduce divisor within CTA
-    tmp_expf = block_reduce<block_reduce_method::SUM>(tmp_expf, shared_vals);
+    tmp_expf = block_reduce<block_reduce_method::SUM>(tmp_expf, shared_vals_sum);
 
     // Store CTA-level sum to GMEM
     if (tid == 0) {
@@ -233,7 +238,7 @@ static __device__ void soft_max_f32_parallelize_cols_single_row(const float * __
     } else {
         tmp_expf = 0.0f;
     }
-    tmp_expf = block_reduce<block_reduce_method::SUM>(tmp_expf, shared_vals);
+    tmp_expf = block_reduce<block_reduce_method::SUM>(tmp_expf, shared_vals_sum);
 
     // Divide dividend by global sum + store data
     for (int col = col_start; col < p.ncols;) {
@@ -320,9 +325,11 @@ __launch_bounds__(8*WARP_SIZE, 1) static __global__ void soft_max_f32_paralleliz
 // https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/device-callable-apis.html#grid-synchronization
 // https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/device-callable-apis.html#class-cluster-group
 {
+    __shared__ float shared_vals[2][32];
+
     for (int rowx = 0; rowx < p.ne01 * p.ne02 * p.ne03; rowx++) {
         soft_max_f32_parallelize_cols_single_row(x + int64_t(rowx) * p.ncols, dst + int64_t(rowx) * p.ncols, tmp_maxs,
-                                                 tmp_sums, p);
+                                                 tmp_sums, shared_vals[0], shared_vals[1], p);
     }
 }
 
