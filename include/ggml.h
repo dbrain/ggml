@@ -599,6 +599,13 @@ extern "C" {
         // op keeps its value. See ggml_flash_attn_ext_lse() below.
         GGML_OP_FLASH_ATTN_EXT_LSE,
 
+        // qwen3-tts: fused snake activation as an explicit op, and a direct (no-im2col)
+        // 1-D convolution. Both appended at the END for the same reason as the two above.
+        // NOTE: an upstream auto-fusion for the snake *pattern* also exists (see
+        // ggml_cuda_op_snake_fused); this op is the explicit form with exp() folded in.
+        GGML_OP_SNAKE,
+        GGML_OP_CONV_1D_DIRECT,
+
         GGML_OP_COUNT,
     };
 
@@ -1773,6 +1780,59 @@ extern "C" {
             float                 min,
             float                 max);
 
+    // Snake activation: x + (1/exp(beta)) * sin^2(exp(alpha) * x)
+    // alpha/beta are F32 vectors of length a->ne[1]; the exp() is applied INSIDE
+    // the op (this is the qwen3-tts vocoder contract). Contrast the upstream
+    // auto-fusion, which expects a and inv_b already exp()'d by the caller.
+    GGML_API struct ggml_tensor * ggml_snake(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * alpha,
+            struct ggml_tensor  * beta);
+
+    // in-place, returns view(a)
+    GGML_API struct ggml_tensor * ggml_snake_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * alpha,
+            struct ggml_tensor  * beta);
+
+    // ggml_conv_1d_direct
+    //
+    // Fused 1D convolution that computes the conv directly without an im2col
+    // temp tensor. Asymmetric (causal) padding via separate p_left / p_right
+    // -- the kernel treats out-of-range input positions as zero, so the caller
+    // need not pre-pad the input.
+    //
+    // a: weights [kernel, in_ch, out_ch]      F16 (CUDA path asserts F16)
+    // b: input   [in_seq, in_ch, batch]       F32
+    // s0: stride
+    // p_left, p_right: padding on each side (use {(K-1)*d, 0} for causal)
+    // d0: dilation
+    // returns: [out_seq = floor((in_seq + p_left + p_right - d0*(K-1) - 1)/s0) + 1, out_ch, batch]
+    GGML_API struct ggml_tensor * ggml_conv_1d_direct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            int                   s0,
+            int                   p_left,
+            int                   p_right,
+            int                   d0);
+
+    // Same as ggml_conv_1d_direct but lets the caller pick the dst dtype
+    // (F32 or F16). The wmma kernel's accumulator stays F32 regardless;
+    // F16 dst halves every intermediate tensor in the cascade and saves
+    // ~50 % of the vocoder's sched_cu without measurable precision loss.
+    GGML_API struct ggml_tensor * ggml_conv_1d_direct_to(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            int                   s0,
+            int                   p_left,
+            int                   p_right,
+            int                   d0,
+            enum   ggml_type      dst_type);
+
     GGML_API struct ggml_tensor * ggml_soft_max(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
@@ -2159,6 +2219,17 @@ extern "C" {
             int                   s0,  // stride
             int                   p0,  // padding
             int                   d0); // dilation
+
+    // Same as ggml_conv_transpose_1d but lets the caller pick the dst dtype.
+    // Reuses GGML_OP_CONV_TRANSPOSE_1D; only the dst type differs.
+    GGML_API struct ggml_tensor * ggml_conv_transpose_1d_to(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            int                   s0,
+            int                   p0,
+            int                   d0,
+            enum   ggml_type      dst_type);
 
     GGML_API struct ggml_tensor * ggml_conv_2d(
             struct ggml_context * ctx,

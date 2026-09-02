@@ -1913,6 +1913,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_conv_transpose_1d(params, tensor);
             } break;
+        case GGML_OP_SNAKE:
+            {
+                ggml_compute_forward_snake(params, tensor);
+            } break;
+        case GGML_OP_CONV_1D_DIRECT:
+            {
+                ggml_compute_forward_conv_1d_direct(params, tensor);
+            } break;
         case GGML_OP_IM2COL:
             {
                 ggml_compute_forward_im2col(params, tensor);
@@ -2389,6 +2397,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COL2IM_1D:
         case GGML_OP_CONV_TRANSPOSE_1D:
         case GGML_OP_CONV_TRANSPOSE_2D:
+        case GGML_OP_SNAKE:
+        case GGML_OP_CONV_1D_DIRECT:
             {
                 n_tasks = n_threads;
             } break;

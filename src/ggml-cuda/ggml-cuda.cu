@@ -14,6 +14,7 @@
 #include "ggml-cuda/col2im-1d.cuh"
 #include "ggml-cuda/concat.cuh"
 #include "ggml-cuda/conv-transpose-1d.cuh"
+#include "ggml-cuda/conv-1d-direct.cuh"
 #include "ggml-cuda/conv2d.cuh"
 #include "ggml-cuda/conv2d-dw.cuh"
 #include "ggml-cuda/conv2d-deform.cuh"
@@ -101,6 +102,65 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
+
+extern "C" {
+// Hook is passed the active compute stream so it can launch on the same
+// non-blocking stream ggml uses; launching on stream 0 would race because
+// ggml's per-context streams are created with cudaStreamNonBlocking.
+typedef bool (*ggml_cuda_mul_mat_hook_fn)(
+    ggml_backend_cuda_context * ctx,
+    const ggml_tensor *         src0,
+    const ggml_tensor *         src1,
+    ggml_tensor *               dst,
+    cudaStream_t                stream);
+
+void ggml_cuda_set_mul_mat_hook(ggml_cuda_mul_mat_hook_fn fn);
+
+// Optional graph-compute-begin hook. Called once at the top of every
+// ggml_backend_cuda_graph_compute invocation, before any node executes.
+// qwen3-tts megakernel uses this to invalidate cross-graph caches (e.g.,
+// the Q8_1 staging buffer) since pool allocators may give the same
+// pointer to a different logical tensor across graph computes — and to
+// pre-scan the cgraph for fusable patterns (Q→K→V, gate→up) so the
+// per-op hook can short-circuit follow-up ops it has already fused.
+typedef void (*ggml_cuda_graph_begin_hook_fn)(
+    ggml_backend_cuda_context * ctx,
+    const ggml_cgraph *         cgraph);
+void ggml_cuda_set_graph_begin_hook(ggml_cuda_graph_begin_hook_fn fn);
+
+// Generic per-op hook. Called at the top of ggml_cuda_compute_forward for
+// every node. Returns true if the hook fully handled the op (ggml-cuda's
+// dispatch will be skipped); false to fall through to ggml's path.
+//
+// qwen3-tts megakernel uses this to fold sequences of small ops
+// (rms_norm + mul-norm-weight + quantize_x → Q8_1, rope + set_rows, etc.)
+// into a single launch — anchor on the first op of the chain, run the
+// fused kernel, return true; subsequent ops in the chain look themselves
+// up in the per-graph plan and return true (no-op).
+typedef bool (*ggml_cuda_op_hook_fn)(
+    ggml_backend_cuda_context * ctx,
+    ggml_tensor *               dst,
+    cudaStream_t                stream);
+void ggml_cuda_set_op_hook(ggml_cuda_op_hook_fn fn);
+}  // extern "C"
+
+static ggml_cuda_mul_mat_hook_fn   g_ggml_cuda_mul_mat_hook    = nullptr;
+static ggml_cuda_graph_begin_hook_fn g_ggml_cuda_graph_begin_hook = nullptr;
+static ggml_cuda_op_hook_fn        g_ggml_cuda_op_hook         = nullptr;
+
+extern "C" void ggml_cuda_set_mul_mat_hook(ggml_cuda_mul_mat_hook_fn fn) {
+    g_ggml_cuda_mul_mat_hook = fn;
+}
+
+extern "C" void ggml_cuda_set_graph_begin_hook(ggml_cuda_graph_begin_hook_fn fn) {
+    g_ggml_cuda_graph_begin_hook = fn;
+}
+
+extern "C" void ggml_cuda_set_op_hook(ggml_cuda_op_hook_fn fn) {
+    g_ggml_cuda_op_hook = fn;
+}
+
+[[noreturn]]
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
@@ -2037,6 +2097,10 @@ static void ggml_cuda_mul_mat_f16_dst(ggml_backend_cuda_context & ctx, const ggm
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (g_ggml_cuda_mul_mat_hook && g_ggml_cuda_mul_mat_hook(&ctx, src0, src1, dst, ctx.stream())) {
+        return;
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
@@ -2316,6 +2380,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    // Per-op hook for the qwen3-tts megakernel's sub-op fusion. If the hook
+    // handles this dst, skip ggml's dispatch entirely.
+    if (g_ggml_cuda_op_hook && g_ggml_cuda_op_hook(&ctx, dst, ctx.stream())) {
+        return true;
+    }
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -2595,6 +2664,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_CONV_TRANSPOSE_1D:
             ggml_cuda_op_conv_transpose_1d(ctx,dst);
+            break;
+        case GGML_OP_SNAKE:
+            ggml_cuda_op_snake(ctx, dst);
+            break;
+        case GGML_OP_CONV_1D_DIRECT:
+            ggml_cuda_op_conv_1d_direct(ctx, dst);
             break;
         case GGML_OP_COL2IM_1D:
             ggml_cuda_op_col2im_1d(ctx, dst);
@@ -5263,6 +5338,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    if (g_ggml_cuda_graph_begin_hook) {
+        g_ggml_cuda_graph_begin_hook(cuda_ctx, cgraph);
+    }
+
     // New graph compute => bump the FP8 activation-quant cache generation so the q/k/v
     // activation reuse cache (nvfp4-cublaslt.cu) can never serve a buffer quantized during a
     // PREVIOUS compute, even when gallocr recycles a node/data address. Hooked here rather
@@ -6535,9 +6614,32 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32;
         case GGML_OP_ACC:
-            // TODO: extend support like so:
-            //return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]);
-            return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+            // Kernel preconditions (acc.cu): src0/src1/dst must share dtype, that
+            // dtype must be F32 or F16, and both srcs contiguous. Master's looser
+            // check ACCEPTED an F16 node and then tripped the F32 assert inside the
+            // kernel at runtime -- which is exactly what the vocoder's streaming
+            // path does (ggml_acc_inplace on an F16 cascade node).
+            return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   op->src[0]->type == op->src[1]->type &&
+                   op->type == op->src[0]->type &&
+                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+        case GGML_OP_SNAKE:
+            // snake.cu: contiguous src0/dst, src0/dst F32 or F16, alpha/beta F32.
+            return ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op) &&
+                   (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+                   op->src[1] && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2] && op->src[2]->type == GGML_TYPE_F32;
+        case GGML_OP_CONV_1D_DIRECT:
+            // conv-1d-direct.cu: weights (src0) F16, input (src1) and dst F32 or
+            // F16, all three contiguous.
+            return op->src[0]->type == GGML_TYPE_F16 &&
+                   (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
+                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+                   ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op);
         case GGML_OP_SUM:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_TOP_K:
