@@ -2202,8 +2202,11 @@ static struct ggml_tensor * ggml_acc_impl(
         bool                  inplace) {
     GGML_ASSERT(ggml_nelements(b) <= ggml_nelements(a));
     GGML_ASSERT(ggml_is_contiguous(a));
-    GGML_ASSERT(a->type == GGML_TYPE_F32);
-    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    // F16 permitted: the vocoder's streaming overlap-add runs on the F16 cascade,
+    // so ggml_acc_inplace is handed F16 nodes. The CPU and CUDA ACC paths are both
+    // templated for it; see the GGML_OP_ACC case in ggml-cuda.cu supports_op.
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
+    GGML_ASSERT(b->type == a->type);
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
