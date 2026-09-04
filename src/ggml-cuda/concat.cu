@@ -426,6 +426,9 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         case GGML_TYPE_F16:
             concat_dispatch<half>(ctx, dst);
             break;
+        case GGML_TYPE_BF16:
+            concat_dispatch<nv_bfloat16>(ctx, dst);
+            break;
         case GGML_TYPE_I32:
             concat_dispatch<int32_t>(ctx, dst);
             break;

@@ -14,6 +14,39 @@
 
 #include "nvfp4-cublaslt.cuh"
 
+// CUDA 12.4 predates the block-scaled FP4 cuBLASLt API used by this optional
+// acceleration path.  Keep the normal MMQ/dequant fallbacks available when
+// building a CUDA 12 backend (for example to match a CUDA 12 PyTorch runtime).
+#if CUDART_VERSION < 12080
+
+bool ggml_cuda_nvfp4_cublaslt_enabled() { return false; }
+
+bool ggml_cuda_nvfp4_cublaslt_mul_mat(ggml_backend_cuda_context &,
+                                      const ggml_tensor *,
+                                      const ggml_tensor *,
+                                      ggml_tensor *) {
+    return false;
+}
+
+bool ggml_cuda_fp8_ffn_enabled() { return false; }
+bool ggml_cuda_f8_gemm_enabled() { return false; }
+bool ggml_cuda_fp8_ffn_name_match(const char *) { return false; }
+
+void ggml_cuda_fp8_quant_pertensor(const void *, ggml_type,
+                                   uint8_t *, float *, unsigned int *,
+                                   long, cudaStream_t) {
+}
+
+bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context &,
+                                    const ggml_tensor *,
+                                    const ggml_tensor *,
+                                    ggml_tensor *,
+                                    const ggml_tensor *) {
+    return false;
+}
+
+#else
+
 #include <cublasLt.h>
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
@@ -1850,3 +1883,5 @@ bool ggml_cuda_fp8_cublaslt_mul_mat(ggml_backend_cuda_context & ctx,
     if (op) cublasLtMatmulDescDestroy(op);
     return ok;
 }
+
+#endif // CUDART_VERSION >= 12080

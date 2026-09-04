@@ -1840,23 +1840,37 @@ static void ggml_cuda_op_mul_mat_cublas(
         }
         const nv_bfloat16 * src1_ptr = src1->type == GGML_TYPE_BF16 ? (const nv_bfloat16 *) src1_ddf_i : src1_as_bf16.get();
         const nv_bfloat16 * src0_ptr = (const nv_bfloat16 *)src0_dd_i;
-        ggml_cuda_pool_alloc<nv_bfloat16> dst_bf16(ctx.pool(id), row_diff*src1_ncols);
-
         const float alpha_f32 = 1.0f;
         const float beta_f32  = 0.0f;
 
         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
-        CUBLAS_CHECK(
-            cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
-                    row_diff, src1_ncols, ne10,
-                    &alpha_f32,  src0_ptr,       CUDA_R_16BF, ne00,
-                                 src1_ptr,       CUDA_R_16BF, ne10,
-                    &beta_f32,   dst_bf16.get(), CUDA_R_16BF, ldc,
-                    CUBLAS_COMPUTE_32F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-
-        const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
-        to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+        if (getenv("GGML_CUDA_BF16_F32_OUT") != nullptr) {
+            // Preserve the tensor-core BF16 products but retain the FP32
+            // accumulator until the graph's explicit model-boundary cast.
+            // This mirrors PyTorch Linear's fused accumulator+bias path and
+            // is opt-in because legacy ggml behavior rounds GEMM output to
+            // BF16 before downstream graph operations.
+            CUBLAS_CHECK(
+                cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                        row_diff, src1_ncols, ne10,
+                        &alpha_f32,  src0_ptr, CUDA_R_16BF, ne00,
+                                     src1_ptr, CUDA_R_16BF, ne10,
+                        &beta_f32,   dst_dd_i, CUDA_R_32F, ldc,
+                        CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        } else {
+            ggml_cuda_pool_alloc<nv_bfloat16> dst_bf16(ctx.pool(id), row_diff*src1_ncols);
+            CUBLAS_CHECK(
+                cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                        row_diff, src1_ncols, ne10,
+                        &alpha_f32,  src0_ptr,       CUDA_R_16BF, ne00,
+                                     src1_ptr,       CUDA_R_16BF, ne10,
+                        &beta_f32,   dst_bf16.get(), CUDA_R_16BF, ldc,
+                        CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+            to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+        }
     } else if (fast_fp16_hardware_available(cc) && use_fp16) {
         // convert src0 and src1 to fp16, multiply as fp16, convert dst to fp32
         ggml_cuda_pool_alloc<half> src0_as_f16(ctx.pool(id));
@@ -2664,7 +2678,6 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1) {
         return false;
     }
-
 
     return use_mul_mat_vec_f;
 }

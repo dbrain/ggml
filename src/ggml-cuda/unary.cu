@@ -173,14 +173,16 @@ void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     void * dst_d = dst->data;
     cudaStream_t stream = ctx.stream();
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
-    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16 ||  dst->type == GGML_TYPE_BF16);
     GGML_ASSERT(src0->type == dst->type);
     GGML_ASSERT(ggml_is_contiguous(dst));
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
 
     if (ggml_is_contiguous(src0)) {
-        if (src0->type == GGML_TYPE_F16) {
+        if (src0->type == GGML_TYPE_BF16) {
+            unary_cuda<op>((const nv_bfloat16 *)src0_d, (nv_bfloat16 *)dst_d, ggml_nelements(src0), stream);
+        } else if (src0->type == GGML_TYPE_F16) {
             unary_cuda<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);
         } else {
             unary_cuda<op>((const float *)src0_d, (float *)dst_d, ggml_nelements(src0), stream);
@@ -191,7 +193,10 @@ void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         const int64_t s00 = src0->nb[0] / ts, s01 = src0->nb[1] / ts;
         const int64_t s02 = src0->nb[2] / ts, s03 = src0->nb[3] / ts;
         const int64_t k   = ggml_nelements(src0);
-        if (src0->type == GGML_TYPE_F16) {
+        if (src0->type == GGML_TYPE_BF16) {
+            unary_strided_cuda<op>((const nv_bfloat16 *)src0_d, (nv_bfloat16 *)dst_d,
+                                   src0->ne[0], src0->ne[1], src0->ne[2], k, s00, s01, s02, s03, stream);
+        } else if (src0->type == GGML_TYPE_F16) {
             unary_strided_cuda<op>((const half *)src0_d, (half *)dst_d,
                                    src0->ne[0], src0->ne[1], src0->ne[2], k, s00, s01, s02, s03, stream);
         } else {
