@@ -138,21 +138,26 @@ static __global__ void nhwc_f16_to_nchw_f32_tiled(const half * __restrict__ in, 
     const half * inb  = in  + (long)n * HW * C;    // [HW, C]
     float      * outb = out + (long)n * C * HW;    // [C, HW]
 
-    // load tile: rows = HW (y), cols = C (x) -> coalesced read along C
-    int hw0 = blockIdx.y * CV_TILE;
-    int c0  = blockIdx.x * CV_TILE;
-    for (int j = 0; j < CV_TILE; j += CV_BR) {
-        int hw = hw0 + threadIdx.y + j;
-        int c  = c0 + threadIdx.x;
-        if (hw < HW && c < C) tile[threadIdx.y + j][threadIdx.x] = __half2float(inb[(long)hw * C + c]);
-    }
-    __syncthreads();
-    // store transposed: out[c, hw] ; coalesced write along HW
-    int cT  = c0  + threadIdx.y;     // becomes row
-    int hwT = hw0 + threadIdx.x;     // becomes col (contiguous in out)
-    for (int j = 0; j < CV_TILE; j += CV_BR) {
-        int c = cT + j;
-        if (c < C && hwT < HW) outb[(long)c * HW + hwT] = tile[threadIdx.x][threadIdx.y + j];
+    int c0 = blockIdx.x * CV_TILE;
+    // grid-stride over HW tiles: grid.y is capped at 65535 at launch, so an output plane of more
+    // than 65535*32 = 2,097,120 pixels (2048x1024 is 2,097,152) is walked in strides instead of
+    // overflowing grid.y -> "invalid argument". Same fix as ndhwc_f16_to_ncdhw_tiled in conv3d.
+    for (int hw0 = blockIdx.y * CV_TILE; hw0 < HW; hw0 += gridDim.y * CV_TILE) {
+        // load tile: rows = HW (y), cols = C (x) -> coalesced read along C
+        for (int j = 0; j < CV_TILE; j += CV_BR) {
+            int hw = hw0 + threadIdx.y + j;
+            int c  = c0 + threadIdx.x;
+            if (hw < HW && c < C) tile[threadIdx.y + j][threadIdx.x] = __half2float(inb[(long)hw * C + c]);
+        }
+        __syncthreads();
+        // store transposed: out[c, hw] ; coalesced write along HW
+        int cT  = c0  + threadIdx.y;     // becomes row
+        int hwT = hw0 + threadIdx.x;     // becomes col (contiguous in out)
+        for (int j = 0; j < CV_TILE; j += CV_BR) {
+            int c = cT + j;
+            if (c < C && hwT < HW) outb[(long)c * HW + hwT] = tile[threadIdx.x][threadIdx.y + j];
+        }
+        __syncthreads();
     }
 }
 
@@ -490,7 +495,9 @@ bool ggml_cuda_op_conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     {
         const int HW = OH * OW;
         dim3 blk(CV_TILE, CV_BR);
-        dim3 grd((OC + CV_TILE - 1) / CV_TILE, (HW + CV_TILE - 1) / CV_TILE, N);
+        int gy = (int)(((long)HW + CV_TILE - 1) / CV_TILE);
+        if (gy > 65535) { gy = 65535; }   // CUDA grid.y limit; the kernel grid-strides the rest
+        dim3 grd((OC + CV_TILE - 1) / CV_TILE, gy, N);
         nhwc_f16_to_nchw_f32_tiled<<<grd, blk, 0, stream>>>(y_nhwc.get(), (float *)dst->data, N, OC, HW);
     }
 
