@@ -123,11 +123,13 @@ static __global__ void soft_max_f32(
         vals[col] = val;
     }
 
-    if (block_size > WARP_SIZE) {
-        // sync is needed as we reuse buf_iw across block_reduce invocations, see #26385
-        // for block_size <= WARP_SIZE, block_reduce does not access buf_iw
-        __syncthreads();
-    }
+    // buf_iw is reused from the MAX reduction above, so the SUM reduction must not
+    // race it. Upstream (#26385) guards this with `if (block_size > WARP_SIZE)` on the
+    // grounds that block_reduce does not touch buf_iw below a warp. We sync
+    // UNCONDITIONALLY: on Blackwell (sm_120) there is no implicit warp reconvergence
+    // for the sub-warp case to lean on, and this kernel miscomputed on the 5060 Ti
+    // without it. The extra barrier is free relative to being wrong.
+    __syncthreads();
     // find the sum of exps in the block
     tmp = block_reduce<block_reduce_method::SUM, block_size_template>(tmp, buf_iw);
 

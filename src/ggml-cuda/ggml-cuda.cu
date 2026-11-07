@@ -7177,7 +7177,30 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 // takes every DiT Linear, so the union — not the FP4 term alone — is the honest
                 // answer to "can this backend serve the node".
                 const bool cublaslt_gemm_serves = ggml_cuda_nvfp4_cublaslt_gemm_serves(dev_ctx->device, op);
-                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 && !ggml_cuda_op_mul_mat_use_fwht(op) && !cublaslt_gemm_serves) {
+                // An F16 activation meeting a non-F16 weight -- the LTX_DIT_F16 residual stream
+                // hitting one of the BF16 holdout tensors -- IS served: ggml_cuda_mul_mat_cublas
+                // converts src1 through traits::convert() and accumulates into the destination.
+                // Only an F16 DESTINATION is unsafe on that path, because the fallback writes
+                // through a `float *` and would overrun it. The F16-dst case is fully decided by
+                // the `op->type == GGML_TYPE_F16` block immediately below.
+                //
+                // ⚠️ DO NOT restore this to an unconditional reject. It WAS one, and it was a
+                // lie about what this backend can do -- harmless only by accident, because a
+                // single-CUDA-device run built no ggml_backend_sched and so never consulted
+                // supports_op at all. Upstream sd.cpp #1828 added
+                // GGMLRunner::graph_requires_backend_fallback(), which scans EVERY node with
+                // supports_op and creates a scheduler the moment one answers no. At that point
+                // the lie stops being free and becomes a hard crash: the node cannot be placed
+                // on CUDA (this reject) and the CPU backend declines BF16 x F16 as well, so
+                // ggml_backend_sched_split_graph hits GGML_ASSERT(*cur_backend_id != -1).
+                //
+                // MEASURED 2026-08-02, prod LTX t2v 1920x1088x97, the whole render died on:
+                //   node 'node_71' MUL_MAT f32 [32,26520]
+                //     src0 transformer_blocks.0.attn1.to_gate_logits.weight bf16 [4096,32]
+                //     src1 node_29 f16 [4096,26520]
+                //   CUDA0 supports_op=0, CPU supports_op=0
+                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 && !ggml_cuda_op_mul_mat_use_fwht(op) && !cublaslt_gemm_serves &&
+                        op->type != GGML_TYPE_F32) {
                     return false;
                 }
                 if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {

@@ -27,6 +27,7 @@
 #include <string>
 #include <cstring>
 #include <tuple>
+#include <type_traits>
 
 // SWIZZLE_32_4_4 offset over a (rows x col_length) UE4M3 scale grid (comfy float_utils)
 __device__ __forceinline__ size_t swz_off(size_t row, size_t col, uint32_t col_len) {
@@ -64,10 +65,39 @@ static __global__ void repack_weight_kernel(const block_nvfp4 * __restrict__ W,
 }
 
 // --- activation quant: one thread per (row r in [0,M), sub ss in [0,nsub)) ---
-// Mirrors quantize_mmq_nvfp4 EXACTLY (same ggml helpers + ±1/±2 scale-refinement
-// search) so the cuBLASLt activation is bit-identical to the MMQ path; only the
-// nibble *packing* differs (consecutive for cuBLASLt vs MMQ tile layout). This
-// keeps cuBLASLt output as close to MMQ as the GEMM kernels themselves allow.
+// ⚠️ HISTORY, READ BEFORE TRUSTING ANY "matches MMQ" CLAIM. This kernel's numeric core
+// (amax -> ue4m3(amax/6) -> ±2 refinement search -> e2m1) was copied verbatim from
+// quantize_mmq_nvfp4, and this comment used to say it was "bit-identical to the MMQ path".
+// That is NO LONGER TRUE and must not be re-asserted without a fresh A/B:
+//
+//   upstream llama.cpp PR 25730 (ggml e7059df1, merged here 2026-08-02) REWROTE
+//   quantize_mmq_nvfp4 to a per-ROW two-level scheme -- it reduces an amax over the whole
+//   row, stores row_scale = amax/(6*448), normalises each 16-sub-block by it before
+//   picking the e4m3 code, and re-applies the row factor in the MMQ write_back epilogue
+//   (the `y_scale` argument). We deliberately did NOT follow that here:
+//     - our global is per-TENSOR (ModelOpt weight_scale_2), computed once by
+//       nvfp4_amax_kernel and reused, not per-row and not recomputed per GEMM;
+//     - we apply it through the cuBLASLt GEMM alpha, not through a write-back epilogue,
+//       because cuBLASLt owns the epilogue and we cannot hook it.
+//   So the two implementations have DIVERGED on purpose. MMQ and cuBLASLt no longer agree
+//   bit-for-bit on the same input, and nothing here is trying to make them.
+//
+// Note the convergent evidence, though: upstream's stated reason for going two-level is
+// the same one written in the per_tensor branch below -- an un-normalised amax/6 drops
+// low-magnitude blocks into e4m3 subnormals. Two independent implementations diagnosing
+// the same subnormal problem is decent support for the per_tensor mode. Whether per-ROW
+// beats per-TENSOR for a DiT residual stream is UNMEASURED; `per_tensor` is a runtime
+// argument, so that A/B is cheap when there is GPU time for it.
+//
+// What WAS taken from PR 25730 (both provably bit-neutral for our output, see below):
+//   - 32-byte vectorised activation loads (nvfp4_act_vec16);
+//   - the __nv_fp4x4_e2m1 intrinsic in the refinement SEARCH (nvfp4_sub_scale_error).
+// What was deliberately NOT taken: the intrinsic in the STORE path. The hardware
+// converter rounds ties to even, whereas ggml_cuda_float_to_fp4_e2m1 breaks ties toward
+// the lower LUT index (strict `<`), so they disagree at ax = 0.75 / 1.75 / 3.5. In the
+// search that is harmless -- at an exact tie both candidates are equidistant, so the
+// squared error is identical and the winning code cannot change -- but in the store it
+// would silently alter emitted nibbles. The store stays scalar and prod stays byte-exact.
 //
 // Templated on the activation element type so the DiT residual stream can flow
 // in F16 (LTX_DIT_F16) straight into the FP4 GEMM with NO per-Linear F16->F32
@@ -76,6 +106,99 @@ static __global__ void repack_weight_kernel(const block_nvfp4 * __restrict__ W,
 // ±scale-refine math runs in float exactly as the F32 path does.
 __device__ __forceinline__ float nvfp4_load_act(const float & v) { return v; }
 __device__ __forceinline__ float nvfp4_load_act(const half  & v) { return __half2float(v); }
+
+// 32-byte load vehicles, from PR 25730's `float8`. Named locally rather than shared with
+// quantize.cu's copy: that one is a file-static inside an upstream translation unit, and
+// re-declaring the same name here would be an ODR trap for no benefit.
+//
+// These are a pure load-width change -- the same bytes, fetched 32 at a time instead of 4
+// (float) or 2 (half). They cannot alter a single output bit; the ONLY hazard is
+// alignment, which the host resolves once (see ALIGNED below) rather than per thread.
+struct __builtin_align__(32) nvfp4_f32x8 { float x, y, z, w, p, q, r, s; };
+struct __builtin_align__(32) nvfp4_f16x16 { half2 a, b, c, d, e, f, g, h; };
+
+// Load the thread's 16 activations and their amax. ALIGNED selects the vector path.
+template <typename act_t, bool ALIGNED>
+static __device__ __forceinline__ float nvfp4_act_vec16(const act_t * __restrict__ x, float (&vals)[16]) {
+    if constexpr (ALIGNED && std::is_same<act_t, float>::value) {
+        const nvfp4_f32x8 v0 = reinterpret_cast<const nvfp4_f32x8 *>(x)[0];
+        const nvfp4_f32x8 v1 = reinterpret_cast<const nvfp4_f32x8 *>(x)[1];
+        vals[ 0]=v0.x; vals[ 1]=v0.y; vals[ 2]=v0.z; vals[ 3]=v0.w;
+        vals[ 4]=v0.p; vals[ 5]=v0.q; vals[ 6]=v0.r; vals[ 7]=v0.s;
+        vals[ 8]=v1.x; vals[ 9]=v1.y; vals[10]=v1.z; vals[11]=v1.w;
+        vals[12]=v1.p; vals[13]=v1.q; vals[14]=v1.r; vals[15]=v1.s;
+    } else if constexpr (ALIGNED && std::is_same<act_t, half>::value) {
+        const nvfp4_f16x16 v = reinterpret_cast<const nvfp4_f16x16 *>(x)[0];
+        const half2 hs[8] = { v.a, v.b, v.c, v.d, v.e, v.f, v.g, v.h };
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float2 f = __half22float2(hs[j]);
+            vals[2*j] = f.x; vals[2*j + 1] = f.y;
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            vals[j] = nvfp4_load_act(x[j]);
+        }
+    }
+
+    float amax = 0.f;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        amax = fmaxf(amax, fabsf(vals[j]));
+    }
+    return amax;
+}
+
+// Squared reconstruction error of one candidate sub-block scale -- PR 25730's
+// nvfp4_native_scale_error, minus its inv_col_scale (we have no per-row scale; ours is
+// per-tensor and folded into the GEMM alpha instead).
+//
+// BIT-NEUTRAL vs the scalar loop it replaces, for two separate reasons:
+//   1. Reconstruction. The scalar form uses kvalues_fp4 = 2x E2M1 times `scale`; this uses
+//      true E2M1 times `2*scale`. Doubling is exact in binary FP, so both are the
+//      correctly-rounded product of the same real number.
+//   2. Ties. The hardware converter rounds ties to even and the scalar helper rounds them
+//      down, so the two can pick DIFFERENT codes at ax = 0.75 / 1.75 / 3.5 -- but a tie is
+//      by definition equidistant, so |err_diff| (and hence err_diff^2, and hence the
+//      accumulated err) is the same either way. The candidate that wins cannot change.
+// Point 2 is exactly why this intrinsic is safe HERE and not in the store path.
+static __device__ __forceinline__ float nvfp4_sub_scale_error(
+        const float (&vals)[16], const float inv_scale, const float scale) {
+#if defined(BLACKWELL_MMA_AVAILABLE) && CUDART_VERSION >= 12080
+    const float scale_dequant = 2.0f * scale;
+    float err = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 16; k += 4) {
+        const __nv_fp4x4_e2m1 q(make_float4(vals[k + 0] * inv_scale, vals[k + 1] * inv_scale,
+                                            vals[k + 2] * inv_scale, vals[k + 3] * inv_scale));
+        const __nv_fp4x4_storage_t qs = q.__x;
+        const float2 dq_lo = __half22float2(static_cast<__half2>(
+            __nv_cvt_fp4x2_to_halfraw2(static_cast<__nv_fp4x2_storage_t>(qs), __NV_E2M1)));
+        const float2 dq_hi = __half22float2(static_cast<__half2>(
+            __nv_cvt_fp4x2_to_halfraw2(static_cast<__nv_fp4x2_storage_t>(qs >> 8U), __NV_E2M1)));
+
+        const float e0 = fabsf(vals[k + 0]) - fabsf(dq_lo.x) * scale_dequant;
+        const float e1 = fabsf(vals[k + 1]) - fabsf(dq_lo.y) * scale_dequant;
+        const float e2 = fabsf(vals[k + 2]) - fabsf(dq_hi.x) * scale_dequant;
+        const float e3 = fabsf(vals[k + 3]) - fabsf(dq_hi.y) * scale_dequant;
+        err = fmaf(e0, e0, err);
+        err = fmaf(e1, e1, err);
+        err = fmaf(e2, e2, err);
+        err = fmaf(e3, e3, err);
+    }
+    return err;
+#else
+    float err = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        const uint8_t q  = ggml_cuda_float_to_fp4_e2m1(vals[k], inv_scale);
+        const float   ed = fabsf(vals[k]) - fabsf(kvalues_mxfp4[q & 0x7]) * scale;
+        err = fmaf(ed, ed, err);
+    }
+    return err;
+#endif
+}
 
 // REFINE=true runs the ggml-MMQ ±2 scale-refinement search (5 candidate scale codes,
 // each re-quantizing the 16-lane sub-block and keeping the min-reconstruction-error one).
@@ -107,7 +230,7 @@ static __global__ void nvfp4_amax_kernel(const act_t * __restrict__ X,
 
 // per_tensor > 0 selects comfy/ModelOpt's TWO-LEVEL one-shot quant (see below); per_tensor
 // <= 0 keeps the original single-level path (REFINE search or one-shot).
-template <typename act_t, bool REFINE>
+template <typename act_t, bool REFINE, bool ALIGNED>
 static __global__ void quant_act_kernel(const act_t * __restrict__ X,
                                         uint8_t * __restrict__ out_data,    // M*(K/2)
                                         uint8_t * __restrict__ out_scales,  // swizzled
@@ -119,9 +242,8 @@ static __global__ void quant_act_kernel(const act_t * __restrict__ X,
     const int r  = idx / nsub;
     const int ss = idx % nsub;
     const act_t * x = &X[(size_t)r*K + ss*16];
-    float vals[16], amax = 0.f;
-    #pragma unroll
-    for (int j=0;j<16;j++) { vals[j]=nvfp4_load_act(x[j]); amax = fmaxf(amax, fabsf(vals[j])); }
+    float vals[16];
+    const float amax = nvfp4_act_vec16<act_t, ALIGNED>(x, vals);
 
     // comfy/ModelOpt TWO-LEVEL one-shot: the per-block scale (amax/6) is normalized by
     // the per-tensor global before being quantized to e4m3, so the e4m3 block-scale code
@@ -159,13 +281,7 @@ static __global__ void quant_act_kernel(const act_t * __restrict__ X,
             if (tc < 0 || tc > 0x7e) continue;
             const float ts = ggml_cuda_ue4m3_to_fp32((uint8_t)tc);
             const float tinv = ts > 0.f ? 0.5f/ts : 0.f;
-            float err = 0.f;
-            #pragma unroll
-            for (int k=0;k<16;k++) {
-                const uint8_t q = ggml_cuda_float_to_fp4_e2m1(vals[k], tinv);
-                const float ed = fabsf(vals[k]) - fabsf(kvalues_mxfp4[q & 0x7]) * ts;
-                err = fmaf(ed, ed, err);
-            }
+            const float err = nvfp4_sub_scale_error(vals, tinv, ts);
             if (err < best_err) { best_err = err; fp8_code = (uint8_t)tc; subblock_scale = ts; }
         }
     } else {
@@ -734,12 +850,31 @@ ggml_cuda_lt_result ggml_cuda_nvfp4_cublaslt_mul_mat_ex(ggml_backend_cuda_contex
         const int total   = M*nsub;
         const int blocks  = (total+threads-1)/threads;
         const float pt = a_per_tensor;   // >0 => two-level branch in the kernel
+        // 32-byte vectorised loads need every thread's start -- X + r*K + ss*16 -- to be
+        // 32B-aligned. ss*16 elements is 64B (f32) / 32B (f16), always fine; so it reduces
+        // to the base pointer AND the row stride. Decided once here rather than branched
+        // per thread, and it only selects a load width: an unaligned tensor takes the
+        // scalar path and produces byte-identical output.
+        const size_t elt      = src1->type == GGML_TYPE_F16 ? sizeof(half) : sizeof(float);
+        const bool   aligned  = ((uintptr_t) src1->data % 32 == 0) && (((size_t) K * elt) % 32 == 0);
         if (src1->type == GGML_TYPE_F16) {
-            if (s_norefine || pt > 0.f) quant_act_kernel<half,false><<<blocks, threads, 0, stream>>>((const half*)src1->data, a_data_ptr, a_scales_ptr, M, K, pt);
-            else                        quant_act_kernel<half,true ><<<blocks, threads, 0, stream>>>((const half*)src1->data, a_data_ptr, a_scales_ptr, M, K, pt);
+            const half * xp = (const half*)src1->data;
+            if (s_norefine || pt > 0.f) {
+                if (aligned) quant_act_kernel<half,false,true ><<<blocks, threads, 0, stream>>>(xp, a_data_ptr, a_scales_ptr, M, K, pt);
+                else         quant_act_kernel<half,false,false><<<blocks, threads, 0, stream>>>(xp, a_data_ptr, a_scales_ptr, M, K, pt);
+            } else {
+                if (aligned) quant_act_kernel<half,true ,true ><<<blocks, threads, 0, stream>>>(xp, a_data_ptr, a_scales_ptr, M, K, pt);
+                else         quant_act_kernel<half,true ,false><<<blocks, threads, 0, stream>>>(xp, a_data_ptr, a_scales_ptr, M, K, pt);
+            }
         } else {
-            if (s_norefine || pt > 0.f) quant_act_kernel<float,false><<<blocks, threads, 0, stream>>>((const float*)src1->data, a_data_ptr, a_scales_ptr, M, K, pt);
-            else                        quant_act_kernel<float,true ><<<blocks, threads, 0, stream>>>((const float*)src1->data, a_data_ptr, a_scales_ptr, M, K, pt);
+            const float * xp = (const float*)src1->data;
+            if (s_norefine || pt > 0.f) {
+                if (aligned) quant_act_kernel<float,false,true ><<<blocks, threads, 0, stream>>>(xp, a_data_ptr, a_scales_ptr, M, K, pt);
+                else         quant_act_kernel<float,false,false><<<blocks, threads, 0, stream>>>(xp, a_data_ptr, a_scales_ptr, M, K, pt);
+            } else {
+                if (aligned) quant_act_kernel<float,true ,true ><<<blocks, threads, 0, stream>>>(xp, a_data_ptr, a_scales_ptr, M, K, pt);
+                else         quant_act_kernel<float,true ,false><<<blocks, threads, 0, stream>>>(xp, a_data_ptr, a_scales_ptr, M, K, pt);
+            }
         }
         if (cudaPeekAtLastError() != cudaSuccess) return GGML_CUDA_LT_DECLINED;
         // Quant enqueued on `stream` -> the entry is now valid for any later GEMM in this same
