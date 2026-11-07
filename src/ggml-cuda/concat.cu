@@ -106,6 +106,9 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_cont_4d(
     const int64_t src1_slice = dst_slice - src0_slice;
     const int64_t n          = dst_slice * ne3;
 
+    // The dim == 0 launch goes through ggml_cuda_kernel_launch, which may start this kernel under
+    // PDL before the producer of x/y has finished. Wait for it before the first load or store.
+    ggml_cuda_pdl_sync();
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n;
          i += (int64_t) blockDim.x * gridDim.x) {
         const int64_t i3 = i / dst_slice;
