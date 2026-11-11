@@ -9,6 +9,7 @@
 
 #include "conv-transpose-1d.cuh"
 #include <mma.h>
+#include <cstdlib>
 
 using namespace nvcuda;
 
@@ -220,6 +221,100 @@ __global__ void conv_transpose_1d_mma_kernel(
     }
 }
 
+// Polyphase form of the same transposed conv. Output t = p + s0*q only ever
+// receives taps kk = p + s0*j (j = 0..m-1, m = ceil(kernel/s0)), from input
+// x[q - j]. Grouping outputs by phase p turns each phase into a small dense
+// GEMM over in_ch*m instead of in_ch*kernel -- the dense kernel above walks all
+// `kernel` taps for every output and masks out the (s0-1)/s0 of them that
+// cannot contribute, so it did s0x the work (8x/5x/4x/3x on a [8,5,4,3]
+// vocoder) plus a div/mod per staged element. Same F16 inputs and F32
+// accumulation; only the summation order of the nonzero terms differs.
+template <typename Tx, typename Ty>
+__global__ void conv_transpose_1d_poly_mma_kernel(
+    const __half * __restrict__ w,        // [in_ch, out_ch, kernel] flat
+    const Tx     * __restrict__ x,        // [batch, in_ch, in_seq]
+    Ty           * __restrict__ y,        // [batch, out_ch, out_seq]
+    int in_seq, int out_seq,
+    int in_ch,  int out_ch,
+    int kernel, int s0, int m_taps,
+    int64_t x_stride_b, int64_t x_stride_c,
+    int64_t y_stride_b, int64_t y_stride_c
+) {
+    const int oc_tile = blockIdx.y;
+    const int q_tile  = blockIdx.x;
+    const int batch_i = blockIdx.z / s0;
+    const int phase   = blockIdx.z % s0;
+    const int warp_id = threadIdx.x / 32;
+    const int oc_base = oc_tile * BM;
+    const int q_base  = q_tile  * BN;
+    const int K       = in_ch * m_taps;
+    // Outputs of this phase: t = phase + s0*q < out_seq.
+    const int n_q     = phase < out_seq ? (out_seq - phase + s0 - 1) / s0 : 0;
+    if (q_base >= n_q) return;
+
+    __shared__ __half a_smem[BM * BK];
+    __shared__ __half b_smem[BN * BK];
+    __shared__ float  c_smem[BM * BN];
+
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    for (int k_outer = 0; k_outer < K; k_outer += BK) {
+        for (int i = threadIdx.x; i < BM * BK; i += WARPS_PER_BLOCK * 32) {
+            const int mm      = i / BK;
+            const int k_local = i % BK;
+            const int oc      = oc_base + mm;
+            const int k_idx   = k_outer + k_local;
+            __half v = __ushort_as_half(0);
+            if (oc < out_ch && k_idx < K) {
+                const int ic = k_idx / m_taps;
+                const int kk = phase + s0 * (k_idx - ic * m_taps);
+                if (kk < kernel) v = w[(int64_t)ic * out_ch * kernel + (int64_t)oc * kernel + kk];
+            }
+            a_smem[i] = v;
+        }
+        for (int i = threadIdx.x; i < BN * BK; i += WARPS_PER_BLOCK * 32) {
+            const int n_local = i / BK;
+            const int k_local = i % BK;
+            const int q       = q_base + n_local;
+            const int k_idx   = k_outer + k_local;
+            __half v = __ushort_as_half(0);
+            if (q < n_q && k_idx < K) {
+                const int ic   = k_idx / m_taps;
+                const int in_t = q - (k_idx - ic * m_taps);
+                if (in_t >= 0 && in_t < in_seq)
+                    v = __float2half(ct1d_load_x<Tx>(x, batch_i * x_stride_b + ic * x_stride_c + in_t));
+            }
+            b_smem[i] = v;
+        }
+
+        __syncthreads();
+
+        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::col_major> b_frag;
+
+        wmma::load_matrix_sync(a_frag, a_smem, BK);
+        wmma::load_matrix_sync(b_frag, b_smem + warp_id * WMMA_N * BK, BK);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+        __syncthreads();
+    }
+
+    wmma::store_matrix_sync(c_smem + warp_id * WMMA_N, c_frag, BN, wmma::mem_row_major);
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < BM * BN; i += WARPS_PER_BLOCK * 32) {
+        const int mm = i / BN;
+        const int n  = i % BN;
+        const int oc = oc_base + mm;
+        const int q  = q_base + n;
+        if (oc < out_ch && q < n_q) {
+            ct1d_store_y<Ty>(y, batch_i * y_stride_b + (int64_t)oc * y_stride_c + phase + (int64_t) s0 * q,
+                             c_smem[mm * BN + n]);
+        }
+    }
+}
+
 // === Dispatch ================================================================
 
 void ggml_cuda_op_conv_transpose_1d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -260,6 +355,36 @@ void ggml_cuda_op_conv_transpose_1d(ggml_backend_cuda_context & ctx, ggml_tensor
         const int blocks_m = (out_ch  + BM - 1) / BM;
         dim3 grid(blocks_n, blocks_m, batch);
         dim3 block(WARPS_PER_BLOCK * 32);
+
+        // Polyphase unless GGML_CT1D_DENSE=1 (A/B against the dense kernel).
+        static const bool dense = [] {
+            const char * e = getenv("GGML_CT1D_DENSE");
+            return e && e[0] == '1';
+        }();
+        if (!dense && s0 > 1) {
+            const int m_taps   = (kernel + s0 - 1) / s0;
+            const int max_q    = (out_seq + s0 - 1) / s0;
+            dim3 pgrid((max_q + BN - 1) / BN, blocks_m, batch * s0);
+#define DISPATCH_CT1D_POLY(TX, TY)                                                        \
+            conv_transpose_1d_poly_mma_kernel<TX, TY><<<pgrid, block, 0, stream>>>(       \
+                w_d, (const TX *) src1->data, (TY *) dst->data,                           \
+                in_seq, out_seq, in_ch, out_ch, kernel, s0, m_taps,                       \
+                x_stride_b, x_stride_c, y_stride_b, y_stride_c)
+            if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+                DISPATCH_CT1D_POLY(float, float);
+            } else if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
+                DISPATCH_CT1D_POLY(float, __half);
+            } else if (src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
+                DISPATCH_CT1D_POLY(__half, float);
+            } else {
+                DISPATCH_CT1D_POLY(__half, __half);
+            }
+#undef DISPATCH_CT1D_POLY
+            CUDA_CHECK(cudaGetLastError());
+            GGML_UNUSED(p0);
+            GGML_UNUSED(d0);
+            return;
+        }
 
 #define DISPATCH_CT1D(TX, TY)                                                             \
         conv_transpose_1d_mma_kernel<TX, TY><<<grid, block, 0, stream>>>(                 \
